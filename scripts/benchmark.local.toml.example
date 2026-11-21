@@ -1,0 +1,5 @@
+# Copy to `scripts/benchmark.local.toml` (gitignored) for per-machine overrides.
+
+[settings]
+runs = 5
+warmup = 2

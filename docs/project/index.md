@@ -25,6 +25,12 @@ Development setup, running tests, and submitting pull requests.
 Release checklist and version policy.
 :::
 
+:::{grid-item-card} Benchmarking
+:link: benchmark
+:link-type: doc
+In-process VT microbenchmarks and cross-commit timing harness.
+:::
+
 ::::
 
 ## API Governance
@@ -58,6 +64,7 @@ Active deprecations and migration guidance.
 contributing
 code-style
 releasing
+benchmark
 public-api
 compatibility
 deprecations

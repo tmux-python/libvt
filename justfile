@@ -69,6 +69,11 @@ ty:
 watch-ty:
     uv run ty check --watch
 
+# Run in-process VT throughput benchmark
+[group: 'bench']
+bench *args:
+    uv run python scripts/bench_vt.py {{ args }}
+
 [private]
 _entr-warn:
     @echo "----------------------------------------------------------"

@@ -1,0 +1,24 @@
+# Default benchmark definitions for `scripts/benchmark.py`.
+#
+# Override locally with `scripts/benchmark.local.toml` (gitignored)
+# or via `--config PATH`.
+#
+# Template tokens: {venv}, {query}, {sha}, {short_sha}, {repo}.
+
+[settings]
+warmup = 1
+runs = 3
+trunk = "master"
+sync_command = "uv sync --quiet"
+venv = ".venv"
+timeout_seconds = 120
+
+[bench.import-libvt]
+description = "Cold-start import of libvt without loading asyncio or pytest"
+command = "{venv}/bin/python -c \"import libvt\""
+default_query = ""
+
+[bench.in-process-vt]
+description = "In-process VT throughput suite (JSON summary)"
+command = "{venv}/bin/python scripts/bench_vt.py --warmup 1 --runs 5 --format json"
+default_query = ""
