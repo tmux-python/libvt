@@ -1,8 +1,9 @@
-"""Clean-room 14-state VT500 streaming byte parser and SGR parameter decoder.
+"""Clean-room VT500 streaming byte parser and SGR parameter decoder.
 
 State transitions follow Paul Flo Williams' public DEC ANSI parser state
-diagram (ECMA-48 / DEC STD 070) with UTF-8 multi-byte decoding, 7-bit C1
-isolation, and bounded parameter and string buffers.
+diagram (ECMA-48 / DEC STD 070) with UTF-8 multi-byte decoding, 7-bit string
+escape isolation via :attr:`ParserState.STRING_ESC`, optional legacy Latin-1
+8-bit ``C1`` wire parsing, and bounded parameter and string buffers.
 """
 
 from __future__ import annotations
@@ -30,6 +31,9 @@ _PARAM_CLAMP = 65_535
 _MEMO_LIMIT = 256
 _CTRL_RE = re.compile(rb"[\x00-\x1f\x7f]")
 _CSI_FAST_RE = re.compile(rb"([\x3c-\x3f]?)([0-9;:]{0,256})([\x40-\x7e])")
+_C1_CHAR_RE = re.compile(r"[\x80-\x9f]")
+
+type ParserEncoding = t.Literal["utf-8", "latin-1"]
 
 
 class ParserState(enum.IntEnum):
@@ -49,6 +53,7 @@ class ParserState(enum.IntEnum):
     DCS_IGNORE = 11
     OSC_STRING = 12
     SOS_PM_APC_STRING = 13
+    STRING_ESC = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,7 +187,8 @@ class OscDispatch:
         Raw payload bytes following the first ``;`` (or the full body when no
         ``;`` is present).
     terminator : bytes
-        Wire terminator that closed the command (``b"\x07"`` or ``b"\x1b\\"``).
+        Wire terminator that closed the command (``b"\x07"``, ``b"\x1b\\"``, or
+        ``b"\x9c"`` in Latin-1 8-bit mode).
     """
 
     code: int
@@ -550,10 +556,9 @@ def parse_sgr(
 
 
 class Parser:
-    """Streaming 14-state VT500 / ANSI escape-sequence byte parser."""
+    """Streaming VT500 / ANSI escape-sequence byte parser."""
 
     __slots__ = (
-        "_c1_controls",
         "_csi_colon_mask",
         "_csi_cur",
         "_csi_has_digit",
@@ -563,15 +568,18 @@ class Parser:
         "_csi_prefix",
         "_csi_vals",
         "_dcs_final",
-        "_dcs_intermediates",
         "_dcs_params",
+        "_encoding",
         "_intermediates",
+        "_latin1",
         "_limits",
-        "_return_from_esc_st",
         "_state",
         "_str_buf",
+        "_str_esc_origin",
         "_str_kind",
         "_str_overflow",
+        "_tmux_dcs_state",
+        "_tmux_passthrough",
         "_utf8",
         "_utf8_pending",
     )
@@ -579,10 +587,16 @@ class Parser:
     def __init__(
         self,
         *,
-        c1_controls: bool = False,
+        encoding: ParserEncoding = "utf-8",
+        tmux_passthrough: bool = True,
         limits: Limits = DEFAULT_LIMITS,
     ) -> None:
-        self._c1_controls = c1_controls
+        if encoding not in ("utf-8", "latin-1"):
+            msg = f"unsupported parser encoding: {encoding!r}"
+            raise ValueError(msg)
+        self._encoding: ParserEncoding = encoding
+        self._latin1: bool = encoding == "latin-1"
+        self._tmux_passthrough: bool = tmux_passthrough
         self._limits = limits
         self._state: ParserState = ParserState.GROUND
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
@@ -596,13 +610,18 @@ class Parser:
         self._csi_has_digit: bool = False
         self._csi_is_colon: bool = False
         self._dcs_params: CsiParams = EMPTY_PARAMS
-        self._dcs_intermediates: bytes = b""
         self._dcs_final: int = 0
         self._str_buf = bytearray()
         self._str_overflow: bool = False
         self._str_kind: int = 0
-        self._return_from_esc_st: ParserState | None = None
+        self._str_esc_origin: ParserState | None = None
+        self._tmux_dcs_state: int = 0
         self._csi_memo: dict[bytes, CsiParams] = {}
+
+    @property
+    def encoding(self) -> ParserEncoding:
+        """Return wire character encoding (``"utf-8"`` or ``"latin-1"``)."""
+        return self._encoding
 
     @property
     def state(self) -> ParserState:
@@ -621,10 +640,7 @@ class Parser:
         self._utf8_pending = False
         self._intermediates.clear()
         self._reset_csi()
-        self._str_buf.clear()
-        self._str_overflow = False
-        self._str_kind = 0
-        self._return_from_esc_st = None
+        self._abort_string()
 
     def _reset_csi(self) -> None:
         self._csi_prefix = 0
@@ -635,6 +651,14 @@ class Parser:
         self._csi_has_digit = False
         self._csi_is_colon = False
         self._intermediates.clear()
+
+    def _abort_string(self) -> None:
+        self._str_buf.clear()
+        self._str_overflow = False
+        self._str_kind = 0
+        self._str_esc_origin = None
+        self._tmux_dcs_state = 0
+        self._reset_csi()
 
     def _push_param(self, *, next_is_colon: bool) -> None:
         idx = len(self._csi_vals)
@@ -671,15 +695,16 @@ class Parser:
         decoded = self._utf8.decode(chunk, final=False)
         self._utf8_pending = bool(self._utf8.getstate()[0])
         if decoded:
-            sink.on_print(decoded)
+            cleaned = _C1_CHAR_RE.sub("", decoded)
+            if cleaned:
+                sink.on_print(cleaned)
 
     def _dispatch_osc(self, sink: ActionSink, terminator: bytes) -> None:
         if self._str_overflow:
-            self._str_buf.clear()
-            self._str_overflow = False
+            self._abort_string()
             return
         raw = bytes(self._str_buf)
-        self._str_buf.clear()
+        self._abort_string()
         semi = raw.find(b";")
         if semi == -1:
             code = int(raw) if raw.isdigit() else -1
@@ -694,21 +719,51 @@ class Parser:
             sink.on_dcs(
                 self._csi_prefix,
                 self._dcs_params,
-                self._dcs_intermediates,
+                bytes(self._intermediates),
                 self._dcs_final,
                 bytes(self._str_buf),
             )
-        self._str_buf.clear()
-        self._str_overflow = False
-        self._dcs_intermediates = b""
-        self._reset_csi()
+        self._abort_string()
 
     def _dispatch_apc(self, sink: ActionSink) -> None:
         if self._str_kind == 0x5F and not self._str_overflow:
             sink.on_apc(bytes(self._str_buf))
+        self._abort_string()
+
+    def _enter_dcs_passthrough(self, final_byte: int) -> None:
+        self._dcs_params = self._finalize_params()
+        self._dcs_final = final_byte
         self._str_buf.clear()
         self._str_overflow = False
-        self._str_kind = 0
+        self._tmux_dcs_state = (
+            1
+            if (
+                self._tmux_passthrough
+                and self._csi_prefix == 0
+                and not self._intermediates
+                and not self._dcs_params.values
+                and final_byte == 0x74
+            )
+            else 0
+        )
+        self._state = ParserState.DCS_PASSTHROUGH
+
+    def _handle_c1_anywhere(self, b: int, sink: ActionSink) -> None:
+        self._abort_string()
+        if b == 0x9B:  # CSI
+            self._state = ParserState.CSI_ENTRY
+        elif b == 0x9D:  # OSC
+            self._state = ParserState.OSC_STRING
+        elif b == 0x90:  # DCS
+            self._state = ParserState.DCS_ENTRY
+        elif b in (0x98, 0x9E, 0x9F):  # SOS, PM, APC
+            self._str_kind = b - 0x40
+            self._state = ParserState.SOS_PM_APC_STRING
+        elif b == 0x9C:  # ST
+            self._state = ParserState.GROUND
+        else:
+            self._state = ParserState.GROUND
+            sink.on_esc(b"", b - 0x40)
 
     def _cached_csi_params(self, pbytes: bytes) -> CsiParams:
         if not pbytes:
@@ -736,7 +791,7 @@ class Parser:
         mv = memoryview(data).cast("B")
         n = len(mv)
         pos = 0
-        c1 = self._c1_controls
+        latin1 = self._latin1
         max_osc = self._limits.max_osc_bytes
         max_dcs = self._limits.max_dcs_bytes
         max_apc = self._limits.max_apc_bytes
@@ -745,42 +800,19 @@ class Parser:
             state = self._state
 
             if state == ParserState.GROUND:
-                if c1:
-                    if not self._utf8_pending and 0x80 <= mv[pos] <= 0x9F:
-                        b_c1 = mv[pos]
-                        pos += 1
-                        if b_c1 == 0x9B:
-                            self._reset_csi()
-                            self._state = ParserState.CSI_ENTRY
-                        elif b_c1 == 0x9D:
-                            self._str_buf.clear()
-                            self._str_overflow = False
-                            self._state = ParserState.OSC_STRING
-                        elif b_c1 == 0x90:
-                            self._reset_csi()
-                            self._str_buf.clear()
-                            self._str_overflow = False
-                            self._state = ParserState.DCS_ENTRY
-                        elif b_c1 in (0x98, 0x9E, 0x9F):
-                            self._str_buf.clear()
-                            self._str_overflow = False
-                            self._str_kind = b_c1 - 0x40
-                            self._state = ParserState.SOS_PM_APC_STRING
-                        elif b_c1 != 0x9C:
-                            sink.on_esc(b"", b_c1 - 0x40)
-                        continue
+                if latin1:
                     end = pos
-                    while end < n and 0x20 <= mv[end] <= 0x7E:
+                    while end < n and (0x20 <= mv[end] <= 0x7E or mv[end] >= 0xA0):
                         end += 1
-                    if end > pos and not self._utf8_pending:
-                        sink.on_print(bytes(mv[pos:end]).decode("ascii"))
+                    if end > pos:
+                        sink.on_print(bytes(mv[pos:end]).decode("latin-1"))
                         pos = end
                         if pos >= n:
                             break
-                        continue
-                    if mv[pos] >= 0x80:
-                        self._decode_utf8_bytes(mv[pos : pos + 1], sink)
+                    b_lat = mv[pos]
+                    if 0x80 <= b_lat <= 0x9F:
                         pos += 1
+                        self._handle_c1_anywhere(b_lat, sink)
                         continue
                 else:
                     match = _CTRL_RE.search(mv, pos)
@@ -819,22 +851,21 @@ class Parser:
                             pos = csi_m.end()
                             continue
                     self._intermediates.clear()
-                    self._return_from_esc_st = None
                     self._state = ParserState.ESCAPE
                 elif b == 0x7F:
                     pass
                 else:
-                    # Flush incomplete UTF-8 BEFORE executing any C0 control!
                     self._flush_incomplete_utf8(sink)
                     sink.on_execute(b)
                 continue
 
-            # String states: bulk-scan up to ESC / BEL / CAN / SUB (or 0x9C if c1).
             if state == ParserState.OSC_STRING:
                 start = pos
                 while pos < n:
                     b_scan = mv[pos]
-                    if b_scan in (0x07, 0x18, 0x1A, 0x1B) or (c1 and b_scan == 0x9C):
+                    if b_scan in (0x07, 0x18, 0x1A, 0x1B) or (
+                        latin1 and 0x80 <= b_scan <= 0x9F
+                    ):
                         break
                     pos += 1
                 if pos > start and not self._str_overflow:
@@ -851,16 +882,16 @@ class Parser:
                 if b == 0x07:
                     self._dispatch_osc(sink, b"\x07")
                     self._state = ParserState.GROUND
-                elif c1 and b == 0x9C:
+                elif latin1 and b == 0x9C:
                     self._dispatch_osc(sink, b"\x9c")
                     self._state = ParserState.GROUND
+                elif latin1 and 0x80 <= b <= 0x9F:
+                    self._handle_c1_anywhere(b, sink)
                 elif b == 0x1B:
-                    self._return_from_esc_st = ParserState.OSC_STRING
-                    self._intermediates.clear()
-                    self._state = ParserState.ESCAPE
-                else:  # CAN (0x18) or SUB (0x1A)
-                    self._str_buf.clear()
-                    self._str_overflow = False
+                    self._str_esc_origin = ParserState.OSC_STRING
+                    self._state = ParserState.STRING_ESC
+                else:
+                    self._abort_string()
                     self._state = ParserState.GROUND
                 continue
 
@@ -868,13 +899,19 @@ class Parser:
                 start = pos
                 while pos < n:
                     b_scan = mv[pos]
-                    if b_scan in (0x18, 0x1A, 0x1B, 0x7F) or (c1 and b_scan == 0x9C):
+                    if b_scan in (0x18, 0x1A, 0x1B, 0x7F) or (
+                        latin1 and 0x80 <= b_scan <= 0x9F
+                    ):
                         break
                     pos += 1
                 if pos > start and not self._str_overflow:
                     chunk_len = pos - start
                     if len(self._str_buf) + chunk_len <= max_dcs:
                         self._str_buf.extend(mv[start:pos])
+                        if self._tmux_dcs_state == 1 and len(self._str_buf) >= 4:
+                            self._tmux_dcs_state = (
+                                2 if self._str_buf[:4] == b"mux;" else -1
+                            )
                     else:
                         self._str_buf.clear()
                         self._str_overflow = True
@@ -884,17 +921,16 @@ class Parser:
                 pos += 1
                 if b == 0x7F:
                     continue
-                if c1 and b == 0x9C:
+                if latin1 and b == 0x9C:
                     self._dispatch_dcs(sink)
                     self._state = ParserState.GROUND
+                elif latin1 and 0x80 <= b <= 0x9F:
+                    self._handle_c1_anywhere(b, sink)
                 elif b == 0x1B:
-                    self._return_from_esc_st = ParserState.DCS_PASSTHROUGH
-                    self._intermediates.clear()
-                    self._state = ParserState.ESCAPE
+                    self._str_esc_origin = ParserState.DCS_PASSTHROUGH
+                    self._state = ParserState.STRING_ESC
                 else:
-                    self._str_buf.clear()
-                    self._str_overflow = False
-                    self._reset_csi()
+                    self._abort_string()
                     self._state = ParserState.GROUND
                 continue
 
@@ -902,7 +938,9 @@ class Parser:
                 start = pos
                 while pos < n:
                     b_scan = mv[pos]
-                    if b_scan in (0x18, 0x1A, 0x1B) or (c1 and b_scan == 0x9C):
+                    if b_scan in (0x18, 0x1A, 0x1B) or (
+                        latin1 and 0x80 <= b_scan <= 0x9F
+                    ):
                         break
                     pos += 1
                 if pos > start and self._str_kind == 0x5F and not self._str_overflow:
@@ -916,31 +954,38 @@ class Parser:
                     break
                 b = mv[pos]
                 pos += 1
-                if c1 and b == 0x9C:
+                if latin1 and b == 0x9C:
                     self._dispatch_apc(sink)
                     self._state = ParserState.GROUND
+                elif latin1 and 0x80 <= b <= 0x9F:
+                    self._handle_c1_anywhere(b, sink)
                 elif b == 0x1B:
-                    self._return_from_esc_st = ParserState.SOS_PM_APC_STRING
-                    self._intermediates.clear()
-                    self._state = ParserState.ESCAPE
+                    self._str_esc_origin = ParserState.SOS_PM_APC_STRING
+                    self._state = ParserState.STRING_ESC
                 else:
-                    self._str_buf.clear()
-                    self._str_overflow = False
-                    self._str_kind = 0
+                    self._abort_string()
                     self._state = ParserState.GROUND
                 continue
 
-            b = mv[pos]
-            pos += 1
-
-            if b == 0x1B:
+            if state == ParserState.STRING_ESC:
+                b = mv[pos]
+                pos += 1
+                origin = self._str_esc_origin
+                if b == 0x5C:  # 'ESC \' -> 7-bit ST
+                    if origin == ParserState.OSC_STRING:
+                        self._dispatch_osc(sink, b"\x1b\\")
+                    elif origin == ParserState.DCS_PASSTHROUGH:
+                        self._dispatch_dcs(sink)
+                    elif origin == ParserState.SOS_PM_APC_STRING:
+                        self._dispatch_apc(sink)
+                    else:
+                        self._abort_string()
+                    self._state = ParserState.GROUND
+                    continue
                 if (
-                    state == ParserState.ESCAPE
-                    and self._return_from_esc_st == ParserState.DCS_PASSTHROUGH
-                    and self._dcs_final == 0x74
-                    and self._csi_prefix == 0
-                    and not self._dcs_intermediates
-                    and self._str_buf.startswith(b"mux;")
+                    b == 0x1B
+                    and origin == ParserState.DCS_PASSTHROUGH
+                    and self._tmux_dcs_state == 2
                 ):
                     if not self._str_overflow:
                         if len(self._str_buf) + 1 <= max_dcs:
@@ -948,33 +993,34 @@ class Parser:
                         else:
                             self._str_buf.clear()
                             self._str_overflow = True
-                    self._return_from_esc_st = None
+                    self._str_esc_origin = None
                     self._state = ParserState.DCS_PASSTHROUGH
                     continue
-                # Double-ESC inside a non-passthrough string aborts it cleanly.
-                if self._return_from_esc_st is not None:
-                    self._str_buf.clear()
-                    self._str_overflow = False
-                    self._str_kind = 0
-                    self._dcs_intermediates = b""
-                    self._return_from_esc_st = None
-                self._intermediates.clear()
+                # Any other byte aborts the unclosed string per DEC STD 070 §5.1.2.3
+                # and re-evaluates b starting from ESCAPE.
+                self._abort_string()
+                self._state = ParserState.ESCAPE
+                pos -= 1
+                continue
+
+            b = mv[pos]
+            pos += 1
+
+            if latin1 and 0x80 <= b <= 0x9F:
+                self._handle_c1_anywhere(b, sink)
+                continue
+
+            if b == 0x1B:
+                self._abort_string()
                 self._state = ParserState.ESCAPE
                 continue
 
             if b in (0x18, 0x1A):
-                self._str_buf.clear()
-                self._str_overflow = False
-                self._str_kind = 0
-                self._return_from_esc_st = None
-                self._reset_csi()
+                self._abort_string()
                 self._state = ParserState.GROUND
                 continue
 
             if state == ParserState.DCS_IGNORE:
-                if c1 and b == 0x9C:
-                    self._reset_csi()
-                    self._state = ParserState.GROUND
                 continue
 
             if b < 0x20:
@@ -984,22 +1030,6 @@ class Parser:
                 continue
 
             if state == ParserState.ESCAPE:
-                prev_str = self._return_from_esc_st
-                self._return_from_esc_st = None
-                if prev_str is not None and b == 0x5C:  # 'ESC \' -> 7-bit ST
-                    if prev_str == ParserState.OSC_STRING:
-                        self._dispatch_osc(sink, b"\x1b\\")
-                    elif prev_str == ParserState.DCS_PASSTHROUGH:
-                        self._dispatch_dcs(sink)
-                    elif prev_str == ParserState.SOS_PM_APC_STRING:
-                        self._dispatch_apc(sink)
-                    self._state = ParserState.GROUND
-                    continue
-                if prev_str is not None:
-                    self._str_buf.clear()
-                    self._str_overflow = False
-                    self._str_kind = 0
-
                 if 0x20 <= b <= 0x2F:
                     self._intermediates.append(b)
                     self._state = ParserState.ESCAPE_INTERMEDIATE
@@ -1111,12 +1141,7 @@ class Parser:
                     self._intermediates.append(b)
                     self._state = ParserState.DCS_INTERMEDIATE
                 elif 0x40 <= b <= 0x7E:
-                    self._dcs_params = self._finalize_params()
-                    self._dcs_intermediates = bytes(self._intermediates)
-                    self._dcs_final = b
-                    self._str_buf.clear()
-                    self._str_overflow = False
-                    self._state = ParserState.DCS_PASSTHROUGH
+                    self._enter_dcs_passthrough(b)
                 else:
                     self._state = ParserState.DCS_IGNORE
 
@@ -1125,12 +1150,7 @@ class Parser:
                     if len(self._intermediates) < MAX_INTERMEDIATES:
                         self._intermediates.append(b)
                 elif 0x40 <= b <= 0x7E:
-                    self._dcs_params = self._finalize_params()
-                    self._dcs_intermediates = bytes(self._intermediates)
-                    self._dcs_final = b
-                    self._str_buf.clear()
-                    self._str_overflow = False
-                    self._state = ParserState.DCS_PASSTHROUGH
+                    self._enter_dcs_passthrough(b)
                 else:
                     self._state = ParserState.DCS_IGNORE
 
@@ -1147,6 +1167,7 @@ __all__ = [
     "Execute",
     "OscDispatch",
     "Parser",
+    "ParserEncoding",
     "ParserState",
     "Print",
     "parse_sgr",

@@ -59,6 +59,9 @@ class Profile:
     pending_wrap_phantom_col: bool = False
 
 
+_DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
+
+
 @dataclass(frozen=True, slots=True)
 class Policy:
     """Default-deny host security and strictness policy.
@@ -84,9 +87,16 @@ class Policy:
     allow_unsafe_uris : bool
         Allow schemes outside ``http://``, ``https://``, and ``mailto:`` in
         HTML ``<a href>`` output (default ``False``).
-    unwrap_tmux_passthrough : bool
-        Unwrap ``DCS tmux; ESC ESC ... ST`` passthrough envelopes and feed the
-        inner byte stream (default ``True``).
+    allow_passthrough : bool
+        Re-feed unwrapped ``DCS tmux; ESC ESC ... ST`` inner byte streams into
+        :class:`~libvt.terminal.Terminal` in addition to emitting
+        :class:`~libvt.events.Passthrough` (default ``False``, matching
+        ``tmux``'s ``allow-passthrough off``).
+    osc7_hosts : frozenset[str]
+        Lowercase hostnames in ``OSC 7`` ``file://<host>/...`` URIs permitted
+        to update :attr:`~libvt.terminal.Terminal.cwd` (default
+        ``frozenset({"", "localhost"})``; :func:`~libvt.aio.open_pty` adds the
+        local machine hostname automatically).
     strict : bool
         Raise :exc:`~libvt.exc.ProtocolError` on unrecognized escape sequences
         instead of ignoring or recording :class:`~libvt.events.UnhandledSequence`
@@ -100,7 +110,8 @@ class Policy:
     allow_color_queries: bool = True
     allow_program_status_query: bool = False
     allow_unsafe_uris: bool = False
-    unwrap_tmux_passthrough: bool = True
+    allow_passthrough: bool = False
+    osc7_hosts: frozenset[str] = _DEFAULT_OSC7_HOSTS
     strict: bool = False
 
 

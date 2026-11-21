@@ -2,18 +2,96 @@
 
 from __future__ import annotations
 
+import pathlib
 import random
 import time
+import unicodedata
 
 import libvt
-from libvt._ucd import WidthRole
+from libvt._ucd import (
+    EXT_PICT_BIT,
+    WidthRole,
+    display_width,
+    segment_graphemes,
+    ucd_lookup,
+)
 from libvt.modes import Mode
+
+
+def test_unicode_17_grapheme_break_test_vectors() -> None:
+    """All 766 official Unicode 17.0.0 ``GraphemeBreakTest.txt`` vectors pass."""
+    fixture = (
+        pathlib.Path(__file__).resolve().parent
+        / "fixtures"
+        / "GraphemeBreakTest-17.0.0.txt"
+    )
+    count = 0
+    for raw in fixture.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        expected: list[str] = []
+        for chunk in line.split("\u00f7"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            expected.append(
+                "".join(chr(int(tok, 16)) for tok in chunk.split("\u00d7")),
+            )
+        text = "".join(expected)
+        assert segment_graphemes(text) == expected, raw
+        count += 1
+    assert count == 766
+
+
+def test_unicode_17_stdlib_parity_when_available() -> None:
+    """Verify 0 property mismatches against Python 3.15+ Unicode 17 ``unicodedata``."""
+    if unicodedata.unidata_version != "17.0.0" or not hasattr(
+        unicodedata, "grapheme_cluster_break"
+    ):
+        return
+
+    gcb_names = (
+        "Other",
+        "CR",
+        "LF",
+        "Control",
+        "Extend",
+        "ZWJ",
+        "Regional_Indicator",
+        "Prepend",
+        "SpacingMark",
+        "L",
+        "V",
+        "T",
+        "LV",
+        "LVT",
+    )
+    incb_names = ("None", "Linker", "Consonant", "Extend")
+    gcb_fn = unicodedata.grapheme_cluster_break
+    incb_fn = unicodedata.indic_conjunct_break
+    ep_fn = unicodedata.extended_pictographic
+
+    for cp in range(0x110000):
+        if 0xD800 <= cp <= 0xDFFF:
+            continue
+        ch = chr(cp)
+        word = ucd_lookup(cp)
+        assert gcb_names[(word >> 2) & 0x0F] == gcb_fn(ch), hex(cp)
+        assert incb_names[(word >> 6) & 0x03] == incb_fn(ch), hex(cp)
+        assert bool(word & EXT_PICT_BIT) == ep_fn(ch), hex(cp)
 
 
 def test_unicode_width_flags_zwj_incb_and_variation_selectors() -> None:
     """Flags, ZWJ emoji, Indic conjuncts, and VS15/VS16 obey ``?2027`` width rules."""
+    # Non-emoji bases (ASCII 'a', CJK '日') ignore VS16/VS15 width overrides!
+    assert display_width("a\ufe0f") == 1
+    assert display_width("日\ufe0e") == 2
+    assert display_width("❤\ufe0f") == 2
+    assert display_width("#\ufe0f\u20e3") == 2
+    assert display_width("⌚\ufe0e") == 1
+
     term = libvt.Terminal(rows=4, cols=10)
-    # Two adjacent Regional Indicator flag pairs occupy 2 + 2 = 4 columns.
     term.feed("🇯🇵🇺🇸!".encode())
     assert term.cursor.col == 5
     assert term[0, 0].text == "🇯🇵"
@@ -36,10 +114,20 @@ def test_unicode_width_flags_zwj_incb_and_variation_selectors() -> None:
     narrow_term.feed("abc❤️".encode())
     assert narrow_term[0].text == "abc"
     assert narrow_term[0].wrapped is True
+    assert narrow_term[0, 3].width_role == WidthRole.SPACER_HEAD
     assert narrow_term[1, 0].text == "❤️"
     assert narrow_term[1, 0].width == 2
     assert narrow_term.cursor.row == 1
     assert narrow_term.cursor.col == 2
+
+    # Overwriting (1, 0) with narrow 'Z' heals (0, 3) SPACER_HEAD and keeps wrapped.
+    narrow_term.feed(b"\x1b[2;1HZ")
+    assert narrow_term[0, 3].width_role == WidthRole.NARROW
+    assert narrow_term[0, 3].text == " "
+    assert narrow_term[0].wrapped is True
+    assert narrow_term[1, 0].text == "Z"
+    assert narrow_term[1, 1].text == " "
+    assert narrow_term[1, 1].width_role == WidthRole.NARROW
 
     # Disabling ?2027 leaves narrow base + VS16 at width 1.
     legacy = libvt.Terminal(rows=2, cols=6)
@@ -57,7 +145,6 @@ def test_combining_mark_cap_and_cluster_anchor_invalidation() -> None:
     assert elapsed < 0.25
     assert len(term[0, 0].text) == term.limits.max_grapheme_codepoints
 
-    # Moving cursor before sending a combining mark must NOT mutate the earlier cell.
     term.reset()
     term.feed(b"ab")
     term.feed(b"\x1b[1;1H" + "\u0301".encode())
@@ -71,49 +158,25 @@ def test_row_clear_range_ich_dch_wide_healing_and_frozen_rle() -> None:
     term.feed(b"   \x1b[K")
     assert term.screen._rows[0].used == 3
 
-    # ICH splitting wide cell at col=1 heals col=0 and clears wide head pushed to col=5.
+    # DCH clears pending_wrap and clears wrapped when shifting to right edge.
+    term.reset()
+    term.feed(b"12345678")
+    assert term[0].wrapped is True
+    term.feed(b"\x1b[1;6H!\x1b[P")
+    assert term.cursor.pending_wrap is False
+    assert term[0].wrapped is False
+    assert term[0].text == "12345"
+
     term.reset()
     term.feed("日本語".encode())
     term.feed(b"\x1b[1;2H\x1b[1@")
-    row0 = term.screen._rows[0]
-    for col in range(6):
-        role = (
-            WidthRole((row0.attrs[col] >> 60) & 0b11)
-            if row0.attrs is not None
-            else WidthRole.NARROW
-        )
-        if role == WidthRole.WIDE:
-            assert col + 1 < 6
-            assert row0.attrs is not None
-            next_role = WidthRole((row0.attrs[col + 1] >> 60) & 0b11)
-            assert next_role == WidthRole.SPACER_TAIL
-        if role == WidthRole.SPACER_TAIL:
-            assert col > 0
-            assert row0.attrs is not None
-            prev_role = WidthRole((row0.attrs[col - 1] >> 60) & 0b11)
-            assert prev_role == WidthRole.WIDE
+    _assert_grid_invariants(term)
 
-    # DCH splitting wide pairs at col=1 heals col=0.
     term.reset()
     term.feed("日本語".encode())
     term.feed(b"\x1b[1;2H\x1b[2P")
-    row0 = term.screen._rows[0]
-    for col in range(6):
-        role = (
-            WidthRole((row0.attrs[col] >> 60) & 0b11)
-            if row0.attrs is not None
-            else WidthRole.NARROW
-        )
-        if role == WidthRole.WIDE:
-            assert row0.attrs is not None
-            assert (
-                WidthRole((row0.attrs[col + 1] >> 60) & 0b11) == WidthRole.SPACER_TAIL
-            )
-        if role == WidthRole.SPACER_TAIL:
-            assert row0.attrs is not None
-            assert WidthRole((row0.attrs[col - 1] >> 60) & 0b11) == WidthRole.WIDE
+    _assert_grid_invariants(term)
 
-    # Scroll styled + wide lines into FrozenRow RLE history and inspect runs/cells.
     term.reset()
     for idx in range(8):
         term.feed(f"\x1b[38;2;10;20;{idx * 20}m日{idx}\r\n".encode())
@@ -126,8 +189,9 @@ def test_row_clear_range_ich_dch_wide_healing_and_frozen_rle() -> None:
 
 
 def _assert_grid_invariants(term: libvt.Terminal) -> None:
-    """Assert cursor bounds and wide-cell head/tail pairing across active rows."""
+    """Assert cursor bounds and wide-cell head/tail/spacer_head invariants."""
     scr = term.screen
+    declrmm = term.modes.is_set(Mode.DECLRMM)
     assert 0 <= scr.cursor.row < scr.rows
     assert 0 <= scr.cursor.col < scr.cols
     for r_idx, raw_row in enumerate(scr._rows):
@@ -145,6 +209,22 @@ def _assert_grid_invariants(term: libvt.Terminal) -> None:
                 assert c_idx > 0, f"orphan SPACER_TAIL at ({r_idx}, 0)"
                 head_role = WidthRole((raw_row.attrs[c_idx - 1] >> 60) & 0b11)
                 assert head_role == WidthRole.WIDE
+            elif (
+                role == WidthRole.SPACER_HEAD
+                and not declrmm
+                and c_idx == scr.cols - 1
+                and r_idx + 1 < scr.rows
+                and raw_row.wrapped
+            ):
+                next_row = scr._rows[r_idx + 1]
+                next_role = (
+                    WidthRole((next_row.attrs[0] >> 60) & 0b11)
+                    if next_row.attrs is not None
+                    else WidthRole.NARROW
+                )
+                assert next_role == WidthRole.WIDE, (
+                    f"stale SPACER_HEAD at ({r_idx}, {c_idx}) before {next_role}"
+                )
 
 
 def test_randomized_invariants_400_trials() -> None:

@@ -1,6 +1,15 @@
-"""Generated two-stage Unicode 17.0.0 cell-width and UAX #29 table.
+"""Generated two-stage Unicode 17.0.0 width and UAX #29 table.
 
 Regenerate with ``uv run python scripts/generate_ucd.py``.
+
+Packed 16-bit entry layout in ``_STAGE2``:
+- bits ``0..1``: cell width (``0``, ``1``, or ``2``)
+- bits ``2..5``: ``Grapheme_Cluster_Break`` property ID (``0..13``)
+- bits ``6..7``: ``Indic_Conjunct_Break`` property ID (``0..3``)
+- bit ``8``: ``Extended_Pictographic``
+- bit ``9``: ``Emoji_Modifier``
+- bit ``10``: ``emoji-variation-sequences.txt`` ``FE0E``/``FE0F`` base
+- bit ``11``: BiDi control / spoofing codepoint
 """
 
 from __future__ import annotations
@@ -21,87 +30,130 @@ class WidthRole(enum.IntEnum):
     SPACER_HEAD = 3
 
 
-class ClusterState(enum.IntEnum):
-    """Scalar UAX #29 grapheme cluster continuation state."""
+GCB_OTHER = 0
+GCB_CR = 1
+GCB_LF = 2
+GCB_CONTROL = 3
+GCB_EXTEND = 4
+GCB_ZWJ = 5
+GCB_REGIONAL_INDICATOR = 6
+GCB_PREPEND = 7
+GCB_SPACING_MARK = 8
+GCB_L = 9
+GCB_V = 10
+GCB_T = 11
+GCB_LV = 12
+GCB_LVT = 13
 
-    NONE = 0
-    BASE = 1
-    RI_ODD = 2
-    EXT_PICT = 3
-    EXT_PICT_ZWJ = 4
-    INCB_CONS = 5
-    INCB_LINKER = 6
+INCB_NONE = 0
+INCB_LINKER = 1
+INCB_CONSONANT = 2
+INCB_EXTEND = 3
 
+EXT_PICT_BIT = 1 << 8
+EMOJI_MOD_BIT = 1 << 9
+EMOJI_VS_BASE_BIT = 1 << 10
+BIDI_SPOOF_BIT = 1 << 11
 
-PROP_NONE = 0
-PROP_CONTROL = 1
-PROP_EXTEND = 2
-PROP_ZWJ = 3
-PROP_REGIONAL_INDICATOR = 4
-PROP_SPACING_MARK = 5
-PROP_EXTENDED_PICTOGRAPHIC = 6
-PROP_INCB_CONSONANT = 7
-PROP_INCB_LINKER = 8
-PROP_VS15 = 9
-PROP_VS16 = 10
-PROP_EMOJI_MODIFIER = 11
-
-EXT_PICT_BIT = 0x40
-BIDI_SPOOF_BIT = 0x80
+CLUSTER_NONE = 0
+_ACTIVE_BIT = 1
 
 UNICODE_VERSION = "17.0.0"
 
 _PACKED_B85 = (
-    "c-rk8hoa;pa9E?Fp5;{RtLu5{*?aH3_ZsZIpMJ!BxP+1rLJ}aPY{JajeVc?Zg@G9=oB{@j;SSD&4"
-    "9<rO;6lJ~5nK$HzzMh%E`!VA3ikXYPle!0xC*WY0@uK`a2>yMJ>0;)Z-kp*4>!Xt?Dv6vZiQ2D8="
-    "QvQ;SRVH&cI!($Ge%-_pr~sa39<c4~#_RL3qeO<c&o>5A$D-z@zN@F?bxFsHJ$4e?J9J!!z(KJO|"
-    "Ii3-BVm1TVuY@G86pufrSgCcFi2!#mDY-woi@4c}|rc^^KIzdj7s^hfY<1l~SjIeiMBS)P3E^!^v"
-    "@^Cjd!Yj?lWet*qm{f7Pj7QTb;+5aEl$6DH-;Ai*+eudxQclZPTgumc#_{Xq@gj>b4Ne3G*f0Qs`"
-    "!h{JECQO(xVZww76DCZUFk!;g;=k};(n7+72@`G*vmQX>Lgq|AFH+|yL0rHSL(+I#5hO+U8zf>V{"
-    ")RO`R`Tdv1kM|Yrc`2v6cb!a4mOtcF*r}vjzXoG1@20!r7y4isD;^M3$MWyC+n+3q><I$1u(&g5K"
-    "`vC;6R9CL#5)TXMyrLd(nwLD*wv_Me#}c2o;$y`ehD8WP=*?i}z}^(N+G6zWP)2h4PEfL9?lnSF@"
-    "B1y9=XVmml+7boot+t@aY2f1N(I>R-wvblqpemdATlc>BG|X0N_0hKgb)f_<ik;$xJ*Q>`gf=p(;"
-    "IpEnAH-Kz$ol3()cAiuBv_lEujeJ+1Vzm{c#KB-#)39SEnT-CoW{Rhb3$pq4Vm8n?zgOHqvuz*Nt"
-    "=1a&hS7Z&?rVDSe-8saj-<cJUy8?A-_#V}KHQc;cXJV45O4zz|c;tXp+uxE@1p!2~jmjDurNr|Qk"
-    "Fj2FYz<R<*o_QZ@5>x#2W*H?z5X5#=a6VYC$BhF9EuO2%>s{=XHvOSyFZgPa0O%OO9@eJ)v8A<3V"
-    "FljBc*|&gKnFp=1TvCLu#kbXj@+g-QEH0i<zbGmUZtC+W&6p{usLCiW?T*U}3;2-0*h%^@8hg{EK"
-    "iomIzCRBV|)U)>3;Tjz?$NiLUvMa|P7y<gFLR_#%IIlKB)Ae*k{^IhUM6<L1O%P+B8@9HDI9Ar7T"
-    "XtL#Iij#uKUw=yTF7g!!cdS(e!*0nltLummjq3yoySqD%vhx$GJ%95|VRXw3*rk0FYYAUa({-~R8"
-    ">LiTJh&GdZ6-<W?jR$mYOI%6S%6lDvtJf&M5~LBC`Fr(CUyso-ayZGD<ZhJ^qVGNs_ENh=cVj8AF"
-    "x=@h<&%D7c1E^`(fEm6pI8L6ORzNvx1Xb$Tygil@%^)XMH=pkMfm9dSiwrjY&<cbOG`Zw5B7_qT*"
-    "%bt4f?D$X!yMx6DMwC?>Jf@DTo?F_!VQmvm_w_vs%w6tr>gJQ)^AgrWV_Z>Cs|^4vrZQE+Lv74%x"
-    "<G=I-gj=8sOFF|E$@9)U44T4<1xt$hJdD;E>Y#Vz0XlZZ36I?EXm)s|m+4x}E31r5}7l)_4Tyk;&"
-    "%yXTJ{Ma*Me;hh6ahDz)u0Irv#clVc6o!=sQsW(AckQ~n9k~V4m1~L5BzqP8s7;F&xFh;c`L0E0M"
-    "Ql+`<HbYZZOTh;32jOe`#r_|;|EVHD>c&xV5UbHC<tj+=%{K(8y)PpVAtGd~g~Y99hsPsL)VkzNc"
-    "~x!0W54j@7yYEl$NEz0X(^Hvy)_&U-l`5nQ>#4g(gu^u7D8^^Ks}pb{bM+_Yg~T^n@|1shnTC@SJ"
-    "G(_{*kQ3{Oj8@$FTjDbxNeNj9HDNisVo=l^Y|_kvq9XP?<&w#w<ZC<i{8VbikAibTxD9EJAbs2oD"
-    "<$SiGrdE@|z19ye0?hZSNvtgBl+jm0^Rps6=1Lwx0Gt^9^9h&=Z7zZUh(I(xga<s^#-eSrdUTi<K"
-    "u(3gKB$q4I%6KtU(FkdkCp6MayDWqdfJ%cWJAff6ym`d%>WTC<xxj&d;!^t9hc%H{bgdaA6okj|*"
-    "=b()wKWcC4P{84*1NsjMMpMt$9aVDFo0MN$q@or&t~}J5xR{SQ26jE$L!IG~PXH!=wMXU+^E?o53"
-    "hl(E2dW<=<IZ<4oNNVZobo|Epq9RTA6fESuKo84X+7j8r%@pHAW5A#?SEg^clPUS0fQxoq>5P}&j"
-    ")8<s5*B_*>|E6rQT;Rg)}zfsB{h{Dm|5@ipnG3DpJbdX>C@%T4=U!{JO*C4RL|Z{QO+1n+vw_+ai"
-    "xg{1a%4IgRZPW@!S)jp59@W&qK8<p+q`oVmsP&3I+=Gax;)3-j*3UhMei(Sj-e|BJnGm;"
+    "c-rk<XWOJS6usa^SAAbydmWWkS65xj+I#P9*4}&Xy?&a12>bYhWEdFI2@n{{;XK34KoW9GZf-&f9"
+    "j5dMQiOC09Uw-h(rI*%PNy^IOxmM;I*ZPxL+Sl<vQPn?OXtz~bOBvR7tzJpl}qT-^n4jzP7At%u1"
+    "tSlm3|^ROjpx2bS)jB>*#tqI(giXQhj6kxrvU^&2$UhO1IH*x}ENzJLxWO|L&%HBm}jw&h5R~ulw"
+    "l!^!xxlNDm1i9?s5>(4+JiJx)*1lk^llP0!G?^c+1;FVKth61_}IIzg{EKlRlHId#Kp%9YpYjr9C"
+    "x`gyCdJm02wJml@&G^O|Gea)Q@oZ^3&em<g)=@a4Vr`+$)Qd&PxzrUa_>8tenYx+hA`z?J(-_sBD"
+    "BmG1_(=YTZ{YJm1*Z;`y=L||FV8&nI!OZ0!000000000000000001yq{7wJRzZQT)0002f#GVERv"
+    "-1J%JsEjA2ZU4)2)|Vfn)-Usq{=qm``cdtFjT}72P6#CEd}5Q(1(Q#@(+LRo4N%Dcj{Bm>EJMUUY"
+    "*iZHE|(b2?Sm8W5*V)IXI_UdpNYX<RWgIYGANs^1Uu;>(f5g<7@vl&Z2cq6glK-<qhlStvMHEQ1i"
+    "0EGCRxMkkcxyo*UHoasC`%^aq;%VhTm+O9c9ZoFm2eQj>>7$W7ot|7!bmlLc^<zi%Dq<<D!rT*lk"
+    "iKlXHd>wlpAA1FGj>VKIRll-e_bSnX}-Hvudf0A1QH~n9SsjvTmMgMp0BPJR3CHJHJccB-y^6#%4"
+    "nxE!J{wssc4kUXodk{;lmajAxtzA9rs{dWszc|x@WJ`aNNjS+$My$v_X<YsztL=z-uK!ngj^+AK)"
+    "c>WXMVff9f5VW!n?2$=#Mc=G-0Z<_=_@qd#cQ5o@2!sh*y@c8nf~Uvin&jpdTDR>$lh0VYreZT6T"
+    "6W2suS@1izKR-xy9YI=IZ3Hj8)bmvCz8G#Wl4Y`PwLu+98|#uV&D*cx2=l+Kk#`Bg5Ex!|{HqFHR"
+    "?|;wL-tIjZBYdV*RL#*!}|arL5zW$)g?=DB;bDqp^=NjyW_5OIB(k>J;tdL0S<ov^B7mA2Shxatj"
+    "&#)1Y}FJY{0uc<m0Yu=ZSd3>EM{kr*!tZ$8c)PD(=yCm=VETogr32hs)%lF^BMz__=m@64;YL?p;"
+    "r_Jl=qAx$@di0|$x0BBGT=iwt(g?fXyp`kDhb6vCRlO3(0OPM+?BX6BqW?_u8?4w*v3Ib5B_wNbN"
+    "1M|E+;i>oGiIhAJ>-&g7<wpR9I8W3+Gd3;w3ObELfG})l&r0EG6`h}i?gW5;Oxky3=F)kaFsLLRS"
+    "t72ZmZQ;dEVN5rn$=k@gC!zLL!uBF_8y_^^#G+=`t6rMu{_|E9AEbS8|C75*E{7O8scGwjxy;{!+"
+    "+2FLc)vIY)VIP)a+@b1COq49{_ssdCato1|3h`9u=+>vTdUYK1ZNUVJX29x{8Z=67dd6M<p1aN4&"
+    "3JeRr|mK6ZN7@1!9Gxz?%xobe!0L^0U7Cz|*h9yJa`rQ_VZ8@1DWX5nT9GwOh7I%s|)m8fA=FYh7"
+    "!}$0!@cM~`Hj4%Tz@%!%;d^*Mb?Z3jr0qL~_H&&z(&EPbBIVfsvGuI<H8(!0KvP|6*T)lg+85=E8"
+    "rwPt&1a5^^H=m^vwg03rH&I{f1hZ{b8!~)%4rn6pE33>GUO?>kHXiDWv@rSeKi^}PO#-xA3e<S`i"
+    "!D&jy=g=os%HiwmK_H0ezwQ`U-0O8*%GNMUHxPobGA_#6vv9Lp;PoJj6ph#6vv9Lp;PAS3K~;Pdr"
+    "omy58z>MXdhTeZw*DW8R}@fvR^$Rd1=A#P4pLQGhq;wXipV5x~3SULWf!)f?Zd-rrX+jdf7~%zXh"
+    "M#b&+^cu~H8w(owRj-&9gD?srSj7aErq+cH+Em6t=l*M=y^<X^MeD#^bIope<=iNX1o{b(`%VXU6"
+    "?x&G<<nQ{<qQZw?^e7LXyIkm2C0<s_cC)+FsxvBW^hZ6EGW{y_o00AMJ*M5qa1M1|MI>l_qS;{!E"
+    "!ehtt=Fu2<-h;^A<O+g`TbwT{eKf}kE?ACkB$dbJTc7~DCP<H-W4xV<W*2r?EIQ+_dwn3B(SKE=U"
+    "6-!`@R5i18X-1x>b1>I-hK3X`rn-RmeLW2hvVSZFW-~f2p6Y=EvII+>%LATUu=WZo0snVQ%q2JBI"
+    "cCNA^%xTE94G`1U8^=D3TV`o_17vJW)EwIuOvHhw3*sImNY{cv6Ee#-AOXR0NZ75OVU;X8*54)(p"
+    "a@Xm60UP#%l0!N1Sc0ugxkW16J#*MhFwGwGPp85Jcx<0u;yDHOSAROX7mO`e{i1ZZzTzmO9<t}nq"
+    "L8tBR&1&yJ*~dM-eqUgNy$ZxT9UTC4;TQ2OR&WUbhEPU_U?U(8pbH$`ev9+yfw5b!>Xmc-LT|l>%"
+    "b{}575)8e50)M75CIH%rZd*7hvooNhG_+j!0Y}!Re5Ne|LRmmvVRZ&phlQX&q~?9J+(euAE=)`v<"
+    "hg7B%fgxbN>sdZ=I?%)km3vOzQ9pd_eoR>m5!Z?>_5)bN$}uv)o3F#0|MN_Av{#@tLk(ojRItO79"
+    ";4V0_vG9~AXE<PRMH7v@vb#8&x37slT{1D!xe{Xoofip4P%4w;VXSXCixQt`{d`uQI}Sil<H+i*W"
+    "St7xe+9UYfYeS~ZJm^n>tKPq$XaovP0ImhyEGN&&+KM1Wfn`7c|IYKj7232;_zq|}F8JbeV!eHlM"
+    "jdH^{d%?DLL#2`#xmT4Z#>Lj~P~~qPf>lwv$!RX9{MyN|fSEr|cbH>b12*|8=@z)g1a3Bxv4>D?p"
+    "UAZLSw%eN_%yw~F{AdeGUQqxYNXvkSv1$mWr!^;jxf~ll4Y`Z1bpc7O6~_(eFZ6eg_psk5OyzxS*"
+    "|i6HKu)vbk%!V>I|K?d(6}_Z3$)#ILDNFRhy0|A-)FSb1K%`f@W`J&3R4CB=MQ}|5Jp6|5o0wIEL"
+    "1KcgbIu?N^`eV^{vxlaJrS%`SSk>h4#8G1sp<EuYr*t<8Q`wvD@zhG4m?!n#<0^F16maLoF^{J7c"
+    "A0bB0}z25@y$gw|j#K5Gn4*(YY59z2SMg"
 )
 
 
-def _unpack_tables() -> tuple[array.array[int], bytes]:
+def _unpack_tables() -> tuple[array.array[int], array.array[int]]:
     raw = zlib.decompress(base64.b85decode(_PACKED_B85))
     s1_len = int.from_bytes(raw[:4], "little")
     s1 = array.array("H")
     s1.frombytes(raw[4 : 4 + s1_len])
+    s2 = array.array("H")
+    s2.frombytes(raw[4 + s1_len :])
     if sys.byteorder != "little":
         s1.byteswap()
-    return s1, raw[4 + s1_len :]
+        s2.byteswap()
+    return s1, s2
 
 
 _STAGE1, _STAGE2 = _unpack_tables()
 
 
 def ucd_lookup(cp: int) -> int:
-    """Return packed 8-bit width and UAX #29 property entry for codepoint *cp*."""
+    """Return packed 16-bit width and UAX #29 property word for codepoint *cp*."""
     if 0 <= cp <= 0x10FFFF:
         return _STAGE2[(_STAGE1[cp >> 8] << 8) | (cp & 0xFF)]
-    return PROP_CONTROL << 2
+    return GCB_CONTROL << 2
+
+
+def _pack_state(
+    gcb: int,
+    ri_odd: int,
+    ep_state: int,
+    incb_state: int,
+    vs_base: int,
+) -> int:
+    return (
+        _ACTIVE_BIT
+        | (gcb << 1)
+        | (ri_odd << 5)
+        | (ep_state << 6)
+        | (incb_state << 8)
+        | (vs_base << 10)
+    )
+
+
+def init_cluster_state(cp: int, *, mode_2027: bool = True) -> int:
+    """Return initial packed cluster state for base codepoint *cp*."""
+    entry = ucd_lookup(cp)
+    gcb = (entry >> 2) & 0x0F
+    incb = (entry >> 6) & 0x03
+    ep = 1 if (entry & EXT_PICT_BIT) else 0
+    vs_b = 1 if (entry & EMOJI_VS_BASE_BIT) else 0
+    ri_odd = 1 if (mode_2027 and gcb == GCB_REGIONAL_INDICATOR) else 0
+    incb_st = 1 if incb == INCB_CONSONANT else 0
+    return _pack_state(gcb, ri_odd, ep, incb_st, vs_b)
 
 
 def char_width(ch: str) -> int:
@@ -113,67 +165,139 @@ def char_width(ch: str) -> int:
 
 
 def step_cluster(
-    prev_state: ClusterState,
+    prev_state: int,
     cp: int,
     *,
     mode_2027: bool,
-) -> tuple[bool, ClusterState, int]:
+) -> tuple[bool, int, int]:
     """Evaluate UAX #29 continuation between *prev_state* and codepoint *cp*.
 
     Returns
     -------
-    tuple[bool, ClusterState, int]
+    tuple[bool, int, int]
         ``(extends_previous, next_state, width_override)`` where
         ``width_override`` is ``-1`` (keep current cluster width), ``1``
-        (narrow via ``VS15``), or ``2`` (widen via ``VS16``, emoji modifier,
-        ZWJ pictographic, or Regional Indicator pair).
+        (narrow via ``VS15`` on an emoji variation base), or ``2`` (widen via
+        ``VS16`` on an emoji variation base, emoji modifier, ZWJ pictographic,
+        Regional Indicator pair, or wide glyph after ``Prepend``).
     """
     entry = ucd_lookup(cp)
-    prop = (entry >> 2) & 0x0F
+    gcb = (entry >> 2) & 0x0F
+    incb = (entry >> 6) & 0x03
+    ep = bool(entry & EXT_PICT_BIT)
+    w = entry & 0b11
 
-    if prev_state != ClusterState.NONE:
-        if prop == PROP_EXTEND:
-            return True, prev_state, -1
-        if prop == PROP_VS16:
-            return True, prev_state, (2 if mode_2027 else -1)
-        if prop == PROP_VS15:
-            return True, prev_state, (1 if mode_2027 else -1)
-        if mode_2027:
-            if prop == PROP_SPACING_MARK:
-                next_st = (
-                    prev_state
-                    if prev_state in (ClusterState.INCB_CONS, ClusterState.EXT_PICT)
-                    else ClusterState.BASE
-                )
-                return True, next_st, -1
-            if prop == PROP_ZWJ:
-                next_st = (
-                    ClusterState.EXT_PICT_ZWJ
-                    if prev_state == ClusterState.EXT_PICT
-                    else ClusterState.BASE
-                )
-                return True, next_st, -1
-            if prop == PROP_EMOJI_MODIFIER and prev_state == ClusterState.EXT_PICT:
-                return True, ClusterState.EXT_PICT, 2
-            if prev_state == ClusterState.EXT_PICT_ZWJ and (entry & EXT_PICT_BIT):
-                return True, ClusterState.EXT_PICT, 2
-            if prop == PROP_REGIONAL_INDICATOR and prev_state == ClusterState.RI_ODD:
-                return True, ClusterState.BASE, 2
-            if prop == PROP_INCB_LINKER and prev_state == ClusterState.INCB_CONS:
-                return True, ClusterState.INCB_LINKER, -1
-            if prop == PROP_INCB_CONSONANT and prev_state == ClusterState.INCB_LINKER:
-                return True, ClusterState.INCB_CONS, -1
+    if prev_state & _ACTIVE_BIT:
+        prev_g = (prev_state >> 1) & 0x0F
+        ri_odd = (prev_state >> 5) & 0x01
+        ep_state = (prev_state >> 6) & 0x03
+        incb_state = (prev_state >> 8) & 0x03
+        vs_base = (prev_state >> 10) & 0x01
 
-    # Start of a new base cell (or dropped standalone zero-width character).
-    if prop == PROP_REGIONAL_INDICATOR and mode_2027:
-        return False, ClusterState.RI_ODD, -1
-    if entry & EXT_PICT_BIT:
-        return False, ClusterState.EXT_PICT, -1
-    if prop == PROP_INCB_CONSONANT:
-        return False, ClusterState.INCB_CONS, -1
-    if (entry & 0b11) == 0:
-        return False, ClusterState.NONE, -1
-    return False, ClusterState.BASE, -1
+        if not mode_2027:
+            if gcb == GCB_EXTEND:
+                return True, _pack_state(gcb, 0, ep_state, incb_state, 0), -1
+            if w == 0:
+                return False, CLUSTER_NONE, -1
+            return False, init_cluster_state(cp, mode_2027=False), -1
+
+        joined = False
+        if prev_g == GCB_CR and gcb == GCB_LF:
+            joined = True
+        elif prev_g in (GCB_CR, GCB_LF, GCB_CONTROL) or gcb in (
+            GCB_CR,
+            GCB_LF,
+            GCB_CONTROL,
+        ):
+            joined = False
+        elif (
+            (prev_g == GCB_L and gcb in (GCB_L, GCB_V, GCB_LV, GCB_LVT))
+            or (prev_g in (GCB_LV, GCB_V) and gcb in (GCB_V, GCB_T))
+            or (prev_g in (GCB_LVT, GCB_T) and gcb == GCB_T)
+            or gcb in (GCB_EXTEND, GCB_ZWJ, GCB_SPACING_MARK)
+            or prev_g == GCB_PREPEND
+            or (incb_state == 2 and incb == INCB_CONSONANT)
+            or (ep_state == 2 and ep)
+            or (ri_odd == 1 and gcb == GCB_REGIONAL_INDICATOR)
+        ):
+            joined = True
+
+        if joined:
+            w_override = -1
+            if cp == 0xFE0F and vs_base:
+                w_override = 2
+            elif cp == 0xFE0E and vs_base:
+                w_override = 1
+            elif (
+                ((entry & EMOJI_MOD_BIT) and ep_state == 1)
+                or (ep_state == 2 and ep)
+                or (ri_odd == 1 and gcb == GCB_REGIONAL_INDICATOR)
+                or (prev_g == GCB_PREPEND and w == 2)
+            ):
+                w_override = 2
+
+            next_ri = (ri_odd ^ 1) if gcb == GCB_REGIONAL_INDICATOR else 0
+            if ep_state == 1 and gcb == GCB_EXTEND:
+                next_ep = 1
+            elif ep_state == 1 and gcb == GCB_ZWJ:
+                next_ep = 2
+            elif ep:
+                next_ep = 1
+            else:
+                next_ep = 0
+
+            if incb == INCB_CONSONANT:
+                next_incb = 1
+            elif incb_state in (1, 2) and incb == INCB_LINKER:
+                next_incb = 2
+            elif incb_state in (1, 2) and incb == INCB_EXTEND:
+                next_incb = incb_state
+            else:
+                next_incb = 0
+
+            next_vs = (
+                1 if (prev_g == GCB_PREPEND and (entry & EMOJI_VS_BASE_BIT)) else 0
+            )
+            return (
+                True,
+                _pack_state(gcb, next_ri, next_ep, next_incb, next_vs),
+                w_override,
+            )
+
+    if w == 0 and gcb in (GCB_CR, GCB_LF, GCB_CONTROL, GCB_EXTEND, GCB_ZWJ):
+        return False, CLUSTER_NONE, -1
+    return False, init_cluster_state(cp, mode_2027=mode_2027), -1
+
+
+def segment_graphemes(text: str) -> list[str]:
+    """Segment *text* into Unicode 17.0.0 UAX #29 extended grapheme clusters."""
+    if not text:
+        return []
+    clusters: list[str] = []
+    buf: list[str] = [text[0]]
+    state = init_cluster_state(ord(text[0]), mode_2027=True)
+    for ch in text[1:]:
+        cp = ord(ch)
+        entry = ucd_lookup(cp)
+        gcb = (entry >> 2) & 0x0F
+        prev_g = (state >> 1) & 0x0F
+        if prev_g in (GCB_CR, GCB_LF, GCB_CONTROL) and not (
+            prev_g == GCB_CR and gcb == GCB_LF
+        ):
+            clusters.append("".join(buf))
+            buf = [ch]
+            state = init_cluster_state(cp, mode_2027=True)
+            continue
+        extends, next_state, _ = step_cluster(state, cp, mode_2027=True)
+        if extends:
+            buf.append(ch)
+            state = next_state
+        else:
+            clusters.append("".join(buf))
+            buf = [ch]
+            state = init_cluster_state(cp, mode_2027=True)
+    clusters.append("".join(buf))
+    return clusters
 
 
 def display_width(text: str, *, mode_2027: bool = True) -> int:
@@ -182,13 +306,12 @@ def display_width(text: str, *, mode_2027: bool = True) -> int:
         return sum(1 for ch in text if " " <= ch <= "~")
     total = 0
     cur_w = 0
-    state = ClusterState.NONE
+    state = CLUSTER_NONE
     for ch in text:
         cp = ord(ch)
-        if 0x20 <= cp <= 0x7E:
-            total += cur_w
+        if 0x20 <= cp <= 0x7E and state == CLUSTER_NONE:
             cur_w = 1
-            state = ClusterState.BASE
+            state = init_cluster_state(cp, mode_2027=mode_2027)
             continue
         extends, state, w_override = step_cluster(state, cp, mode_2027=mode_2027)
         if extends:
@@ -216,12 +339,14 @@ def sanitize_terminal_text(text: str) -> str:
 
 __all__ = [
     "BIDI_SPOOF_BIT",
+    "CLUSTER_NONE",
     "UNICODE_VERSION",
-    "ClusterState",
     "WidthRole",
     "char_width",
     "display_width",
+    "init_cluster_state",
     "sanitize_terminal_text",
+    "segment_graphemes",
     "step_cluster",
     "ucd_lookup",
 ]

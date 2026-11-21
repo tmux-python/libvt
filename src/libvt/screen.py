@@ -526,6 +526,35 @@ class Screen:
         """Clear all sealed scrollback rows (``ED 3``)."""
         self._history.clear()
 
+    def _clear_row_spacer_head(self, row_obj: _Row) -> None:
+        if not row_obj.has_wide or row_obj.attrs is None:
+            return
+        last = self._cols - 1
+        if raw_width_bits(row_obj.attrs[last]) == int(WidthRole.SPACER_HEAD):
+            row_obj.chars[last] = " "
+            row_obj.attrs[last] &= _WIDTH_CLEAR_MASK
+            while (
+                row_obj.used > 0
+                and row_obj.chars[row_obj.used - 1] == " "
+                and row_obj.attr_at(row_obj.used - 1) == 0
+                and row_obj.ext_at(row_obj.used - 1) is None
+            ):
+                row_obj.used -= 1
+
+    def heal_wrapped_spacer_head(self, row: int) -> None:
+        """Clear a preceding row's ``SPACER_HEAD`` when ``(row, 0)`` splits."""
+        if row <= 0 or row > len(self._rows):
+            return
+        prev = self._rows[row - 1]
+        if not prev.has_wide or prev.attrs is None:
+            return
+        if row == len(self._rows) or not prev.wrapped:
+            self._clear_row_spacer_head(prev)
+            return
+        cur = self._rows[row]
+        if raw_width_bits(cur.attr_at(0)) != int(WidthRole.WIDE):
+            self._clear_row_spacer_head(prev)
+
     @property
     def lines(self) -> tuple[str, ...]:
         """Return right-trimmed text for every visible row."""
@@ -577,6 +606,12 @@ class Screen:
         full_width = left == 0 and r_col == self._cols - 1
 
         if full_width:
+            if t_row > 0:
+                self._rows[t_row - 1].wrapped = False
+                self._clear_row_spacer_head(self._rows[t_row - 1])
+            if b_row < len(self._rows) - 1:
+                self._rows[b_row].wrapped = False
+                self._clear_row_spacer_head(self._rows[b_row])
             can_save = (
                 save_history
                 and t_row == 0
@@ -598,6 +633,10 @@ class Screen:
         for dst_r in range(t_row, b_row - shift + 1):
             src_row = self._rows[dst_r + shift]
             dst_row = self._rows[dst_r]
+            dst_row.wrapped = False
+            self._clear_row_spacer_head(dst_row)
+            if dst_r > 0 and left <= 1:
+                self._clear_row_spacer_head(self._rows[dst_r - 1])
             dst_row._heal_wide_boundary(left)
             dst_row._heal_wide_boundary(r_col)
             src_row._heal_wide_boundary(left)
@@ -610,6 +649,10 @@ class Screen:
             dst_row.used = max(dst_row.used, min(src_row.used, r_col + 1))
 
         for clr_r in range(b_row - shift + 1, b_row + 1):
+            self._rows[clr_r].wrapped = False
+            self._clear_row_spacer_head(self._rows[clr_r])
+            if clr_r > 0 and left <= 1:
+                self._clear_row_spacer_head(self._rows[clr_r - 1])
             self._rows[clr_r].clear_range(left, r_col + 1, bce_word, bce_ext)
 
     def scroll_down(
@@ -633,16 +676,26 @@ class Screen:
         full_width = left == 0 and r_col == self._cols - 1
 
         if full_width:
+            if t_row > 0:
+                self._rows[t_row - 1].wrapped = False
+                self._clear_row_spacer_head(self._rows[t_row - 1])
             recycled = self._rows[b_row - shift + 1 : b_row + 1]
             del self._rows[b_row - shift + 1 : b_row + 1]
             for row_ev in recycled:
                 row_ev.reset_blank(self._cols, bce_word, bce_ext)
             self._rows[t_row:t_row] = recycled
+            if b_row < len(self._rows) - 1:
+                self._rows[b_row].wrapped = False
+                self._clear_row_spacer_head(self._rows[b_row])
             return
 
         for dst_r in range(b_row, t_row + shift - 1, -1):
             src_row = self._rows[dst_r - shift]
             dst_row = self._rows[dst_r]
+            dst_row.wrapped = False
+            self._clear_row_spacer_head(dst_row)
+            if dst_r > 0 and left <= 1:
+                self._clear_row_spacer_head(self._rows[dst_r - 1])
             dst_row._heal_wide_boundary(left)
             dst_row._heal_wide_boundary(r_col)
             src_row._heal_wide_boundary(left)
@@ -655,6 +708,10 @@ class Screen:
             dst_row.used = max(dst_row.used, min(src_row.used, r_col + 1))
 
         for clr_r in range(t_row, t_row + shift):
+            self._rows[clr_r].wrapped = False
+            self._clear_row_spacer_head(self._rows[clr_r])
+            if clr_r > 0 and left <= 1:
+                self._clear_row_spacer_head(self._rows[clr_r - 1])
             self._rows[clr_r].clear_range(left, r_col + 1, bce_word, bce_ext)
 
     def push_scrollback_and_clear(

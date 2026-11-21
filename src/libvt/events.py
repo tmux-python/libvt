@@ -298,6 +298,19 @@ class ScreenErased:
 
 
 @dataclass(frozen=True, slots=True)
+class Passthrough:
+    """Emitted when a ``DCS tmux; ESC ESC ... ST`` passthrough envelope arrives.
+
+    Attributes
+    ----------
+    data : bytes
+        Payload bytes with one layer of ``ESC ESC`` un-doubled.
+    """
+
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class UnhandledSequence:
     """Recorded when an unrecognized control sequence arrives and ``strict=False``.
 
@@ -326,6 +339,7 @@ type Event = (
     | SixelGraphic
     | KittyGraphic
     | ScreenErased
+    | Passthrough
     | UnhandledSequence
 )
 
@@ -338,6 +352,7 @@ __all__ = [
     "InBandResize",
     "KittyCommand",
     "KittyGraphic",
+    "Passthrough",
     "ProgramStatusChanged",
     "PromptKind",
     "PromptZone",

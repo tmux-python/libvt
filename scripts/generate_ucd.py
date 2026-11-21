@@ -1,100 +1,71 @@
-"""Generate the compact two-stage Unicode 17.0 width & UAX #29 table in libvt._ucd."""
+"""Compile SHA-256-pinned Unicode 17.0.0 UCD & Emoji tables into ``libvt._ucd``."""
 
 from __future__ import annotations
 
+import argparse
 import base64
+import hashlib
 import pathlib
-import unicodedata
+import urllib.request
 import zlib
 
-PROP_NONE = 0
-PROP_CONTROL = 1
-PROP_EXTEND = 2
-PROP_ZWJ = 3
-PROP_REGIONAL_INDICATOR = 4
-PROP_SPACING_MARK = 5
-PROP_EXTENDED_PICTOGRAPHIC = 6
-PROP_INCB_CONSONANT = 7
-PROP_INCB_LINKER = 8
-PROP_VS15 = 9
-PROP_VS16 = 10
-PROP_EMOJI_MODIFIER = 11
+UNICODE_VERSION = "17.0.0"
+_BASE_URL = f"https://www.unicode.org/Public/{UNICODE_VERSION}"
 
-EXT_PICT_BIT = 0x40
-BIDI_SPOOF_BIT = 0x80
+PINNED_UCD_FILES: dict[str, tuple[str, str]] = {
+    "DerivedCoreProperties.txt": (
+        f"{_BASE_URL}/ucd/DerivedCoreProperties.txt",
+        "24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da22c08",
+    ),
+    "DerivedGeneralCategory.txt": (
+        f"{_BASE_URL}/ucd/extracted/DerivedGeneralCategory.txt",
+        "d62e5bab70ca74f099343f71224fa051cb1fdd61a1ab45c0488c44cfc0b6102e",
+    ),
+    "EastAsianWidth.txt": (
+        f"{_BASE_URL}/ucd/EastAsianWidth.txt",
+        "ea7ce50f3444a050333448dffef1cadd9325af55cbb764b4a2280faf52170a33",
+    ),
+    "GraphemeBreakProperty.txt": (
+        f"{_BASE_URL}/ucd/auxiliary/GraphemeBreakProperty.txt",
+        "d6b51d1d2ae5c33b451b7ed994b48f1f4dc62b2272a5831e7fd418514a6bae89",
+    ),
+    "GraphemeBreakTest.txt": (
+        f"{_BASE_URL}/ucd/auxiliary/GraphemeBreakTest.txt",
+        "e2d134d2c52919bace503ebb6a551c1855fe1a1faec18478c78fff254a1793ec",
+    ),
+    "emoji-data.txt": (
+        f"{_BASE_URL}/ucd/emoji/emoji-data.txt",
+        "2cb2bb9455cda83e8481541ecf5b6dfda66a3bb89efa3fa7c5297eccf607b72b",
+    ),
+    "emoji-variation-sequences.txt": (
+        f"{_BASE_URL}/ucd/emoji/emoji-variation-sequences.txt",
+        "bb3d09ef03f206012c7532dd52dc0a21c9efddba0135ea4cf0d9201b8b9bba7e",
+    ),
+}
 
-# Unicode Indic_Conjunct_Break=Linker (Virama / Halant) codepoints across Indic scripts.
-INCB_LINKERS: frozenset[int] = frozenset(
-    {
-        0x094D,  # Devanagari
-        0x09CD,  # Bengali
-        0x0A4D,  # Gurmukhi
-        0x0ACD,  # Gujarati
-        0x0B4D,  # Oriya
-        0x0BCD,  # Tamil
-        0x0C4D,  # Telugu
-        0x0CCD,  # Kannada
-        0x0D4D,  # Malayalam
-        0x0DCA,  # Sinhala
-        0x1039,  # Myanmar
-        0x17D2,  # Khmer
-        0x1A60,  # Tai Tham
-        0x1B44,  # Balinese
-        0xA9C0,  # Javanese
-    },
-)
+GCB_IDS: dict[str, int] = {
+    "Other": 0,
+    "CR": 1,
+    "LF": 2,
+    "Control": 3,
+    "Extend": 4,
+    "ZWJ": 5,
+    "Regional_Indicator": 6,
+    "Prepend": 7,
+    "SpacingMark": 8,
+    "L": 9,
+    "V": 10,
+    "T": 11,
+    "LV": 12,
+    "LVT": 13,
+}
 
-INCB_CONSONANT_RANGES: tuple[tuple[int, int], ...] = (
-    (0x0915, 0x0939),
-    (0x0958, 0x095F),
-    (0x0978, 0x097F),
-    (0x0995, 0x09B9),
-    (0x09DC, 0x09DF),
-    (0x09F0, 0x09F1),
-    (0x0A15, 0x0A39),
-    (0x0A59, 0x0A5E),
-    (0x0A95, 0x0AB9),
-    (0x0B15, 0x0B39),
-    (0x0B5C, 0x0B5D),
-    (0x0B95, 0x0BB9),
-    (0x0C15, 0x0C39),
-    (0x0C58, 0x0C5A),
-    (0x0C95, 0x0CB9),
-    (0x0D15, 0x0D3A),
-    (0x0D9A, 0x0DC6),
-)
-
-# Official Unicode Extended_Pictographic core blocks for UAX #29 GB11 ZWJ sequences.
-EXT_PICT_RANGES: tuple[tuple[int, int], ...] = (
-    (0x00A9, 0x00A9),
-    (0x00AE, 0x00AE),
-    (0x203C, 0x203C),
-    (0x2049, 0x2049),
-    (0x2122, 0x2122),
-    (0x2139, 0x2139),
-    (0x2194, 0x2199),
-    (0x21A9, 0x21AA),
-    (0x231A, 0x231B),
-    (0x2328, 0x2328),
-    (0x23CF, 0x23CF),
-    (0x23E9, 0x23F3),
-    (0x23F8, 0x23FA),
-    (0x24C2, 0x24C2),
-    (0x25AA, 0x25AB),
-    (0x25B6, 0x25B6),
-    (0x25C0, 0x25C0),
-    (0x25FB, 0x25FE),
-    (0x2600, 0x27BF),
-    (0x2934, 0x2935),
-    (0x2B05, 0x2B07),
-    (0x2B1B, 0x2B1C),
-    (0x2B50, 0x2B50),
-    (0x2B55, 0x2B55),
-    (0x3030, 0x3030),
-    (0x303D, 0x303D),
-    (0x3297, 0x3299),
-    (0x1F000, 0x1FAFF),
-)
+INCB_IDS: dict[str, int] = {
+    "None": 0,
+    "Linker": 1,
+    "Consonant": 2,
+    "Extend": 3,
+}
 
 BIDI_SPOOF: frozenset[int] = frozenset(
     {
@@ -105,66 +76,147 @@ BIDI_SPOOF: frozenset[int] = frozenset(
 )
 
 
-def _in_ranges(cp: int, ranges: tuple[tuple[int, int], ...]) -> bool:
-    return any(lo <= cp <= hi for lo, hi in ranges)
+def _ensure_verified_file(ucd_dir: pathlib.Path, filename: str) -> pathlib.Path:
+    url, expected_sha256 = PINNED_UCD_FILES[filename]
+    path = ucd_dir / filename
+    if not path.exists():
+        ucd_dir.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = resp.read()
+        path.write_bytes(data)
+    actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual_sha256 != expected_sha256:
+        msg = (
+            f"SHA-256 mismatch for {filename}: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+        raise RuntimeError(msg)
+    return path
 
 
-def _classify(cp: int) -> int:
-    if 0xD800 <= cp <= 0xDFFF:
-        return PROP_CONTROL << 2
-    ch = chr(cp)
-    bidi_bit = BIDI_SPOOF_BIT if cp in BIDI_SPOOF else 0
-    if cp < 0x20 or 0x7F <= cp < 0xA0:
-        return (PROP_CONTROL << 2) | bidi_bit
-    if 0x20 <= cp <= 0x7E:
-        return 1  # width=1, prop=NONE
-
-    if cp == 0x200D:
-        return (PROP_ZWJ << 2) | bidi_bit
-    if cp == 0xFE0E:
-        return (PROP_VS15 << 2) | bidi_bit
-    if cp == 0xFE0F:
-        return (PROP_VS16 << 2) | bidi_bit
-    if 0xFE00 <= cp <= 0xFE0D or 0xE0100 <= cp <= 0xE01EF:
-        return (PROP_EXTEND << 2) | bidi_bit
-    if 0x1F1E6 <= cp <= 0x1F1FF:
-        # Single Regional Indicator has base width 1; pair widens to 2 under ?2027.
-        return 1 | (PROP_REGIONAL_INDICATOR << 2) | bidi_bit
-    if 0x1F3FB <= cp <= 0x1F3FF:
-        return 2 | (PROP_EMOJI_MODIFIER << 2) | EXT_PICT_BIT | bidi_bit
-    if cp in INCB_LINKERS:
-        return (PROP_INCB_LINKER << 2) | bidi_bit
-
-    cat = unicodedata.category(ch)
-    if cat in ("Mn", "Me") or unicodedata.combining(ch):
-        return (PROP_EXTEND << 2) | bidi_bit
-    if cat == "Mc":
-        eaw = unicodedata.east_asian_width(ch)
-        w = 2 if eaw in ("W", "F") else 1
-        return w | (PROP_SPACING_MARK << 2) | bidi_bit
-    if cat == "Cf":
-        return (PROP_CONTROL << 2) | bidi_bit
-
-    eaw = unicodedata.east_asian_width(ch)
-    width = 2 if eaw in ("W", "F") else 1
-
-    if _in_ranges(cp, INCB_CONSONANT_RANGES) and cat == "Lo":
-        return width | (PROP_INCB_CONSONANT << 2) | bidi_bit
-    if _in_ranges(cp, EXT_PICT_RANGES) and cat in ("So", "Sk", "Sm", "Po"):
-        return width | (PROP_EXTENDED_PICTOGRAPHIC << 2) | EXT_PICT_BIT | bidi_bit
-
-    return width | bidi_bit
+def _parse_codepoint_ranges(
+    path: pathlib.Path,
+    *,
+    value_col: int = 1,
+    filter_col1: str | None = None,
+) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(";")]
+        if filter_col1 is not None and parts[1] != filter_col1:
+            continue
+        val = parts[value_col]
+        rng = parts[0]
+        if ".." in rng:
+            lo_s, hi_s = rng.split("..")
+            lo, hi = int(lo_s, 16), int(hi_s, 16)
+        else:
+            lo = hi = int(rng, 16)
+        for cp in range(lo, hi + 1):
+            result[cp] = val
+    return result
 
 
-def build_tables() -> tuple[bytes, bytes]:
-    """Build deduplicated stage-1 (u16 LE) and stage-2 (u8) 256-codepoint tables."""
+def _parse_emoji_sets(path: pathlib.Path) -> tuple[set[int], set[int]]:
+    ext_pict: set[int] = set()
+    emoji_mod: set[int] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(";")]
+        prop = parts[1]
+        if prop not in ("Extended_Pictographic", "Emoji_Modifier"):
+            continue
+        rng = parts[0]
+        if ".." in rng:
+            lo_s, hi_s = rng.split("..")
+            lo, hi = int(lo_s, 16), int(hi_s, 16)
+        else:
+            lo = hi = int(rng, 16)
+        target = ext_pict if prop == "Extended_Pictographic" else emoji_mod
+        target.update(range(lo, hi + 1))
+    return ext_pict, emoji_mod
+
+
+def _parse_emoji_vs_bases(path: pathlib.Path) -> set[int]:
+    bases: set[int] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        seq = [int(tok, 16) for tok in line.split(";")[0].split()]
+        if len(seq) == 2 and seq[1] == 0xFE0F:
+            bases.add(seq[0])
+    return bases
+
+
+def build_tables(ucd_dir: pathlib.Path) -> tuple[bytes, bytes]:
+    """Compile deduplicated stage-1 and stage-2 u16LE 256-codepoint tables."""
+    gcb_map = _parse_codepoint_ranges(
+        _ensure_verified_file(ucd_dir, "GraphemeBreakProperty.txt"),
+        value_col=1,
+    )
+    incb_map = _parse_codepoint_ranges(
+        _ensure_verified_file(ucd_dir, "DerivedCoreProperties.txt"),
+        value_col=2,
+        filter_col1="InCB",
+    )
+    eaw_map = _parse_codepoint_ranges(
+        _ensure_verified_file(ucd_dir, "EastAsianWidth.txt"),
+        value_col=1,
+    )
+    gc_map = _parse_codepoint_ranges(
+        _ensure_verified_file(ucd_dir, "DerivedGeneralCategory.txt"),
+        value_col=1,
+    )
+    ext_pict, emoji_mod = _parse_emoji_sets(
+        _ensure_verified_file(ucd_dir, "emoji-data.txt"),
+    )
+    vs_bases = _parse_emoji_vs_bases(
+        _ensure_verified_file(ucd_dir, "emoji-variation-sequences.txt"),
+    )
+    _ensure_verified_file(ucd_dir, "GraphemeBreakTest.txt")
+
     block_map: dict[bytes, int] = {}
     stage1_indices: list[int] = []
     stage2_blocks: list[bytes] = []
 
     for block_idx in range(0x110000 >> 8):
         base = block_idx << 8
-        block = bytes(_classify(base + offset) for offset in range(256))
+        words: list[bytes] = []
+        for offset in range(256):
+            cp = base + offset
+            gcb = GCB_IDS[gcb_map.get(cp, "Other")]
+            incb = INCB_IDS[incb_map.get(cp, "None")]
+            gc = gc_map.get(cp, "Cn")
+            eaw = eaw_map.get(cp, "N")
+            if 0xD800 <= cp <= 0xDFFF or cp < 0x20 or 0x7F <= cp < 0xA0:
+                width = 0
+            elif cp == 0x00AD or 0x1F1E6 <= cp <= 0x1F1FF:
+                width = 1
+            elif gc in ("Mn", "Me", "Cf") and gcb != GCB_IDS["Prepend"]:
+                width = 0
+            elif eaw in ("W", "F"):
+                width = 2
+            else:
+                width = 1
+
+            entry = (
+                width
+                | (gcb << 2)
+                | (incb << 6)
+                | ((1 if cp in ext_pict else 0) << 8)
+                | ((1 if cp in emoji_mod else 0) << 9)
+                | ((1 if cp in vs_bases else 0) << 10)
+                | ((1 if cp in BIDI_SPOOF else 0) << 11)
+            )
+            words.append(entry.to_bytes(2, "little"))
+
+        block = b"".join(words)
         idx = block_map.get(block)
         if idx is None:
             idx = len(stage2_blocks)
@@ -184,10 +236,18 @@ def render_module(stage1: bytes, stage2: bytes) -> str:
     lines = [compressed[i : i + 76] for i in range(0, len(compressed), 76)]
     b85_literal = "\n".join(f'    "{ln}"' for ln in lines)
 
-    ver = unicodedata.unidata_version
-    return f'''"""Generated two-stage Unicode {ver} cell-width and UAX #29 table.
+    return f'''"""Generated two-stage Unicode {UNICODE_VERSION} width and UAX #29 table.
 
 Regenerate with ``uv run python scripts/generate_ucd.py``.
+
+Packed 16-bit entry layout in ``_STAGE2``:
+- bits ``0..1``: cell width (``0``, ``1``, or ``2``)
+- bits ``2..5``: ``Grapheme_Cluster_Break`` property ID (``0..13``)
+- bits ``6..7``: ``Indic_Conjunct_Break`` property ID (``0..3``)
+- bit ``8``: ``Extended_Pictographic``
+- bit ``9``: ``Emoji_Modifier``
+- bit ``10``: ``emoji-variation-sequences.txt`` ``FE0E``/``FE0F`` base
+- bit ``11``: BiDi control / spoofing codepoint
 """
 
 from __future__ import annotations
@@ -208,59 +268,91 @@ class WidthRole(enum.IntEnum):
     SPACER_HEAD = 3
 
 
-class ClusterState(enum.IntEnum):
-    """Scalar UAX #29 grapheme cluster continuation state."""
+GCB_OTHER = 0
+GCB_CR = 1
+GCB_LF = 2
+GCB_CONTROL = 3
+GCB_EXTEND = 4
+GCB_ZWJ = 5
+GCB_REGIONAL_INDICATOR = 6
+GCB_PREPEND = 7
+GCB_SPACING_MARK = 8
+GCB_L = 9
+GCB_V = 10
+GCB_T = 11
+GCB_LV = 12
+GCB_LVT = 13
 
-    NONE = 0
-    BASE = 1
-    RI_ODD = 2
-    EXT_PICT = 3
-    EXT_PICT_ZWJ = 4
-    INCB_CONS = 5
-    INCB_LINKER = 6
+INCB_NONE = 0
+INCB_LINKER = 1
+INCB_CONSONANT = 2
+INCB_EXTEND = 3
 
+EXT_PICT_BIT = 1 << 8
+EMOJI_MOD_BIT = 1 << 9
+EMOJI_VS_BASE_BIT = 1 << 10
+BIDI_SPOOF_BIT = 1 << 11
 
-PROP_NONE = 0
-PROP_CONTROL = 1
-PROP_EXTEND = 2
-PROP_ZWJ = 3
-PROP_REGIONAL_INDICATOR = 4
-PROP_SPACING_MARK = 5
-PROP_EXTENDED_PICTOGRAPHIC = 6
-PROP_INCB_CONSONANT = 7
-PROP_INCB_LINKER = 8
-PROP_VS15 = 9
-PROP_VS16 = 10
-PROP_EMOJI_MODIFIER = 11
+CLUSTER_NONE = 0
+_ACTIVE_BIT = 1
 
-EXT_PICT_BIT = 0x40
-BIDI_SPOOF_BIT = 0x80
-
-UNICODE_VERSION = "{unicodedata.unidata_version}"
+UNICODE_VERSION = "{UNICODE_VERSION}"
 
 _PACKED_B85 = (
 {b85_literal}
 )
 
 
-def _unpack_tables() -> tuple[array.array[int], bytes]:
+def _unpack_tables() -> tuple[array.array[int], array.array[int]]:
     raw = zlib.decompress(base64.b85decode(_PACKED_B85))
     s1_len = int.from_bytes(raw[:4], "little")
     s1 = array.array("H")
     s1.frombytes(raw[4 : 4 + s1_len])
+    s2 = array.array("H")
+    s2.frombytes(raw[4 + s1_len :])
     if sys.byteorder != "little":
         s1.byteswap()
-    return s1, raw[4 + s1_len :]
+        s2.byteswap()
+    return s1, s2
 
 
 _STAGE1, _STAGE2 = _unpack_tables()
 
 
 def ucd_lookup(cp: int) -> int:
-    """Return packed 8-bit width and UAX #29 property entry for codepoint *cp*."""
+    """Return packed 16-bit width and UAX #29 property word for codepoint *cp*."""
     if 0 <= cp <= 0x10FFFF:
         return _STAGE2[(_STAGE1[cp >> 8] << 8) | (cp & 0xFF)]
-    return PROP_CONTROL << 2
+    return GCB_CONTROL << 2
+
+
+def _pack_state(
+    gcb: int,
+    ri_odd: int,
+    ep_state: int,
+    incb_state: int,
+    vs_base: int,
+) -> int:
+    return (
+        _ACTIVE_BIT
+        | (gcb << 1)
+        | (ri_odd << 5)
+        | (ep_state << 6)
+        | (incb_state << 8)
+        | (vs_base << 10)
+    )
+
+
+def init_cluster_state(cp: int, *, mode_2027: bool = True) -> int:
+    """Return initial packed cluster state for base codepoint *cp*."""
+    entry = ucd_lookup(cp)
+    gcb = (entry >> 2) & 0x0F
+    incb = (entry >> 6) & 0x03
+    ep = 1 if (entry & EXT_PICT_BIT) else 0
+    vs_b = 1 if (entry & EMOJI_VS_BASE_BIT) else 0
+    ri_odd = 1 if (mode_2027 and gcb == GCB_REGIONAL_INDICATOR) else 0
+    incb_st = 1 if incb == INCB_CONSONANT else 0
+    return _pack_state(gcb, ri_odd, ep, incb_st, vs_b)
 
 
 def char_width(ch: str) -> int:
@@ -272,67 +364,139 @@ def char_width(ch: str) -> int:
 
 
 def step_cluster(
-    prev_state: ClusterState,
+    prev_state: int,
     cp: int,
     *,
     mode_2027: bool,
-) -> tuple[bool, ClusterState, int]:
+) -> tuple[bool, int, int]:
     """Evaluate UAX #29 continuation between *prev_state* and codepoint *cp*.
 
     Returns
     -------
-    tuple[bool, ClusterState, int]
+    tuple[bool, int, int]
         ``(extends_previous, next_state, width_override)`` where
         ``width_override`` is ``-1`` (keep current cluster width), ``1``
-        (narrow via ``VS15``), or ``2`` (widen via ``VS16``, emoji modifier,
-        ZWJ pictographic, or Regional Indicator pair).
+        (narrow via ``VS15`` on an emoji variation base), or ``2`` (widen via
+        ``VS16`` on an emoji variation base, emoji modifier, ZWJ pictographic,
+        Regional Indicator pair, or wide glyph after ``Prepend``).
     """
     entry = ucd_lookup(cp)
-    prop = (entry >> 2) & 0x0F
+    gcb = (entry >> 2) & 0x0F
+    incb = (entry >> 6) & 0x03
+    ep = bool(entry & EXT_PICT_BIT)
+    w = entry & 0b11
 
-    if prev_state != ClusterState.NONE:
-        if prop == PROP_EXTEND:
-            return True, prev_state, -1
-        if prop == PROP_VS16:
-            return True, prev_state, (2 if mode_2027 else -1)
-        if prop == PROP_VS15:
-            return True, prev_state, (1 if mode_2027 else -1)
-        if mode_2027:
-            if prop == PROP_SPACING_MARK:
-                next_st = (
-                    prev_state
-                    if prev_state in (ClusterState.INCB_CONS, ClusterState.EXT_PICT)
-                    else ClusterState.BASE
-                )
-                return True, next_st, -1
-            if prop == PROP_ZWJ:
-                next_st = (
-                    ClusterState.EXT_PICT_ZWJ
-                    if prev_state == ClusterState.EXT_PICT
-                    else ClusterState.BASE
-                )
-                return True, next_st, -1
-            if prop == PROP_EMOJI_MODIFIER and prev_state == ClusterState.EXT_PICT:
-                return True, ClusterState.EXT_PICT, 2
-            if prev_state == ClusterState.EXT_PICT_ZWJ and (entry & EXT_PICT_BIT):
-                return True, ClusterState.EXT_PICT, 2
-            if prop == PROP_REGIONAL_INDICATOR and prev_state == ClusterState.RI_ODD:
-                return True, ClusterState.BASE, 2
-            if prop == PROP_INCB_LINKER and prev_state == ClusterState.INCB_CONS:
-                return True, ClusterState.INCB_LINKER, -1
-            if prop == PROP_INCB_CONSONANT and prev_state == ClusterState.INCB_LINKER:
-                return True, ClusterState.INCB_CONS, -1
+    if prev_state & _ACTIVE_BIT:
+        prev_g = (prev_state >> 1) & 0x0F
+        ri_odd = (prev_state >> 5) & 0x01
+        ep_state = (prev_state >> 6) & 0x03
+        incb_state = (prev_state >> 8) & 0x03
+        vs_base = (prev_state >> 10) & 0x01
 
-    # Start of a new base cell (or dropped standalone zero-width character).
-    if prop == PROP_REGIONAL_INDICATOR and mode_2027:
-        return False, ClusterState.RI_ODD, -1
-    if entry & EXT_PICT_BIT:
-        return False, ClusterState.EXT_PICT, -1
-    if prop == PROP_INCB_CONSONANT:
-        return False, ClusterState.INCB_CONS, -1
-    if (entry & 0b11) == 0:
-        return False, ClusterState.NONE, -1
-    return False, ClusterState.BASE, -1
+        if not mode_2027:
+            if gcb == GCB_EXTEND:
+                return True, _pack_state(gcb, 0, ep_state, incb_state, 0), -1
+            if w == 0:
+                return False, CLUSTER_NONE, -1
+            return False, init_cluster_state(cp, mode_2027=False), -1
+
+        joined = False
+        if prev_g == GCB_CR and gcb == GCB_LF:
+            joined = True
+        elif prev_g in (GCB_CR, GCB_LF, GCB_CONTROL) or gcb in (
+            GCB_CR,
+            GCB_LF,
+            GCB_CONTROL,
+        ):
+            joined = False
+        elif (
+            (prev_g == GCB_L and gcb in (GCB_L, GCB_V, GCB_LV, GCB_LVT))
+            or (prev_g in (GCB_LV, GCB_V) and gcb in (GCB_V, GCB_T))
+            or (prev_g in (GCB_LVT, GCB_T) and gcb == GCB_T)
+            or gcb in (GCB_EXTEND, GCB_ZWJ, GCB_SPACING_MARK)
+            or prev_g == GCB_PREPEND
+            or (incb_state == 2 and incb == INCB_CONSONANT)
+            or (ep_state == 2 and ep)
+            or (ri_odd == 1 and gcb == GCB_REGIONAL_INDICATOR)
+        ):
+            joined = True
+
+        if joined:
+            w_override = -1
+            if cp == 0xFE0F and vs_base:
+                w_override = 2
+            elif cp == 0xFE0E and vs_base:
+                w_override = 1
+            elif (
+                ((entry & EMOJI_MOD_BIT) and ep_state == 1)
+                or (ep_state == 2 and ep)
+                or (ri_odd == 1 and gcb == GCB_REGIONAL_INDICATOR)
+                or (prev_g == GCB_PREPEND and w == 2)
+            ):
+                w_override = 2
+
+            next_ri = (ri_odd ^ 1) if gcb == GCB_REGIONAL_INDICATOR else 0
+            if ep_state == 1 and gcb == GCB_EXTEND:
+                next_ep = 1
+            elif ep_state == 1 and gcb == GCB_ZWJ:
+                next_ep = 2
+            elif ep:
+                next_ep = 1
+            else:
+                next_ep = 0
+
+            if incb == INCB_CONSONANT:
+                next_incb = 1
+            elif incb_state in (1, 2) and incb == INCB_LINKER:
+                next_incb = 2
+            elif incb_state in (1, 2) and incb == INCB_EXTEND:
+                next_incb = incb_state
+            else:
+                next_incb = 0
+
+            next_vs = (
+                1 if (prev_g == GCB_PREPEND and (entry & EMOJI_VS_BASE_BIT)) else 0
+            )
+            return (
+                True,
+                _pack_state(gcb, next_ri, next_ep, next_incb, next_vs),
+                w_override,
+            )
+
+    if w == 0 and gcb in (GCB_CR, GCB_LF, GCB_CONTROL, GCB_EXTEND, GCB_ZWJ):
+        return False, CLUSTER_NONE, -1
+    return False, init_cluster_state(cp, mode_2027=mode_2027), -1
+
+
+def segment_graphemes(text: str) -> list[str]:
+    """Segment *text* into Unicode 17.0.0 UAX #29 extended grapheme clusters."""
+    if not text:
+        return []
+    clusters: list[str] = []
+    buf: list[str] = [text[0]]
+    state = init_cluster_state(ord(text[0]), mode_2027=True)
+    for ch in text[1:]:
+        cp = ord(ch)
+        entry = ucd_lookup(cp)
+        gcb = (entry >> 2) & 0x0F
+        prev_g = (state >> 1) & 0x0F
+        if prev_g in (GCB_CR, GCB_LF, GCB_CONTROL) and not (
+            prev_g == GCB_CR and gcb == GCB_LF
+        ):
+            clusters.append("".join(buf))
+            buf = [ch]
+            state = init_cluster_state(cp, mode_2027=True)
+            continue
+        extends, next_state, _ = step_cluster(state, cp, mode_2027=True)
+        if extends:
+            buf.append(ch)
+            state = next_state
+        else:
+            clusters.append("".join(buf))
+            buf = [ch]
+            state = init_cluster_state(cp, mode_2027=True)
+    clusters.append("".join(buf))
+    return clusters
 
 
 def display_width(text: str, *, mode_2027: bool = True) -> int:
@@ -341,13 +505,12 @@ def display_width(text: str, *, mode_2027: bool = True) -> int:
         return sum(1 for ch in text if " " <= ch <= "~")
     total = 0
     cur_w = 0
-    state = ClusterState.NONE
+    state = CLUSTER_NONE
     for ch in text:
         cp = ord(ch)
-        if 0x20 <= cp <= 0x7E:
-            total += cur_w
+        if 0x20 <= cp <= 0x7E and state == CLUSTER_NONE:
             cur_w = 1
-            state = ClusterState.BASE
+            state = init_cluster_state(cp, mode_2027=mode_2027)
             continue
         extends, state, w_override = step_cluster(state, cp, mode_2027=mode_2027)
         if extends:
@@ -375,24 +538,33 @@ def sanitize_terminal_text(text: str) -> str:
 
 __all__ = [
     "BIDI_SPOOF_BIT",
+    "CLUSTER_NONE",
     "UNICODE_VERSION",
-    "ClusterState",
     "WidthRole",
     "char_width",
     "display_width",
+    "init_cluster_state",
     "sanitize_terminal_text",
+    "segment_graphemes",
     "step_cluster",
     "ucd_lookup",
 ]
 '''
 
 
-def main() -> int:
-    """Regenerate ``src/libvt/_ucd.py`` from ``unicodedata``."""
-    stage1, stage2 = build_tables()
-    target = (
-        pathlib.Path(__file__).resolve().parent.parent / "src" / "libvt" / "_ucd.py"
+def main(argv: list[str] | None = None) -> int:
+    """Regenerate ``src/libvt/_ucd.py`` from SHA-256-verified Unicode 17.0.0 data."""
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--ucd-dir",
+        type=pathlib.Path,
+        default=repo_root / ".cache" / "ucd" / UNICODE_VERSION,
+        help="Directory holding SHA-256-verified Unicode 17.0.0 UCD text files.",
     )
+    args = parser.parse_args(argv)
+    stage1, stage2 = build_tables(args.ucd_dir)
+    target = repo_root / "src" / "libvt" / "_ucd.py"
     target.write_text(render_module(stage1, stage2), encoding="utf-8")
     return 0
 

@@ -1,6 +1,10 @@
-"""Streaming VT500 parser, SGR subparameter, UTF-8, and C1 isolation tests."""
+"""Streaming VT500 parser, SGR subparameter, STRING_ESC, and encoding tests."""
 
 from __future__ import annotations
+
+import typing as t
+
+import pytest
 
 import libvt
 from libvt.config import Limits
@@ -9,6 +13,7 @@ from libvt.parser import (
     ApcDispatch,
     CsiDispatch,
     DcsDispatch,
+    EscDispatch,
     OscDispatch,
     Parser,
     ParserState,
@@ -82,8 +87,8 @@ def test_sgr_colon_subparameters_and_indexed_vs_ansi() -> None:
     assert cell_c.style == libvt.Style()
 
 
-def test_utf8_0x9c_inside_osc_dcs_apc_does_not_break_out() -> None:
-    """UTF-8 ``0x9C`` continuation bytes never terminate string control payloads."""
+def test_utf8_c1_isolation_and_latin1_wire_mode() -> None:
+    """UTF-8 isolates ``0x80..0x9F`` and ``U+009B``; ``latin-1`` parses 8-bit ``C1``."""
     title = "Build “日本” Ü 😜"
     assert 0x9C in title.encode("utf-8")
 
@@ -91,6 +96,11 @@ def test_utf8_0x9c_inside_osc_dcs_apc_does_not_break_out() -> None:
     term.feed(f"\x1b]2;{title}\x07ok".encode())
     assert term.title == title
     assert term.text == "ok"
+
+    # UTF-8 encoded U+009B (0xC2 0x9B) never smuggles CSI into UTF-8 streams!
+    smuggled = Parser(encoding="utf-8").feed(b"\xc2\x9b31mSAFE")
+    assert _coalesce_prints(smuggled) == [Print("31mSAFE")]
+    assert libvt.strip(b"\xc2\x9b31mSAFE") == "31mSAFE"
 
     parser = Parser()
     actions = parser.feed(
@@ -103,13 +113,18 @@ def test_utf8_0x9c_inside_osc_dcs_apc_does_not_break_out() -> None:
     assert isinstance(actions[1], ApcDispatch)
     assert actions[1].data == title.encode("utf-8")
 
-    # Explicit 8-bit C1 opt-in handles single-byte CSI (0x9B) and OSC/ST (0x9D/0x9C).
-    c1_actions = Parser(c1_controls=True).feed(b"\x9b12;34H\x9d2;ascii\x9c")
-    assert len(c1_actions) == 2
-    assert isinstance(c1_actions[0], CsiDispatch)
-    assert c1_actions[0].params.values == (12, 34)
-    assert c1_actions[0].final == ord("H")
-    assert c1_actions[1] == OscDispatch(2, b"ascii", b"\x9c")
+    # Legacy 8-bit Latin-1 mode handles C1 anywhere transitions and 0xA0..0xFF glyphs.
+    lat_parser = Parser(encoding="latin-1")
+    lat_actions = lat_parser.feed(b"\x1b[12\x9b3;4H\x9d2;caf\xe9\x9c\x8d\xe9")
+    assert lat_actions == [
+        CsiDispatch(0, libvt.CsiParams((3, 4), 0, 0), b"", ord("H")),
+        OscDispatch(2, b"caf\xe9", b"\x9c"),
+        EscDispatch(b"", ord("M")),
+        Print("é"),
+    ]
+
+    with pytest.raises(ValueError, match="unsupported parser encoding"):
+        Parser(encoding=t.cast("t.Any", "ebcdic"))
 
 
 def test_incomplete_utf8_flushed_before_c0_control() -> None:
@@ -121,12 +136,35 @@ def test_incomplete_utf8_flushed_before_c0_control() -> None:
     assert term[1].text == " X"
 
 
-def test_double_esc_st_and_oversized_payload_recovery() -> None:
-    """Double ``ESC`` aborts cleanly and oversized strings resynchronize."""
+def test_string_esc_abort_and_oversized_payload_recovery() -> None:
+    r"""``STRING_ESC`` aborts non-``\`` escapes cleanly and preserves DCS headers."""
+    p = Parser()
+    p.feed(b"\x1b]2;pending\x1b")
+    assert p.state == ParserState.STRING_ESC
+    # Non-'\' byte ('c' -> RIS) discards unclosed OSC and dispatches ESC c!
+    acts = p.feed(b"c")
+    assert acts == [EscDispatch(b"", ord("c"))]
+    assert p.state == ParserState.GROUND
+
+    # Ubiquitty OSC-G4 on Terminal: unclosed OSC 2 followed by ESC [ 31 m drops title.
     term = libvt.Terminal(rows=4, cols=20, limits=Limits(max_osc_bytes=16))
-    # First ESC enters OSC_ESC; second ESC cancels OSC and begins ESC \ ST no-op.
+    term.feed(b"\x1b]2;unterminated\x1b[32mok")
+    assert term.title == ""
+    assert term.text == "ok"
+    assert term[0, 0].style.fg == AnsiColor.GREEN
+
+    # Double ESC inside OSC cancels OSC and treats second ESC \ as standalone ST no-op.
+    term.reset()
     term.feed(b"\x1b]2;short\x1b\x1b\\after")
+    assert term.title == ""
     assert term.text == "after"
+
+    # Disabling tmux_passthrough on Parser aborts DCS tmux; on ESC ESC.
+    strict_dcs = Parser(tmux_passthrough=False).feed(b"\x1bPtmux;\x1b\x1b\\hi")
+    assert _coalesce_prints([a for a in strict_dcs if isinstance(a, Print)]) == [
+        Print("hi"),
+    ]
+    assert not any(isinstance(a, DcsDispatch) for a in strict_dcs)
 
     term.reset()
     term.feed(b"\x1b]2;" + (b"x" * 64) + b"\x07clean")
