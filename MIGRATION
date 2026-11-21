@@ -1,0 +1,15 @@
+# Migration notes
+
+Migration and deprecation notes for `libvt` are recorded here; see
+{ref}`changelog` as well.
+
+`libvt` is pre-1.0. Pin a minor version range in downstream projects
+(`libvt>=0.1,<0.2`).
+
+---
+
+## Upcoming Release
+
+<!-- KEEP THIS PLACEHOLDER - DO NOT REMOVE OR MODIFY THIS LINE -->
+_Detailed migration steps for the next version will be posted here._
+<!-- END PLACEHOLDER - ADD NEW MIGRATION ENTRIES BELOW THIS LINE -->
