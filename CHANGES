@@ -5,3 +5,75 @@
 <!-- KEEP THIS PLACEHOLDER - DO NOT REMOVE OR MODIFY THIS LINE -->
 _Notes on the upcoming release will go here._
 <!-- END PLACEHOLDER - ADD NEW CHANGELOG ENTRIES BELOW THIS LINE -->
+
+### What's new
+
+#### Sans-I/O terminal core, two-tier RLE grid, and Unicode 17 width (#2)
+
+{class}`~libvt.terminal.Terminal`, {class}`~libvt.screen.Screen`, and
+{class}`~libvt.terminal.Snapshot` emulate primary and `?1049` alternate
+screens with zero-based `(row, col)` coordinates, lazy 64-bit inline
+viewport attributes, run-length-encoded scrollback history, and
+primary-screen soft-wrap resize reflow. Top-level
+{func}`~libvt.terminal.render`, {func}`~libvt.terminal.strip`, and
+{func}`~libvt.codec.explain` helpers handle common rendering, stripping,
+and sequence disassembly tasks, backed by `python -m libvt` CLI
+subcommands.
+
+{class}`~libvt.parser.Parser` decodes incremental UTF-8, colon-delimited
+ITU T.416 SGR subparameters (`4:3`, `38:2::R:G:B`, `58:5:idx`), `G0`–`G3`
+character-set designations (`ESC ( 0` DEC Special Graphics, `SO`/`SI`,
+`SS2`/`SS3`), `CBT`/`CHT`, `DECSCA`/`DECSED`/`DECSEL`, `CSI 22 J`, and
+`DCS tmux;` passthrough unwrapping while isolating UTF-8 `0x9C` bytes
+from 8-bit `C1` string terminators. Bundled Unicode 17.0.0 two-stage
+tables drive East Asian width and DEC `?2027` grapheme clustering across
+ZWJ emoji, Regional Indicator flag pairs, Indic conjuncts, and `VS15` /
+`VS16` variation selectors. See {doc}`topics/architecture` for details.
+
+#### Synchronized output stepping, Rex `OSC 7501`, and host queries (#2)
+
+{meth}`~libvt.terminal.Terminal.committed`,
+{meth}`~libvt.terminal.Terminal.feed_until`, and
+{meth}`~libvt.terminal.Terminal.expire_synchronized_output` provide
+lazy copy-on-write frame holds and generation-tagged timeout recovery
+for DEC mode `?2026` synchronized updates.
+{class}`~libvt.terminal.Formatter` exports snapshots to plain text, VT
+escape sequences, and span-coalesced HTML with URI scheme allowlisting.
+
+{class}`~libvt.status.ProgramStatusStore` and
+{class}`~libvt.status.ProgramStatus` implement the Rex `OSC 7501`
+Program Status specification, including hierarchical task identifiers,
+ancestor `app` inheritance, urgency ranking, base64 `title`/`msg`
+validation, consumer-gated `OSC 7501 ; ?` capability replies, `OSC 9;4`
+fallback, and lifecycle pruning alongside `OSC 133` prompt zones,
+`OSC 7` working directory updates, `OSC 52` clipboard writes, `DA1`/`DA2`,
+`DSR`, `DECRQM`, `DECRQSS`, `XTVERSION`, `XTGETTCAP`, and `?2031`/`?996n`
+color-scheme queries. Configuration splits cleanly across
+{class}`~libvt.config.Profile`, {class}`~libvt.config.Policy`, and
+{class}`~libvt.config.Limits`. See {doc}`topics/protocols-and-input` for
+details.
+
+#### Mode-aware input encoding, `asyncio` PTY bridge, and pytest plugin (#2)
+
+{class}`~libvt.input.KeyEvent`, {class}`~libvt.input.MouseEvent`,
+{class}`~libvt.input.FocusEvent`, and {class}`~libvt.input.PasteEvent`
+encode outbound PTY bytes against active terminal modes, including
+per-screen Kitty `CSI u` keyboard stacks (`>u`, `<u`, `=u`, `?u`), `SGR`
+and `SGR-Pixel` mouse tracking (`?1006`, `?1016`), and fail-closed
+bracketed paste validation raising {exc}`~libvt.exc.UnsafePasteError`.
+
+{class}`~libvt.aio.AsyncTerminalStream` and {func}`~libvt.aio.open_pty`
+connect sans-I/O terminals to `asyncio` streams and POSIX pseudo-terminals
+without importing `asyncio` or `pty` on `import libvt`. The `pytest11`
+plugin provides protocol-typed `vt_terminal`, `vt_factory`, `vt_parser`,
+`vt_recorder`, and `vt_pty` fixtures alongside
+{func}`~libvt.testing.assert_screen` and
+{class}`~libvt.terminal.FlightRecorder` diagnostics. See
+{doc}`topics/sync-and-asyncio` for details.
+
+### Documentation
+
+- Add Architecture Decision Records `0001`–`0010` documenting clean-room
+  provenance, sans-I/O layering, two-tier RLE storage, Unicode 17
+  clustering, protocol semantics, input safety, and `asyncio`/pytest
+  boundaries in {doc}`project/adr/index` (#2).

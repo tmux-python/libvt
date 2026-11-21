@@ -111,7 +111,7 @@ class KeyEvent:
         (``"enter"``, ``"tab"``, ``"escape"``, ``"backspace"``, ``"up"``,
         ``"down"``, ``"right"``, ``"left"``, ``"home"``, ``"end"``,
         ``"page_up"``, ``"page_down"``, ``"insert"``, ``"delete"``,
-        ``"f1"``..``"f12"``).
+        ``"f1"`` through ``"f12"``).
     modifiers : KeyMod
         Active modifier bitmask.
     action : KeyAction

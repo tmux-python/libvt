@@ -1,11 +1,13 @@
 # AGENTS.md
 
 libvt is a pure-Python, zero-dependency, typed virtual terminal emulator
-and streaming VT parser (`Parser` → `Effects` → `Terminal` / `Screen` /
-`Snapshot`). It ships an `asyncio` stream adapter (`libvt.aio`), a
-namespace-safe pytest plugin (`libvt.pytest_plugin`), and visual boxed
-screen assertions (`libvt.testing`), serving [libtmux](https://github.com/tmux-python/libtmux)
-and general Python terminal testing without LGPL copyleft obligations.
+and streaming VT parser (`Parser` → `Terminal` / `Screen` / `Snapshot` +
+`Event`s). It ships a transport-only `asyncio` stream and POSIX PTY
+adapter (`libvt.aio`), a namespace-safe pytest plugin
+(`libvt.pytest_plugin`), mode-aware input encoders (`libvt.input`), and
+visual boxed screen assertions (`libvt.testing`), serving
+[libtmux](https://github.com/tmux-python/libtmux) and general Python
+terminal testing without LGPL copyleft obligations.
 
 Follow the conventions already in the tree, and keep a change scoped to
 what was asked for.
@@ -14,13 +16,14 @@ what was asked for.
 
 | Path | What it is |
 | ---- | ---------- |
-| `src/libvt/parser.py`, `modes.py`, `style.py` | VT500 byte parser, CSI subparameters, modes, and SGR styles |
-| `src/libvt/_grid.py`, `screen.py`, `terminal.py` | Packed row storage, `Screen` / `ScreenSet`, `Terminal`, and `Snapshot` |
-| `src/libvt/aio.py` | Transport-only `asyncio` stream wrapper (`AsyncTerminalStream`) |
-| `src/libvt/testing.py`, `pytest_plugin.py` | Visual boxed screen assertions and `vt_*` pytest fixtures |
-| `tests/` | Unit, property, and fixture tests, one file per module under test |
-| `docs/` | Sphinx/MyST site: `topics/` (concepts), `api/` (autodoc), `project/` (contributing, releasing, ADRs) |
-| `scripts/` | Cross-commit and in-process VT throughput benchmark harnesses |
+| `src/libvt/parser.py`, `modes.py`, `style.py`, `config.py` | VT500 byte parser, CSI subparameters, modes, SGR styles, and `Profile` / `Policy` / `Limits` |
+| `src/libvt/_ucd.py`, `_grid.py`, `screen.py`, `terminal.py` | Unicode 17 width/clustering tables, packed viewport & RLE scrollback rows, `Screen` / `ScreenSet`, `Terminal`, `Snapshot`, and `Formatter` |
+| `src/libvt/status.py`, `events.py`, `input.py`, `codec.py` | Rex `OSC 7501` program status store, closed `Event` union, mode-aware input encoders, and cold-path VT sequence explainer |
+| `src/libvt/aio.py`, `__main__.py` | `AsyncTerminalStream`, POSIX `open_pty()`, and `python -m libvt` CLI (`explain`, `render`, `strip`) |
+| `src/libvt/testing.py`, `pytest_plugin.py`, `exc.py` | Boxed `assert_screen`, `FlightRecorder` diagnostics, `vt_*` pytest fixtures, and exceptions |
+| `tests/` | Unit, property fuzz, PTY, CLI, and fixture tests |
+| `docs/` | Sphinx/MyST site: `topics/` (concepts), `api/` (autodoc), `project/` (contributing, releasing, ADRs `0001`–`0010`) |
+| `scripts/` | Unicode table generator (`generate_ucd.py`) and VT throughput benchmarks (`bench_vt.py`, `benchmark.py`) |
 | `README.md` | Doctested quickstart — every `>>> ` block is a real test |
 | `CHANGES` | The changelog, rendered as a docs page |
 | `MIGRATION` | Deprecation and migration notes |
@@ -51,14 +54,15 @@ be stated twice, the file listed above is the one that governs.
 - A passing gate is evidence only once it has been shown capable of
   failing. Pair a new test with a deliberate break that proves it bites.
 - Maintain strict clean-room MIT provenance: derive state transitions
-  and test vectors from public standards (ECMA-48, DEC STD 070, Paul Flo
-  Williams' VT500 state diagram) and permissive (`MIT`, `ISC`,
-  `Apache-2.0`, `BSD`) references — never copy or translate from `LGPL`
-  or `GPL` terminal implementations (`pyte`, `vte`/GTK, `asciinema`).
+  and test vectors from public standards (ECMA-48, ITU T.416, Unicode
+  UAX #11 / #29, Paul Flo Williams' VT500 state diagram) and permissive
+  (`MIT`, `ISC`, `Apache-2.0`, `BSD`) references — never copy or
+  translate from `LGPL` or `GPL` terminal implementations (`pyte`,
+  `vte`/GTK, `asciinema`).
 
 Python >= 3.12 is the compatibility floor, and runtime dependencies stay
 empty (`dependencies = []`). Importing `libvt` performs no I/O and does
-not load `asyncio` or `pytest`.
+not load `asyncio`, `pty`, or `pytest`.
 
 ## References
 

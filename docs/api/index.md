@@ -12,13 +12,49 @@ Public modules and types shipped by `libvt`.
 :::{grid-item-card} `libvt`
 :link: libvt
 :link-type: doc
-Top-level package exports and metadata.
+Top-level re-exports, progressive-disclosure helpers, and package metadata.
 :::
 
-:::{grid-item-card} `libvt.pytest_plugin`
-:link: pytest_plugin
+:::{grid-item-card} `libvt.terminal`
+:link: terminal
 :link-type: doc
-Pytest plugin entry point and fixtures.
+`Terminal`, `Snapshot`, `Formatter`, `FlightRecorder`, `render`, and `strip`.
+:::
+
+:::{grid-item-card} `libvt.screen`
+:link: screen
+:link-type: doc
+`Screen`, `ScreenSet`, `Cell`, `RowView`, `RowRun`, `RegionView`, and `Cursor`.
+:::
+
+:::{grid-item-card} `libvt.parser`
+:link: parser
+:link-type: doc
+Streaming VT500 `Parser`, `CsiParams`, `Action` records, and `parse_sgr`.
+:::
+
+:::{grid-item-card} `libvt.style` & `libvt.modes`
+:link: style
+:link-type: doc
+`Style`, `AnsiColor`, `IndexedColor`, `RgbColor`, `Hyperlink`, and DEC/ANSI `Mode`s.
+:::
+
+:::{grid-item-card} `libvt.config`, `events`, & `status`
+:link: config
+:link-type: doc
+`Profile`, `Policy`, `Limits`, closed `Event` union, and `OSC 7501` `ProgramStatus`.
+:::
+
+:::{grid-item-card} `libvt.input` & `libvt.codec`
+:link: input
+:link-type: doc
+Mode-aware `KeyEvent`, `MouseEvent`, `PasteEvent`, and VT sequence `explain`.
+:::
+
+:::{grid-item-card} `libvt.aio`, `testing`, & `pytest_plugin`
+:link: aio
+:link-type: doc
+`AsyncTerminalStream`, POSIX `open_pty`, `assert_screen`, and `vt_*` fixtures.
 :::
 
 ::::
@@ -53,5 +89,18 @@ Active deprecations and migration guidance.
 :maxdepth: 1
 
 libvt
+terminal
+screen
+parser
+style
+modes
+config
+events
+status
+input
+codec
+aio
+testing
 pytest_plugin
+exc
 ```
