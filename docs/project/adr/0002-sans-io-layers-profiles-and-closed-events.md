@@ -61,9 +61,10 @@ security gates (`Policy`), resource bounds (`Limits`), outbound wire replies
      `DEFAULT_PROFILE` (`XTERM_PROFILE`) and `TMUX_PROFILE`.
    - `Policy`: Default-deny host security gates (`allow_title_report=False`,
      `allow_checksum_report=False`, `allow_clipboard_read=False`,
-     `allow_clipboard_write=False`, `allow_color_queries=True`,
+     `allow_clipboard_write=True`, `allow_color_queries=True`,
      `allow_program_status_query=False`, `allow_unsafe_uris=False`,
-     `unwrap_tmux_passthrough=True`, `strict=False`).
+     `allow_passthrough=False`, `osc7_hosts=frozenset({"", "localhost"})`,
+     `strict=False`).
    - `Limits`: Hard memory and CPU bounds (`max_grapheme_codepoints=32`,
      `max_csi_params=32`, `max_osc_bytes=131_072`, `max_dcs_bytes=4_194_304`,
      `max_apc_bytes=4_194_304`, `max_reply_bytes=65_536`,
@@ -80,7 +81,7 @@ security gates (`Policy`), resource bounds (`Limits`), outbound wire replies
    - `type Event = Bell | TitleChanged | WorkingDirectoryChanged |
      ClipboardWrite | PromptMark | ProgramStatusChanged | RenderHoldChanged |
      ColorSchemeQueried | InBandResize | SixelGraphic | KittyGraphic |
-     ScreenErased | UnhandledSequence`.
+     ScreenErased | Passthrough | UnhandledSequence`.
    - Callers either pass `on_event: Callable[[Event], None]` (push) or set
      `record_events: bool = True` and call `term.drain_events() ->
      tuple[Event, ...]` (pull). When neither is enabled, `feed()` allocates

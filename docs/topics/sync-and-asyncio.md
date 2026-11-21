@@ -52,7 +52,8 @@ and POSIX pseudo-terminals without adding background threads to the core:
   `asyncio.StreamReader`, flushes {meth}`~libvt.terminal.Terminal.drain_replies`
   to an optional writer, and coalesces `wait_for(...)` wakeups across
   `?2026` batches up to `sync_timeout`.
-- {func}`~libvt.aio.open_pty` spawns a child process attached to
-  `pty.openpty()` with initial `TIOCSWINSZ` window dimensions, forwards
-  terminal query replies, and calls
+- {func}`~libvt.aio.open_pty` spawns a child process attached to a
+  controlling `pty.openpty()` terminal (`TIOCSCTTY`, `TIOCSWINSZ`,
+  default `SIGPIPE`, and selectable `tty_mode`), forwards terminal query
+  replies, and calls
   {meth}`~libvt.terminal.Terminal.notify_process_exit` on teardown.

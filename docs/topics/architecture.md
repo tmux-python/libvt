@@ -5,10 +5,10 @@
 `libvt` separates terminal emulation into four acyclic layers so callers
 import only the machinery they need:
 
-1. **Streaming parser** ({mod}`libvt.parser`): 14-state VT500 byte
-   machine with colon-subparameter `CSI` bitmasks, incremental UTF-8
-   decoding, 7-bit string termination, and `DCS tmux;` `ESC ESC`
-   collapsing.
+1. **Streaming parser** ({mod}`libvt.parser`): VT500 byte state machine
+   with colon-subparameter `CSI` bitmasks, incremental UTF-8 decoding,
+   `STRING_ESC` 7-bit string termination, optional Latin-1 8-bit `C1`
+   wire parsing, and `DCS tmux;` `ESC ESC` collapsing.
 2. **Grid and screen model** ({mod}`libvt.screen`): Zero-based
    `(row, col)` viewport with lazy 64-bit `array('Q')` attribute words,
    wide-spacer boundary healing, run-length-encoded scrollback rows, and

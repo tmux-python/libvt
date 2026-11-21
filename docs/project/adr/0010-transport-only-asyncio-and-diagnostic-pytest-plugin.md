@@ -42,13 +42,17 @@ empirical testing:
      pairs, flushing `drain_replies()` automatically and enforcing
      `sync_timeout` via `Terminal.expire_synchronized_output(sync_gen)` in both
      background-task (`async with`) and on-demand `wait_for()` modes.
-   - `open_pty(argv, *, rows=24, cols=80, env=None, cwd=None)` spawns a child
-     process attached to a stdlib `pty.openpty()` master/slave pair on POSIX,
-     sets `TIOCSWINSZ`, pumps output + `drain_replies()`, and exposes
-     `send()`, `send_key()`, `paste()`, `resize()`, and `wait_for()`. On
-     Windows (`sys.platform == "win32"`), `open_pty()` raises
-     `NotImplementedError` cleanly while the entire Sans-I/O core works
-     unchanged.
+   - `open_pty(argv, *, rows=24, cols=80, env=None, cwd=None, tty_mode="cooked")`
+     spawns a child process attached to a stdlib `pty.openpty()` master/slave
+     pair via an isolated `-I -S` child trampoline (`start_new_session=True`,
+     `TIOCSCTTY` controlling terminal acquisition, `SIGPIPE` reset to
+     `SIG_DFL`, and `CLOEXEC` `err_fd` exec-failure propagation without
+     `preexec_fn`), configures `TIOCSWINSZ` and optional `"cbreak"` / `"raw"`
+     termios modes, augments default `Policy.osc7_hosts` with the local
+     hostname, pumps output + `drain_replies()`, and exposes `send()`,
+     `send_key()`, `paste()`, `resize()`, and `wait_for()`. On Windows
+     (`sys.platform == "win32"`), `open_pty()` raises `NotImplementedError`
+     cleanly while the entire Sans-I/O core works unchanged.
 3. **Strictly `vt_`-prefixed, `Protocol`-typed `pytest11` plugin
    (`libvt.pytest_plugin`)**:
    - Register `vt_terminal`, `vt_factory` (typed via `TerminalFactory`
@@ -56,14 +60,16 @@ empirical testing:
      `vt_parser`, `vt_recorder` (`FlightRecorder`), and `vt_pty` (calling
      `pytest.skip("POSIX pty required")` on `win32`), with lazy imports inside
      fixture bodies.
-4. **Column-exact, sanitized `assert_screen` and `FlightRecorder`
+4. **Literal `assert_screen`, column-exact `assert_screen_box`, and `FlightRecorder`
    (`libvt.testing`)**:
-   - `format_screen_box` and `assert_screen` measure cells by terminal display
-     width (`WidthRole` / `display_width`), sanitize C0/C1 and BiDi overrides,
-     display `W` soft-wrap markers, and append `FlightRecorder` diagnostics
-     (cursor, active modes, `OSC 7501` status, `Parser.state`, and disassembled
-     recent raw bytes via `format_explain`) when a `FlightRecorder` is attached
-     to `Terminal`.
+   - `assert_screen` compares literal screen text without stripping `┌──┐`
+     borders rendered by applications, while `format_screen_box` and
+     `assert_screen_box` measure cells by terminal display width (`WidthRole` /
+     `display_width`), sanitize C0/C1 and BiDi overrides, validate outer `│W`
+     soft-wrap markers, and append `FlightRecorder` diagnostics (cursor, active
+     modes, `OSC 7501` status, `Parser.state`, and disassembled recent raw
+     bytes via `format_explain`) when a `FlightRecorder` is attached to
+     `Terminal`.
    - `Snapshot.to_dict()` returns a deterministic JSON-compatible dictionary
      for snapshot testing (`inline-snapshot` / `syrupy`).
 

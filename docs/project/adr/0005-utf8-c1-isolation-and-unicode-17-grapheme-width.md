@@ -38,17 +38,19 @@ framing hazards in terminal emulators:
 
 ## Decision
 
-1. **7-bit string termination by default in UTF-8 streams (`libvt.parser`)**:
-   - `Parser(c1_controls: bool = False)` ignores raw `0x80..0x9F` 8-bit `C1`
-     bytes as control introducers/terminators unless `c1_controls=True` is
-     explicitly requested for legacy 8-bit Latin-1 streams. `OSC` terminates on
-     `BEL` (`0x07`) or 7-bit `ESC \` (`0x1B 0x5C`), and `DCS`/`APC`/`SOS`/`PM`
-     terminate strictly on `ESC \`, matching `tmux` (`input.c`) and `Ghostty`.
+1. **`STRING_ESC` 7-bit string termination and separated wire modes (`libvt.parser`)**:
+   - `Parser(encoding="utf-8")` ignores raw `0x80..0x9F` 8-bit `C1` bytes and
+     UTF-8-encoded `U+0080..U+009F` (`0xC2 0x80..0x9F`) as control introducers;
+     `Parser(encoding="latin-1")` provides complete 8-bit DEC `C1` `anywhere`
+     transitions for legacy Latin-1 byte streams.
+   - `OSC`, `DCS`, and `APC`/`SOS`/`PM` transition on `0x1B` into a dedicated
+     `ParserState.STRING_ESC` substate: `\` (`0x5C`) dispatches with `DCS`
+     header intermediates intact, `0x1B` inside a latched `DCS tmux;` envelope
+     collapses `ESC ESC` into one payload `ESC` byte, and any other byte aborts
+     and discards the unclosed payload per DEC STD 070 §5.1.2.3 before
+     re-evaluating that byte in `ESCAPE`.
    - Incomplete UTF-8 sequences flush `U+FFFD` *before* executing any C0
      control (`< 0x20`), `ESC`, `CAN` (`0x18`), or `SUB` (`0x1A`).
-   - A second `ESC` inside `ESCAPE` when `_return_from_esc_st` is set aborts
-     the pending control string cleanly before entering `ESCAPE` so `ESC ESC \`
-     never dispatches a cancelled `OSC`.
 2. **Strict `_last_printed_pos` invalidation and `O(1)` combining cap**:
    - Any cursor motion, C0 execution, erase, scroll, resize, reset, or screen
      switch clears `_last_printed_pos = None`.
@@ -60,13 +62,14 @@ framing hazards in terminal emulators:
      soft-wraps to the next line, and writes the widened 2-column cluster at
      `left` (`col 0`). `VS15` (`\ufe0e`) narrows default-wide emoji to `1`
      column under `?2027`.
-3. **Generated two-stage Unicode 17.0 block table (`libvt._ucd`)**:
-   - `scripts/generate_ucd.py` compiles Unicode 17.0 East Asian Width,
-     `General_Category`, `Extended_Pictographic`, `Regional_Indicator`,
-     variation selectors, and `InCB` (`Consonant`, `Linker`, `Extend`) into a
-     compact zlib-compressed base85 2-stage 256-codepoint block table in
-     `libvt._ucd` (`stage2[(stage1[cp >> 8] << 8) | (cp & 0xFF)]`, `~90 KiB`
-     unpacked `bytes` in RAM, zero runtime dependencies).
+3. **SHA-256-pinned Unicode 17.0.0 two-stage block table (`libvt._ucd`)**:
+   - `scripts/generate_ucd.py` compiles official SHA-256-verified Unicode 17.0.0
+     UCD and Emoji data (`GraphemeBreakProperty.txt`, `DerivedCoreProperties.txt`,
+     `EastAsianWidth.txt`, `DerivedGeneralCategory.txt`, `emoji-data.txt`, and
+     `emoji-variation-sequences.txt`) into a zlib-compressed base85 2-stage
+     256-codepoint `u16` block table in `libvt._ucd` (`~70.5 KiB` unpacked,
+     zero runtime dependencies), validated in `pytest` against all official
+     `GraphemeBreakTest.txt` vectors.
    - Python 3.12, 3.13, 3.14, and 3.15 therefore compute identical cell widths
      and UAX #29 `?2027` cluster boundaries (`GB9`, `GB9a`, `GB9c` Indic
      conjuncts, `GB11` ZWJ pictographics, and `GB12`/`GB13` Regional Indicator

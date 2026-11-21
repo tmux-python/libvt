@@ -71,15 +71,17 @@ capability query:
      exit_code: int | None)` in a `collections.deque` bounded by
      `Limits.max_prompt_zones` (`1,024`), updating viewport `row` via
      `abs_row - scr.scrolled_total` so scrolling never desyncs prompt zones.
-   - Support `OSC 7` and `OSC 9;9` (`term.cwd` + `WorkingDirectoryChanged`),
-     `OSC 52` write (`ClipboardWrite` when `Policy.allow_clipboard_write` or
-     recorded as event; `OSC 52 ; c ; ?` denied unless
+   - Support `OSC 7` and `OSC 9;9` (`term.cwd_uri` for any URI, `term.cwd`
+     filtered by `Policy.osc7_hosts` without host syscalls, plus
+     `WorkingDirectoryChanged`), `OSC 52` write (`ClipboardWrite` when
+     `Policy.allow_clipboard_write`; `OSC 52 ; c ; ?` denied unless
      `Policy.allow_clipboard_read`), `XTVERSION` (`CSI > q` -> `DCS > | ... ST`),
      `DECRQSS` (`DCS $ q ... ST` for `m` SGR, `r` `DECSTBM`, `s` `DECSLRM`,
      ` q` `DECSCUSR`, `"q` `DECSCA`), `XTGETTCAP` (`DCS + q <hex> ST` for
      `TN`/`Co`/`RGB`/`Smulx`), `OSC 10;?` / `OSC 11;?` foreground/background
      queries, `?2031` + `CSI ? 996 n` color-scheme DSR, and `DCS tmux; ESC ESC
-     ... ST` passthrough unwrapping (gated by `Policy.unwrap_tmux_passthrough`).
+     ... ST` passthrough envelopes (emitting `Passthrough` and re-feeding inner
+     bytes only when `Policy.allow_passthrough=True`).
 
 ## Alternatives considered
 

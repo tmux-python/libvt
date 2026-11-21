@@ -24,11 +24,13 @@ subcommands.
 ITU T.416 SGR subparameters (`4:3`, `38:2::R:G:B`, `58:5:idx`), `G0`–`G3`
 character-set designations (`ESC ( 0` DEC Special Graphics, `SO`/`SI`,
 `SS2`/`SS3`), `CBT`/`CHT`, `DECSCA`/`DECSED`/`DECSEL`, `CSI 22 J`, and
-`DCS tmux;` passthrough unwrapping while isolating UTF-8 `0x9C` bytes
-from 8-bit `C1` string terminators. Bundled Unicode 17.0.0 two-stage
-tables drive East Asian width and DEC `?2027` grapheme clustering across
-ZWJ emoji, Regional Indicator flag pairs, Indic conjuncts, and `VS15` /
-`VS16` variation selectors. See {doc}`topics/architecture` for details.
+`DCS tmux;` passthrough framing while isolating UTF-8 `0x9C` and `U+009B`
+bytes from 8-bit `C1` controls (with optional `encoding="latin-1"` 8-bit
+wire mode). SHA-256-pinned Unicode 17.0.0 two-stage tables drive East
+Asian width and DEC `?2027` UAX #29 grapheme clustering across ZWJ
+emoji, Regional Indicator flag pairs, Indic conjuncts, Hangul jamo, and
+`VS15` / `VS16` emoji variation sequences. See {doc}`topics/architecture`
+for details.
 
 #### Synchronized output stepping, Rex `OSC 7501`, and host queries (#2)
 
@@ -63,11 +65,12 @@ and `SGR-Pixel` mouse tracking (`?1006`, `?1016`), and fail-closed
 bracketed paste validation raising {exc}`~libvt.exc.UnsafePasteError`.
 
 {class}`~libvt.aio.AsyncTerminalStream` and {func}`~libvt.aio.open_pty`
-connect sans-I/O terminals to `asyncio` streams and POSIX pseudo-terminals
-without importing `asyncio` or `pty` on `import libvt`. The `pytest11`
-plugin provides protocol-typed `vt_terminal`, `vt_factory`, `vt_parser`,
-`vt_recorder`, and `vt_pty` fixtures alongside
-{func}`~libvt.testing.assert_screen` and
+connect sans-I/O terminals to `asyncio` streams and controlling POSIX
+pseudo-terminals (`TIOCSCTTY` and `tty_mode`) without importing `asyncio`
+or `pty` on `import libvt`. The `pytest11` plugin provides
+protocol-typed `vt_terminal`, `vt_factory`, `vt_parser`, `vt_recorder`,
+and `vt_pty` fixtures alongside {func}`~libvt.testing.assert_screen`,
+{func}`~libvt.testing.assert_screen_box`, and
 {class}`~libvt.terminal.FlightRecorder` diagnostics. See
 {doc}`topics/sync-and-asyncio` for details.
 
