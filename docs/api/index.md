@@ -6,6 +6,23 @@
 
 Public modules and types shipped by `libvt`.
 
+::::{grid} 1 1 2 2
+:gutter: 2 2 3 3
+
+:::{grid-item-card} `libvt`
+:link: libvt
+:link-type: doc
+Top-level package exports and metadata.
+:::
+
+:::{grid-item-card} `libvt.pytest_plugin`
+:link: pytest_plugin
+:link-type: doc
+Pytest plugin entry point and fixtures.
+:::
+
+::::
+
 ## Policy and Guarantees
 
 ::::{grid} 1 2 3 3
@@ -30,3 +47,11 @@ Active deprecations and migration guidance.
 :::
 
 ::::
+
+```{toctree}
+:hidden:
+:maxdepth: 1
+
+libvt
+pytest_plugin
+```
