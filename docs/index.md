@@ -11,25 +11,25 @@ streaming VT parser (`py3-none-any.whl` — no C shared library required).
 :::{grid-item-card} Quickstart
 :link: quickstart
 :link-type: doc
-Install `libvt` and inspect package metadata.
+Feed VT byte streams, slice 2D screen regions, and assert terminal state.
 :::
 
 :::{grid-item-card} Topics
 :link: topics/index
 :link-type: doc
-Parser state machine, screen storage, and sans-I/O design.
+Three-layer architecture, `?2026` sync frames, `asyncio`, and `pyte` migration.
 :::
 
 :::{grid-item-card} API Reference
 :link: api/index
 :link-type: doc
-Public modules, types, and pytest fixtures.
+Every public class, dataclass, enum, and pytest fixture.
 :::
 
 :::{grid-item-card} Project
 :link: project/index
 :link-type: doc
-Contributing, code style, releases, and architecture decisions.
+Contributing, code style, benchmarks, releases, and ADRs.
 :::
 
 ::::
@@ -49,9 +49,13 @@ $ pip install libvt
 ## At a glance
 
 ```python
->>> import libvt
->>> libvt.__title__
-'libvt'
+>>> from libvt import AnsiColor, Terminal
+>>> term = Terminal(rows=24, cols=80)
+>>> term.feed(b"\x1b[1;32mOK\x1b[0m \xe6\x97\xa5\xe6\x9c\xac\r\n> ")
+>>> term.text
+'OK 日本\n> '
+>>> (term[0, 0].text, term[0, 0].style.bold, term[0, 0].style.fg)
+('O', True, <AnsiColor.GREEN: 2>)
 ```
 
 ```{toctree}
