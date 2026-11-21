@@ -31,6 +31,12 @@ Release checklist and version policy.
 In-process VT microbenchmarks and cross-commit timing harness.
 :::
 
+:::{grid-item-card} Architecture Decisions
+:link: adr/index
+:link-type: doc
+Architecture decision records and proposal template.
+:::
+
 ::::
 
 ## API Governance
@@ -65,6 +71,7 @@ contributing
 code-style
 releasing
 benchmark
+adr/index
 public-api
 compatibility
 deprecations
