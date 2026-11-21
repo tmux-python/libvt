@@ -7,7 +7,7 @@ import typing as t
 import pytest
 
 import libvt
-from libvt.testing import assert_screen
+from libvt.testing import assert_screen, assert_screen_box
 
 
 @pytest.fixture(autouse=True)
@@ -17,3 +17,4 @@ def _seed_doctest_namespace(doctest_namespace: dict[str, t.Any]) -> None:
     doctest_namespace["Terminal"] = libvt.Terminal
     doctest_namespace["AnsiColor"] = libvt.AnsiColor
     doctest_namespace["assert_screen"] = assert_screen
+    doctest_namespace["assert_screen_box"] = assert_screen_box

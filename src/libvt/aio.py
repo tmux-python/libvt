@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import collections.abc
 import contextlib
+import dataclasses
 import os
+import socket
 import struct
 import sys
 import time
@@ -22,6 +24,67 @@ from libvt.config import (
 from libvt.exc import TerminalTimeoutError
 from libvt.input import InputEvent, KeyEvent, PasteEvent
 from libvt.terminal import FlightRecorder, Snapshot, Terminal
+
+type TtyMode = t.Literal["cooked", "cbreak", "raw"]
+
+_PTY_TRAMPOLINE = (
+    "import errno, fcntl, os, signal, sys, termios\n"
+    "err_fd = int(sys.argv[1])\n"
+    "try:\n"
+    "    os.set_inheritable(err_fd, False)\n"
+    "    if hasattr(termios, 'TIOCSCTTY'):\n"
+    "        try:\n"
+    "            fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+    "        except OSError as exc:\n"
+    "            if exc.errno not in (errno.EPERM, errno.EINVAL):\n"
+    "                raise\n"
+    "    signal.signal(signal.SIGPIPE, signal.SIG_DFL)\n"
+    "    os.execvp(sys.argv[2], sys.argv[2:])\n"
+    "except BaseException as exc:\n"
+    "    code = getattr(exc, 'errno', None)\n"
+    "    if not isinstance(code, int):\n"
+    "        code = errno.ENOEXEC\n"
+    "    msg = getattr(exc, 'strerror', None) or str(exc)\n"
+    "    os.write(err_fd, f'{code}:{msg}'.encode('utf-8', 'replace'))\n"
+    "    os._exit(127)\n"
+)
+
+
+def _raise_exec_error(err_payload: bytes, cmd: str, default_errno: int) -> t.NoReturn:
+    code_s, _, err_msg = err_payload.decode("utf-8", "replace").partition(":")
+    err_no = int(code_s) if code_s.isdigit() else default_errno
+    raise OSError(err_no, err_msg or os.strerror(err_no), cmd)
+
+
+async def _read_cloexec_pipe(loop: asyncio.AbstractEventLoop, fd: int) -> bytes:
+    """Read non-blocking *fd* until EOF without spawning executor threads."""
+    chunks: list[bytes] = []
+    done = loop.create_future()
+
+    def _on_ready() -> None:
+        while True:
+            try:
+                data = os.read(fd, 4_096)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                loop.remove_reader(fd)
+                if not done.done():
+                    done.set_exception(exc)
+                return
+            if not data:
+                loop.remove_reader(fd)
+                if not done.done():
+                    done.set_result(b"".join(chunks))
+                return
+            chunks.append(data)
+
+    loop.add_reader(fd, _on_ready)
+    try:
+        return await done
+    finally:
+        with contextlib.suppress(Exception):
+            loop.remove_reader(fd)
 
 
 class ReplyWriter(t.Protocol):
@@ -372,31 +435,56 @@ async def open_pty(
     scrollback: int = 2_000,
     env: collections.abc.Mapping[str, str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
+    tty_mode: TtyMode = "cooked",
     profile: Profile = DEFAULT_PROFILE,
     policy: Policy = DEFAULT_POLICY,
     limits: Limits = DEFAULT_LIMITS,
     sync_timeout: float = 1.0,
 ) -> collections.abc.AsyncGenerator[PtySession]:
-    """Spawn *argv* on a POSIX pseudo-terminal driven by :class:`Terminal`."""
+    """Spawn *argv* with a controlling POSIX PTY driven by :class:`Terminal`."""
     if sys.platform == "win32":
         msg = "open_pty requires POSIX pty.openpty()"
         raise NotImplementedError(msg)
+    if not argv:
+        msg = "argv must not be empty"
+        raise ValueError(msg)
+    if tty_mode not in ("cooked", "cbreak", "raw"):
+        msg = f"unsupported tty_mode: {tty_mode!r}"
+        raise ValueError(msg)
 
+    import errno
     import fcntl
     import pty
     import termios
+    import tty
 
+    loop = asyncio.get_running_loop()
     master_fd, slave_fd = pty.openpty()
+    err_r, err_w = os.pipe()
+    slave_closed = False
+    err_w_closed = False
+    proc: asyncio.subprocess.Process | None = None
     try:
         fcntl.ioctl(
             slave_fd,
             termios.TIOCSWINSZ,
             struct.pack("HHHH", rows, cols, 0, 0),
         )
+        if tty_mode == "cbreak":
+            tty.setcbreak(slave_fd)
+        elif tty_mode == "raw":
+            tty.setraw(slave_fd)
         os.set_blocking(master_fd, False)
+        os.set_blocking(err_r, False)
         child_env = dict(os.environ if env is None else env)
         child_env.setdefault("TERM", "xterm-256color")
         proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _PTY_TRAMPOLINE,
+            str(err_w),
             *argv,
             stdin=slave_fd,
             stdout=slave_fd,
@@ -404,13 +492,44 @@ async def open_pty(
             cwd=cwd,
             env=child_env,
             start_new_session=True,
+            pass_fds=(err_w,),
             close_fds=True,
         )
+        os.close(slave_fd)
+        slave_closed = True
+        os.close(err_w)
+        err_w_closed = True
+
+        err_payload = await _read_cloexec_pipe(loop, err_r)
+        if err_payload:
+            await proc.wait()
+            _raise_exec_error(err_payload, argv[0], errno.ENOEXEC)
     except BaseException:
-        os.close(master_fd)
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+        with contextlib.suppress(OSError):
+            os.close(master_fd)
         raise
     finally:
-        os.close(slave_fd)
+        if not slave_closed:
+            with contextlib.suppress(OSError):
+                os.close(slave_fd)
+        if not err_w_closed:
+            with contextlib.suppress(OSError):
+                os.close(err_w)
+        with contextlib.suppress(OSError):
+            os.close(err_r)
+
+    eff_policy = policy
+    if policy == DEFAULT_POLICY:
+        fqdn = socket.gethostname().lower()
+        short = fqdn.partition(".")[0]
+        eff_policy = dataclasses.replace(
+            policy,
+            osc7_hosts=policy.osc7_hosts | frozenset({fqdn, short}),
+        )
 
     recorder = FlightRecorder(max_bytes=limits.max_recorder_bytes)
     terminal = Terminal(
@@ -418,7 +537,7 @@ async def open_pty(
         cols=cols,
         scrollback=scrollback,
         profile=profile,
-        policy=policy,
+        policy=eff_policy,
         limits=limits,
         recorder=recorder,
     )
@@ -428,7 +547,6 @@ async def open_pty(
         terminal=terminal,
         sync_timeout=sync_timeout,
     )
-    loop = asyncio.get_running_loop()
     session._loop = loop
     loop.add_reader(master_fd, session._on_readable)
     try:
@@ -441,5 +559,6 @@ __all__ = [
     "AsyncTerminalStream",
     "PtySession",
     "ReplyWriter",
+    "TtyMode",
     "open_pty",
 ]

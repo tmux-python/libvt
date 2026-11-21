@@ -63,12 +63,24 @@ b'\x1b[200~line 1\nline 2\x1b[201~'
 
 ## Pytest assertions
 
-{func}`libvt.testing.assert_screen` compares visible text and optional
-cursor coordinates, accepting either plain lines or boxed diagrams:
+{func}`libvt.testing.assert_screen` compares literal visible text (including
+box-drawing borders) and optional cursor coordinates, while
+{func}`libvt.testing.assert_screen_box` validates column-aligned `┌──┐`
+diagrams and soft-wrap markers:
 
 ```python
->>> from libvt.testing import assert_screen
+>>> from libvt.testing import assert_screen, assert_screen_box
 >>> term = libvt.Terminal(rows=2, cols=8)
 >>> term.feed("日本!\r\nok".encode())
 >>> assert_screen(term, "日本!\nok", cursor=(1, 2))
+>>> assert_screen_box(
+...     term,
+...     """
+...     ┌────────┐
+...     │日本!   │
+...     │ok      │
+...     └────────┘
+...     """,
+...     cursor=(1, 2),
+... )
 ```

@@ -114,13 +114,38 @@ def format_flight_recorder(target: Terminal) -> str:
     return "\n".join(lines)
 
 
+def _raise_mismatch(
+    target: Terminal | Snapshot,
+    snap: Snapshot,
+    expected_box: str,
+    actual_box: str,
+    cursor: tuple[int, int] | None,
+) -> None:
+    details = [
+        "Screen state mismatch:",
+        f"cursor actual=({snap.cursor.row}, {snap.cursor.col})"
+        + (f" expected={cursor}" if cursor is not None else ""),
+        "Expected:",
+        expected_box,
+        "Actual:",
+        actual_box,
+    ]
+    if isinstance(target, Terminal):
+        details.append(format_flight_recorder(target))
+    raise ScreenAssertionError("\n".join(details))
+
+
 def assert_screen(
     target: Terminal | Snapshot,
     expected: str | collections.abc.Sequence[str],
     *,
     cursor: tuple[int, int] | None = None,
 ) -> None:
-    """Assert that *target*'s visible lines (and optional *cursor*) match *expected*.
+    """Assert that *target*'s literal visible text (and *cursor*) matches *expected*.
+
+    Unlike :func:`assert_screen_box`, ``assert_screen`` never strips ``┌──┐``
+    border glyphs, so applications drawing literal box-drawing borders match
+    verbatim.
 
     Parameters
     ----------
@@ -128,7 +153,7 @@ def assert_screen(
         Live terminal or immutable snapshot under test.
     expected : str | Sequence[str]
         Expected visible text (dedented when passed as a multi-line string)
-        or explicit sequence of row strings.
+        or explicit sequence of right-trimmed row strings.
     cursor : tuple[int, int] | None, optional
         Expected zero-based ``(row, col)`` cursor coordinates, if checked.
 
@@ -140,25 +165,7 @@ def assert_screen(
     snap = target.snapshot() if isinstance(target, Terminal) else target
     if isinstance(expected, str):
         cleaned = textwrap.dedent(expected).removeprefix("\n").removesuffix("\n")
-        raw_lines = cleaned.split("\n") if cleaned else []
-        if (
-            len(raw_lines) >= 2
-            and raw_lines[0].startswith("┌")
-            and raw_lines[0].endswith("┐")
-            and raw_lines[-1].startswith("└")
-            and raw_lines[-1].endswith("┘")
-        ):
-            unboxed: list[str] = []
-            for box_ln in raw_lines[1:-1]:
-                body = box_ln.removeprefix("│")
-                body = body.removesuffix("W")
-                body = body.removesuffix("│").rstrip(" ")
-                unboxed.append(body)
-            while unboxed and unboxed[-1] == "":
-                unboxed.pop()
-            exp_lines = unboxed
-        else:
-            exp_lines = raw_lines
+        exp_lines = cleaned.split("\n") if cleaned else []
     else:
         exp_lines = list(expected)
 
@@ -181,24 +188,95 @@ def assert_screen(
         line = exp_lines[idx] if idx < len(exp_lines) else ""
         exp_box_lines.append(f"│{_pad_expected_line(line, preview_cols)}│")
     exp_box_lines.append(f"└{exp_border}┘")
-    expected_box = "\n".join(exp_box_lines)
+    _raise_mismatch(target, snap, "\n".join(exp_box_lines), actual_box, cursor)
 
-    details = [
-        "Screen state mismatch:",
-        f"cursor actual=({snap.cursor.row}, {snap.cursor.col})"
-        + (f" expected={cursor}" if cursor is not None else ""),
-        "Expected:",
-        expected_box,
-        "Actual:",
-        actual_box,
-    ]
-    if isinstance(target, Terminal):
-        details.append(format_flight_recorder(target))
-    raise ScreenAssertionError("\n".join(details))
+
+def assert_screen_box(
+    target: Terminal | Snapshot,
+    expected: str,
+    *,
+    cursor: tuple[int, int] | None = None,
+) -> None:
+    """Assert that *target* matches a ``┌──┐`` / ``│..│`` boxed diagram.
+
+    Validates exact display-column width across every row, preserves interior
+    and trailing spaces as well as blank rows, and checks soft-wrap flags via
+    trailing ``│W`` markers outside the right pipe.
+
+    Parameters
+    ----------
+    target : Terminal | Snapshot
+        Live terminal or immutable snapshot under test.
+    expected : str
+        Boxed diagram matching :func:`format_screen_box` layout.
+    cursor : tuple[int, int] | None, optional
+        Expected zero-based ``(row, col)`` cursor coordinates, if checked.
+
+    Raises
+    ------
+    ValueError
+        When *expected* does not form a rectangular ``┌──┐`` / ``└──┘`` frame.
+    ScreenAssertionError
+        When screen dimensions, cell contents, soft-wrap flags, or cursor
+        coordinates differ from *expected*.
+    """
+    cleaned = textwrap.dedent(expected).removeprefix("\n").removesuffix("\n")
+    raw_lines = cleaned.split("\n") if cleaned else []
+    if len(raw_lines) < 3:
+        msg = "expected box must contain top border, >=1 row, and bottom border"
+        raise ValueError(msg)
+
+    top = raw_lines[0]
+    bottom = raw_lines[-1]
+    if not (top.startswith("┌") and top.endswith("┐")):
+        msg = f"expected box top border must match '┌─...─┐', got {top!r}"
+        raise ValueError(msg)
+    top_bars = top[1:-1]
+    if not top_bars or any(ch != "─" for ch in top_bars):
+        msg = f"expected box top border must contain only '─', got {top!r}"
+        raise ValueError(msg)
+    box_cols = len(top_bars)
+    expected_bottom = f"└{'─' * box_cols}┘"
+    if bottom != expected_bottom:
+        msg = f"expected box bottom border {expected_bottom!r}, got {bottom!r}"
+        raise ValueError(msg)
+
+    norm_lines = [top]
+    for r_idx, raw_row in enumerate(raw_lines[1:-1]):
+        if not raw_row.startswith("│"):
+            msg = f"box row {r_idx} missing leading '│': {raw_row!r}"
+            raise ValueError(msg)
+        if raw_row.endswith("│W"):
+            body = raw_row[1:-2]
+            wrap_suffix = "W"
+        elif raw_row.endswith("│"):
+            body = raw_row[1:-1]
+            wrap_suffix = ""
+        else:
+            msg = f"box row {r_idx} must end with '│' or '│W': {raw_row!r}"
+            raise ValueError(msg)
+        row_w = display_width(body)
+        if row_w != box_cols:
+            msg = (
+                f"box row {r_idx} display width {row_w} != border width "
+                f"{box_cols}: {raw_row!r}"
+            )
+            raise ValueError(msg)
+        norm_lines.append(f"│{sanitize_terminal_text(body)}│{wrap_suffix}")
+    norm_lines.append(bottom)
+    expected_box = "\n".join(norm_lines)
+
+    snap = target.snapshot() if isinstance(target, Terminal) else target
+    actual_box = format_screen_box(snap)
+    cursor_ok = cursor is None or (snap.cursor.row, snap.cursor.col) == cursor
+    if actual_box == expected_box and cursor_ok:
+        return
+    _raise_mismatch(target, snap, expected_box, actual_box, cursor)
 
 
 __all__ = [
     "assert_screen",
+    "assert_screen_box",
     "format_flight_recorder",
     "format_screen_box",
 ]

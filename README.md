@@ -21,11 +21,12 @@ zero-dependency, typed virtual terminal emulator and streaming VT parser
   `OSC 9;4` fallback), `OSC 133` semantic prompt zones, `OSC 7` working
   directory, `OSC 8` hyperlinks, `OSC 52` clipboard, `?2026`
   synchronized-output stepping, `DECRQM`, `DECRQSS`, `XTGETTCAP`, and
-  `DCS tmux;` passthrough unwrapping.
+  `DCS tmux;` passthrough events.
 - **Mode-aware input & testing**: Outbound key/mouse/focus/paste
   encoding (including Kitty `CSI u` and fail-closed bracketed paste),
-  `libvt.aio` stream and POSIX PTY helpers, `vt_*` pytest fixtures, and
-  boxed `assert_screen` diffs with `FlightRecorder` disassembly.
+  `libvt.aio` stream and controlling-TTY POSIX PTY helpers, `vt_*`
+  pytest fixtures, and `assert_screen` / `assert_screen_box` diffs with
+  `FlightRecorder` disassembly.
 
 ## Requirements
 
@@ -81,10 +82,10 @@ Boxed visual assertions verify CJK wide-character alignment and cursor
 coordinates in tests:
 
 ```python
->>> from libvt.testing import assert_screen
+>>> from libvt.testing import assert_screen_box
 >>> t = libvt.Terminal(rows=2, cols=8)
 >>> t.feed("日本ok\r\ndone".encode())
->>> assert_screen(
+>>> assert_screen_box(
 ...     t,
 ...     """
 ...     ┌────────┐

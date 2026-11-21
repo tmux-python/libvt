@@ -11,7 +11,7 @@ if t.TYPE_CHECKING:
     import collections.abc
     import os
 
-    from libvt.aio import PtySession
+    from libvt.aio import PtySession, TtyMode
     from libvt.config import Limits, Policy, Profile
     from libvt.events import Event
     from libvt.parser import Parser
@@ -48,6 +48,7 @@ class PtyFactory(t.Protocol):
         cols: int = 80,
         env: collections.abc.Mapping[str, str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
+        tty_mode: TtyMode = "cooked",
     ) -> contextlib.AbstractAsyncContextManager[PtySession]:
         """Open a POSIX PTY subprocess session."""
 
@@ -128,8 +129,16 @@ def vt_pty() -> PtyFactory:
         cols: int = 80,
         env: collections.abc.Mapping[str, str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
+        tty_mode: TtyMode = "cooked",
     ) -> contextlib.AbstractAsyncContextManager[PtySession]:
-        return open_pty(argv, rows=rows, cols=cols, env=env, cwd=cwd)
+        return open_pty(
+            argv,
+            rows=rows,
+            cols=cols,
+            env=env,
+            cwd=cwd,
+            tty_mode=tty_mode,
+        )
 
     return _spawn
 
