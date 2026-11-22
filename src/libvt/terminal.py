@@ -791,11 +791,12 @@ class Terminal:
         self._pen_word: int = 0
         self._hyperlink: Hyperlink | None = None
         self._cell_ext: _CellExt | None = None
-        self._g_sets: list[str] = ["B", "B", "B", "B"]
+        def_g = ("B", profile.default_g1_charset, "B", "B")
+        self._g_sets: list[str] = list(def_g)
         self._gl: int = 0
         self._single_shift: int | None = None
-        self._saved_primary = _SavedCursor()
-        self._saved_alt = _SavedCursor()
+        self._saved_primary = _SavedCursor(g_sets=def_g)
+        self._saved_alt = _SavedCursor(g_sets=def_g)
         self._last_printed: str = ""
         self._last_printed_pos: tuple[int, int] | None = None
         self._cluster_state: int = CLUSTER_NONE
@@ -1216,7 +1217,8 @@ class Terminal:
         self._sync_pen_cache()
         self._last_printed = ""
         self._clear_cluster_anchor()
-        self._g_sets = ["B", "B", "B", "B"]
+        def_g = ("B", self._profile.default_g1_charset, "B", "B")
+        self._g_sets = list(def_g)
         self._gl = 0
         self._single_shift = None
         was_sync = self.synchronized
@@ -1245,8 +1247,8 @@ class Terminal:
             self._screens.active_is_alt = False
             self._screens.primary.reset()
             self._screens.alternate.reset()
-            self._saved_primary = _SavedCursor()
-            self._saved_alt = _SavedCursor()
+            self._saved_primary = _SavedCursor(g_sets=def_g)
+            self._saved_alt = _SavedCursor(g_sets=def_g)
             self._title = ""
             self._window_name = ""
             self._fg_rgb = self._profile.fg_rgb
@@ -1391,6 +1393,11 @@ class Terminal:
         self._before_mutate()
         top, bottom, left, right = self._effective_margins(scr)
         col = left if carriage_return else scr._cur_col
+        keep_wrap = (
+            (not carriage_return)
+            and self._profile.pending_wrap_phantom_col
+            and scr._pending_wrap
+        )
         if scr._cur_row == bottom and left <= scr._cur_col <= right:
             bce_word, bce_ext = self._bce_pair()
             scr.scroll_up(
@@ -1407,11 +1414,11 @@ class Terminal:
                 Rect(bottom, left, 1, right - left + 1),
                 EraseCause.SCROLL,
             )
-            self._set_cursor(scr, bottom, col, pending_wrap=False)
+            self._set_cursor(scr, bottom, col, pending_wrap=keep_wrap)
         elif scr._cur_row < scr.rows - 1:
-            self._set_cursor(scr, scr._cur_row + 1, col, pending_wrap=False)
+            self._set_cursor(scr, scr._cur_row + 1, col, pending_wrap=keep_wrap)
         else:
-            self._set_cursor(scr, scr._cur_row, col, pending_wrap=False)
+            self._set_cursor(scr, scr._cur_row, col, pending_wrap=keep_wrap)
 
     def _map_charset(self, text: str) -> str:
         if self._single_shift is not None:
@@ -1878,11 +1885,14 @@ class Terminal:
         self._gl = saved.gl
         self._single_shift = None
         self._modes.set_mode(Mode.DECOM, enabled=saved.decom)
+        restored_wrap = (
+            False if self._profile.pending_wrap_phantom_col else saved.pending_wrap
+        )
         self._set_cursor(
             scr,
             saved.row,
             saved.col,
-            pending_wrap=saved.pending_wrap,
+            pending_wrap=restored_wrap,
         )
 
     def _handle_esc(self, intermediates: bytes, final: int) -> None:
@@ -1902,6 +1912,7 @@ class Terminal:
             elif final == 0x4D:  # ESC M RI
                 self._before_mutate()
                 top, bottom, left, right = self._effective_margins(scr)
+                keep_wrap = self._profile.pending_wrap_phantom_col and scr._pending_wrap
                 if scr._cur_row == top and left <= scr._cur_col <= right:
                     bce_w, bce_e = self._bce_pair()
                     scr.scroll_down(
@@ -1920,7 +1931,10 @@ class Terminal:
                     self._clear_cluster_anchor()
                 elif scr._cur_row > 0:
                     self._set_cursor(
-                        scr, scr._cur_row - 1, scr._cur_col, pending_wrap=False
+                        scr,
+                        scr._cur_row - 1,
+                        scr._cur_col,
+                        pending_wrap=keep_wrap,
                     )
             elif final == 0x4E:  # ESC N SS2 -> G2
                 self._single_shift = 2
@@ -2062,38 +2076,41 @@ class Terminal:
         cause = EraseCause.DECSED if selective else EraseCause.ED
         c_row = scr._cur_row
         c_col = scr._cur_col
+        phantom = self._profile.pending_wrap_phantom_col and scr._pending_wrap
         if mode == 0:
-            scr.heal_before_edit(c_row, c_col, scr.cols)
-            scr._rows[c_row].clear_range(
-                c_col,
-                scr.cols,
-                bce_w,
-                bce_e,
-                selective=selective,
-            )
-            scr._rows[c_row].wrapped = False
+            if not phantom:
+                scr.heal_before_edit(c_row, c_col, scr.cols)
+                scr._rows[c_row].clear_range(
+                    c_col,
+                    scr.cols,
+                    bce_w,
+                    bce_e,
+                    selective=selective,
+                )
+                scr._rows[c_row].wrapped = False
+                self._notify_erase(Rect(c_row, c_col, 1, scr.cols - c_col), cause)
             for r in range(c_row + 1, scr.rows):
                 scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e, selective=selective)
-            self._notify_erase(Rect(c_row, c_col, 1, scr.cols - c_col), cause)
             if c_row + 1 < scr.rows:
                 self._notify_erase(
                     Rect(c_row + 1, 0, scr.rows - c_row - 1, scr.cols),
                     cause,
                 )
         elif mode == 1:
+            end_c = scr.cols if phantom else c_col + 1
             for r in range(c_row):
                 scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e, selective=selective)
-            scr.heal_before_edit(c_row, 0, c_col + 1)
+            scr.heal_before_edit(c_row, 0, end_c)
             scr._rows[c_row].clear_range(
                 0,
-                c_col + 1,
+                end_c,
                 bce_w,
                 bce_e,
                 selective=selective,
             )
             if c_row > 0:
                 self._notify_erase(Rect(0, 0, c_row, scr.cols), cause)
-            self._notify_erase(Rect(c_row, 0, 1, c_col + 1), cause)
+            self._notify_erase(Rect(c_row, 0, 1, end_c), cause)
         elif mode == 2:
             for r in range(scr.rows):
                 scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e, selective=selective)
@@ -2105,7 +2122,7 @@ class Terminal:
                 for r in range(scr.rows):
                     scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e)
             self._notify_erase(Rect(0, 0, scr.rows, scr.cols), cause)
-        self._set_cursor(scr, c_row, c_col, pending_wrap=False)
+        self._set_cursor(scr, c_row, c_col, pending_wrap=phantom)
 
     def _erase_line(
         self,
@@ -2115,6 +2132,9 @@ class Terminal:
         selective: bool,
     ) -> None:
         if mode not in (0, 1, 2):
+            return
+        phantom = self._profile.pending_wrap_phantom_col and scr._pending_wrap
+        if mode == 0 and phantom:
             return
         self._before_mutate()
         bce_w, bce_e = self._bce_pair()
@@ -2133,17 +2153,18 @@ class Terminal:
             scr._rows[c_row].wrapped = False
             self._notify_erase(Rect(c_row, c_col, 1, scr.cols - c_col), cause)
         elif mode == 1:
-            scr.heal_before_edit(c_row, 0, c_col + 1)
+            end_c = scr.cols if phantom else c_col + 1
+            scr.heal_before_edit(c_row, 0, end_c)
             scr._rows[c_row].clear_range(
                 0,
-                c_col + 1,
+                end_c,
                 bce_w,
                 bce_e,
                 selective=selective,
             )
-            if c_col + 1 >= scr.cols:
+            if end_c >= scr.cols:
                 scr._rows[c_row].wrapped = False
-            self._notify_erase(Rect(c_row, 0, 1, c_col + 1), cause)
+            self._notify_erase(Rect(c_row, 0, 1, end_c), cause)
         elif mode == 2:
             scr.heal_before_edit(c_row, 0, scr.cols)
             scr._rows[c_row].clear_range(
@@ -2154,7 +2175,7 @@ class Terminal:
                 selective=selective,
             )
             self._notify_erase(Rect(c_row, 0, 1, scr.cols), cause)
-        self._set_cursor(scr, c_row, c_col, pending_wrap=False)
+        self._set_cursor(scr, c_row, c_col, pending_wrap=phantom)
 
     def _handle_csi(
         self,
@@ -2266,15 +2287,22 @@ class Terminal:
             elif final == ord("n"):  # Private DSR (?6n DECXCPR, ?996n color scheme)
                 ps = params.raw_or_default(0, 0)
                 if ps == 6:
+                    phantom_extra = (
+                        1
+                        if (
+                            self._profile.pending_wrap_phantom_col and scr._pending_wrap
+                        )
+                        else 0
+                    )
                     r_out = (
                         (scr._cur_row - top + 1)
                         if self._modes.is_set(Mode.DECOM)
                         else (scr._cur_row + 1)
                     )
                     c_out = (
-                        (scr._cur_col - left + 1)
+                        (scr._cur_col - left + 1 + phantom_extra)
                         if self._modes.is_set(Mode.DECOM)
-                        else (scr._cur_col + 1)
+                        else (scr._cur_col + 1 + phantom_extra)
                     )
                     self._emit_reply(f"\x1b[?{r_out};{c_out}R".encode("ascii"))
                 elif ps == 996 and self._policy.allow_color_queries:
@@ -2366,7 +2394,8 @@ class Terminal:
                 target_r = min(bottom, top + row_1 - 1)
             else:
                 target_r = min(scr.rows - 1, row_1 - 1)
-            self._set_cursor(scr, max(0, target_r), c_col)
+            keep_wrap = self._profile.pending_wrap_phantom_col and scr._pending_wrap
+            self._set_cursor(scr, max(0, target_r), c_col, pending_wrap=keep_wrap)
         elif ch_final == "e":  # VPR
             if not self._profile.hpr_vpr_enabled:
                 return
@@ -2388,6 +2417,8 @@ class Terminal:
         elif ch_final == "K":  # EL
             self._erase_line(scr, params.raw_or_default(0, 0), selective=False)
         elif ch_final == "X":  # ECH
+            if self._profile.pending_wrap_phantom_col and scr._pending_wrap:
+                return
             self._before_mutate()
             n = min(scr.cols - c_col, params.get(0, 1))
             bce_w, bce_e = self._bce_pair()
@@ -2398,6 +2429,8 @@ class Terminal:
             self._notify_erase(Rect(c_row, c_col, 1, n), EraseCause.ECH)
             self._set_cursor(scr, c_row, c_col, pending_wrap=False)
         elif ch_final == "@":  # ICH
+            if self._profile.pending_wrap_phantom_col and scr._pending_wrap:
+                return
             self._before_mutate()
             n = params.get(0, 1)
             bce_w, bce_e = self._bce_pair()
@@ -2412,6 +2445,8 @@ class Terminal:
             )
             self._set_cursor(scr, c_row, c_col, pending_wrap=False)
         elif ch_final == "P":  # DCH
+            if self._profile.pending_wrap_phantom_col and scr._pending_wrap:
+                return
             self._before_mutate()
             n = params.get(0, 1)
             bce_w, bce_e = self._bce_pair()
@@ -2434,6 +2469,11 @@ class Terminal:
                 self._before_mutate()
                 n = params.get(0, 1)
                 bce_w, bce_e = self._bce_pair()
+                keep_wrap = (
+                    not self._profile.il_dl_resets_col
+                    and self._profile.pending_wrap_phantom_col
+                    and scr._pending_wrap
+                )
                 scr.scroll_down(
                     n,
                     top=c_row,
@@ -2447,12 +2487,18 @@ class Terminal:
                     Rect(c_row, left, min(n, bottom - c_row + 1), right - left + 1),
                     EraseCause.SCROLL,
                 )
-                self._set_cursor(scr, c_row, left)
+                target_col = left if self._profile.il_dl_resets_col else c_col
+                self._set_cursor(scr, c_row, target_col, pending_wrap=keep_wrap)
         elif ch_final == "M":  # DL
             if top <= c_row <= bottom and left <= c_col <= right:
                 self._before_mutate()
                 n = params.get(0, 1)
                 bce_w, bce_e = self._bce_pair()
+                keep_wrap = (
+                    not self._profile.il_dl_resets_col
+                    and self._profile.pending_wrap_phantom_col
+                    and scr._pending_wrap
+                )
                 scr.scroll_up(
                     n,
                     top=c_row,
@@ -2472,7 +2518,8 @@ class Terminal:
                     ),
                     EraseCause.SCROLL,
                 )
-                self._set_cursor(scr, c_row, left)
+                target_col = left if self._profile.il_dl_resets_col else c_col
+                self._set_cursor(scr, c_row, target_col, pending_wrap=keep_wrap)
         elif ch_final == "S":  # SU
             self._before_mutate()
             n = params.get(0, 1)
@@ -2518,7 +2565,19 @@ class Terminal:
         elif ch_final == "b":  # REP
             if prev_printed:
                 count = min(self._limits.max_rep_count, params.get(0, 1))
-                self._handle_print(prev_printed * count)
+                if not self._profile.rep_wraps and self._modes.is_set(Mode.DECAWM):
+                    if scr._pending_wrap and self._profile.pending_wrap_phantom_col:
+                        self._last_printed = prev_printed
+                    else:
+                        w = max(1, char_width(prev_printed[0]))
+                        max_c = right if c_col <= right else scr.cols - 1
+                        avail_cols = max_c - c_col + 1
+                        fit = max(0, avail_cols // w)
+                        if fit > 0:
+                            self._handle_print(prev_printed * min(count, fit))
+                        self._last_printed = prev_printed
+                else:
+                    self._handle_print(prev_printed * count)
         elif ch_final == "r":  # DECSTBM
             t_arg = params.get(0, 1) - 1
             b_arg = params.get(1, scr.rows) - 1
@@ -2577,13 +2636,18 @@ class Terminal:
             if ps == 5:
                 self._emit_reply(b"\x1b[0n")
             elif ps == 6:
+                phantom_extra = (
+                    1
+                    if (self._profile.pending_wrap_phantom_col and scr._pending_wrap)
+                    else 0
+                )
                 r_out = (
                     (c_row - top + 1) if self._modes.is_set(Mode.DECOM) else (c_row + 1)
                 )
                 c_out = (
-                    (c_col - left + 1)
+                    (c_col - left + 1 + phantom_extra)
                     if self._modes.is_set(Mode.DECOM)
-                    else (c_col + 1)
+                    else (c_col + 1 + phantom_extra)
                 )
                 self._emit_reply(f"\x1b[{r_out};{c_out}R".encode("ascii"))
         elif ch_final == "t":  # XTWINOPS

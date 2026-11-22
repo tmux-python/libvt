@@ -9,7 +9,7 @@ import pytest
 
 import libvt
 from libvt.aio import AsyncTerminalStream
-from libvt.config import DEFAULT_PROFILE, TMUX_PROFILE, XTERM_PROFILE, Policy
+from libvt.config import DEFAULT_PROFILE, TMUX_PROFILE, XTERM_PROFILE, Policy, Profile
 from libvt.events import ScreenErased
 from libvt.exc import TerminalTimeoutError
 from libvt.modes import Mode
@@ -300,3 +300,65 @@ async def test_formatter_vt_bce_roundtrip_html_palette_and_timeout_diagnostics()
     assert err.parser_state == ParserState.OSC_STRING
     assert b"\x1b]0;stuck" in err.recent_bytes
     assert "Flight Recorder:" in str(err)
+
+
+def test_tmux_phantom_column_il_dl_and_version_factory() -> None:
+    """``TMUX_PROFILE`` models phantom col ``cols``, ``IL``/``DL``, and versions."""
+    # Reverse-video header + EL 0 at phantom column preserves col 4 glyph and style!
+    tm = libvt.Terminal(rows=3, cols=5, profile=TMUX_PROFILE)
+    tm.feed(b"\x1b[7mHEAD!\x1b[K\x1b[0m")
+    assert tm[0].text == "HEAD!"
+    assert tm[0, 4].style.reverse is True
+    assert tm.cursor.pending_wrap is True
+
+    # ED 0 at phantom column keeps current row, clears below, and keeps pending_wrap.
+    tm.reset()
+    tm.feed(b"12345\r\nrow-2\x1b[1;1H12345\x1b[J")
+    assert tm.lines == ("12345", "", "")
+    assert tm.cursor.pending_wrap is True
+
+    # ECH, ICH, DCH at phantom column are no-ops keeping pending_wrap.
+    for seq in (b"\x1b[X", b"\x1b[@", b"\x1b[P"):
+        tm.reset()
+        tm.feed(b"12345" + seq)
+        assert tm[0].text == "12345"
+        assert tm.cursor.pending_wrap is True
+
+    # LF (LNM off), IND, RI, and VPA preserve pending_wrap under TMUX_PROFILE.
+    tm.reset()
+    tm.feed(b"12345\nX")
+    assert tm.lines == ("12345", "", "X")
+
+    tm.reset()
+    tm.feed(b"\x1b[2;1H12345\x1bMX")
+    assert tm.lines == ("", "X2345", "")
+
+    tm.reset()
+    tm.feed(b"12345\x1b[2dX")
+    assert tm.lines == ("12345", "", "X")
+
+    # DECRC drops pending_wrap under TMUX_PROFILE, clamping to cols - 1.
+    tm.reset()
+    tm.feed(b"12345\x1b7\x1b8X")
+    assert tm[0].text == "1234X"
+
+    # CPR (CSI 6 n) reports cols + 1 at phantom column under TMUX_PROFILE.
+    tm.reset()
+    tm.feed(b"12345\x1b[6n")
+    assert tm.drain_replies() == b"\x1b[1;6R"
+
+    # IL and DL preserve cursor column under TMUX_PROFILE (unlike DEFAULT_PROFILE).
+    tm.reset()
+    tm.feed(b"abcde\r\n12345\x1b[2;4H\x1b[L")
+    assert tm.cursor.col == 3
+    tm.feed(b"\x1b[M")
+    assert tm.cursor.col == 3
+
+    # Profile.tmux("3.8a") vs Profile.tmux("3.9") versioned quirks.
+    tm38 = libvt.Terminal(rows=2, cols=5, profile=Profile.tmux("3.8a"))
+    tm38.feed(b"1234X\x1b[2b")
+    assert tm38.lines == ("1234X", "")
+
+    tm39 = libvt.Terminal(rows=2, cols=5, profile=Profile.tmux("3.9"))
+    tm39.feed(b"1234X\x1b[2b")
+    assert tm39.lines == ("1234X", "XX")

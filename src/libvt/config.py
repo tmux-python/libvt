@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import enum
+import re
+import typing as t
 from dataclasses import dataclass
+
+type Charset = t.Literal["B", "0", "A"]
+
+_TMUX_VERSION_RE = re.compile(r"^\s*(\d+)\.(\d+)[a-z]?\s*$")
 
 
 class ColorScheme(enum.IntEnum):
@@ -39,8 +45,8 @@ class Profile:
         Default background 8-bit RGB reported for ``OSC 11 ; ?``.
     pending_wrap_phantom_col : bool
         When ``True`` (``TMUX_PROFILE``), ``pending_wrap`` treats the cursor as
-        occupying phantom column ``cols`` on ``CUB`` / ``BS`` and allows ``BS``
-        at column ``0`` to step onto the end of a soft-wrapped predecessor row,
+        occupying phantom column ``cols`` across ``EL``/``ED``, ``ECH``/``ICH``/
+        ``DCH``, vertical motions, ``DECRC``, ``CPR``, and ``CUB`` / ``BS``,
         matching ``tmux``'s ``screen-write.c``.
     vs15_narrows_wide_emoji : bool
         When ``True`` (default), ``U+FE0E`` narrows standalone wide emoji
@@ -64,6 +70,17 @@ class Profile:
         When ``True``, ``HPR`` (``CSI Ps a``) and ``VPR`` (``CSI Ps e``) move
         the cursor relatively; when ``False`` (``TMUX_PROFILE``), both are
         quietly ignored.
+    il_dl_resets_col : bool
+        When ``True`` (ECMA-48 / ``xterm`` / ``Ghostty``), ``IL`` and ``DL``
+        move the cursor to the active left margin; when ``False``
+        (``TMUX_PROFILE``), the cursor column is preserved.
+    rep_wraps : bool
+        When ``True`` (default and ``tmux >= 3.9``), ``REP`` (``CSI Ps b``)
+        autowraps across the right margin; when ``False`` (``tmux <= 3.8``),
+        ``REP`` halts at phantom column ``cols``.
+    default_g1_charset : Charset
+        Initial ``G1`` character-set designation on startup and ``RIS``
+        (``"B"`` US-ASCII by default).
     """
 
     name: str = "libvt"
@@ -83,6 +100,35 @@ class Profile:
     reflow_on_resize: bool = True
     ed3_clears_scrollback_on_alt: bool = False
     hpr_vpr_enabled: bool = True
+    il_dl_resets_col: bool = True
+    rep_wraps: bool = True
+    default_g1_charset: Charset = "B"
+
+    @classmethod
+    def tmux(cls, version: tuple[int, int] | str = "3.8a") -> Profile:
+        """Build a version-specific ``tmux`` compatibility :class:`Profile`."""
+        if isinstance(version, tuple):
+            major, minor = version
+        else:
+            m = _TMUX_VERSION_RE.match(version)
+            if m is None:
+                msg = (
+                    f"invalid tmux version {version!r}; expected e.g. '3.8a' or (3, 8)"
+                )
+                raise ValueError(msg)
+            major, minor = int(m.group(1)), int(m.group(2))
+        at_least_3_9 = (major, minor) >= (3, 9)
+        return cls(
+            name="tmux",
+            osc_7501_capabilities="?",
+            pending_wrap_phantom_col=True,
+            vs15_narrows_wide_emoji=False,
+            tmux_window_rename=True,
+            ed3_clears_scrollback_on_alt=True,
+            hpr_vpr_enabled=False,
+            il_dl_resets_col=False,
+            rep_wraps=at_least_3_9,
+        )
 
 
 DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
@@ -207,15 +253,7 @@ XTERM_PROFILE = Profile(
     reflow_on_resize=False,
     ed3_clears_scrollback_on_alt=True,
 )
-TMUX_PROFILE = Profile(
-    name="tmux",
-    osc_7501_capabilities="?",
-    pending_wrap_phantom_col=True,
-    vs15_narrows_wide_emoji=False,
-    tmux_window_rename=True,
-    ed3_clears_scrollback_on_alt=True,
-    hpr_vpr_enabled=False,
-)
+TMUX_PROFILE = Profile.tmux("3.8a")
 DEFAULT_POLICY = Policy()
 TMUX_CAPTURE_POLICY = Policy(allow_passthrough=True)
 DEFAULT_LIMITS = Limits()
@@ -228,6 +266,7 @@ __all__ = [
     "TMUX_CAPTURE_POLICY",
     "TMUX_PROFILE",
     "XTERM_PROFILE",
+    "Charset",
     "ColorScheme",
     "Limits",
     "Policy",
