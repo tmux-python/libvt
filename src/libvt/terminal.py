@@ -906,9 +906,41 @@ class Terminal:
             return self._held_snapshot
         return self.snapshot()
 
+    def _invalidate_cache(self) -> None:
+        if self._cached_snapshot is not None:
+            self._cached_snapshot = None
+            self._generation += 1
+
+    def _build_snapshot(
+        self,
+        *,
+        exclude_modes: frozenset[Mode] = frozenset(),
+    ) -> Snapshot:
+        scr = self._screens.active
+        modes = self._modes.enabled_modes()
+        if exclude_modes:
+            modes = modes - exclude_modes
+        return Snapshot(
+            rows=tuple(r.clone() for r in scr._rows),
+            history=tuple(self._screens.primary._history),
+            cols=scr.cols,
+            cursor=scr.cursor,
+            title=self._title,
+            cwd=self._cwd,
+            cwd_uri=self._cwd_uri,
+            modes=modes,
+            active_is_alt=self._screens.active_is_alt,
+            prompt_zones=self.prompt_zones,
+            program_status=self._status_store.most_urgent,
+            program_statuses=self._status_store.records,
+            generation=self._generation,
+        )
+
     def _ensure_sync_snapshot(self) -> None:
         if self._sync_hold_pending and self._held_snapshot is None:
-            self._held_snapshot = self.snapshot()
+            self._held_snapshot = self._build_snapshot(
+                exclude_modes=TRANSIENT_SNAPSHOT_MODES,
+            )
             self._sync_hold_pending = False
 
     def snapshot(self) -> Snapshot:
@@ -918,22 +950,7 @@ class Terminal:
             and self._cached_snapshot.generation == self._generation
         ):
             return self._cached_snapshot
-        scr = self._screens.active
-        snap = Snapshot(
-            rows=tuple(r.clone() for r in scr._rows),
-            history=tuple(self._screens.primary._history),
-            cols=scr.cols,
-            cursor=scr.cursor,
-            title=self._title,
-            cwd=self._cwd,
-            cwd_uri=self._cwd_uri,
-            modes=self._modes.enabled_modes(),
-            active_is_alt=self._screens.active_is_alt,
-            prompt_zones=self.prompt_zones,
-            program_status=self._status_store.most_urgent,
-            program_statuses=self._status_store.records,
-            generation=self._generation,
-        )
+        snap = self._build_snapshot()
         self._cached_snapshot = snap
         return snap
 
@@ -1021,6 +1038,7 @@ class Terminal:
         self._modes.set_mode(Mode.SYNCHRONIZED_OUTPUT, enabled=False)
         self._sync_hold_pending = False
         self._held_snapshot = None
+        self._cached_snapshot = None
         self._generation += 1
         self._emit_event(
             RenderHoldChanged(
@@ -1033,6 +1051,7 @@ class Terminal:
 
     def notify_process_exit(self) -> None:
         """Prune transient ``working`` / ``blocked`` ``OSC 7501`` status records."""
+        self._before_mutate()
         if self._status_store.on_process_exit():
             self._generation += 1
             self._emit_event(
@@ -1131,13 +1150,6 @@ class Terminal:
             self._modes.set_mode(Mode.LNM, enabled=True)
         self._sync_hold_pending = False
         self._held_snapshot = None
-        if was_sync:
-            self._emit_event(
-                RenderHoldChanged(
-                    active=False,
-                    sync_generation=self._sync_generation,
-                ),
-            )
         if soft:
             if was_alt:
                 self._modes.sync_alt_screen(active_is_alt=True)
@@ -1172,11 +1184,20 @@ class Terminal:
                 Rect(0, 0, self.rows, self.cols),
                 EraseCause.RESET,
             )
+        self._cached_snapshot = None
         self._generation += 1
+        if was_sync:
+            self._emit_event(
+                RenderHoldChanged(
+                    active=False,
+                    sync_generation=self._sync_generation,
+                ),
+            )
 
     def _before_mutate(self) -> None:
         if self._sync_hold_pending:
             self._ensure_sync_snapshot()
+        self._invalidate_cache()
 
     def feed_str(self, text: str, /) -> None:
         """Encode *text* as UTF-8 and feed into the terminal."""
@@ -1283,6 +1304,7 @@ class Terminal:
         pending_wrap: bool = False,
         clear_cluster: bool = True,
     ) -> None:
+        self._before_mutate()
         scr._cur_row = max(0, min(scr.rows - 1, row))
         scr._cur_col = max(0, min(scr.cols - 1, col))
         scr._pending_wrap = pending_wrap
@@ -1684,6 +1706,7 @@ class Terminal:
         )
         n = max(1, count)
         if scr._pending_wrap and rev_wrap:
+            self._before_mutate()
             scr._pending_wrap = False
             self._clear_cluster_anchor()
             n -= 1
@@ -1759,6 +1782,7 @@ class Terminal:
             self._saved_primary = saved
 
     def _restore_cursor(self) -> None:
+        self._before_mutate()
         scr = self._screens.active
         saved = self._saved_alt if self._screens.active_is_alt else self._saved_primary
         self._style = saved.style
@@ -1847,6 +1871,28 @@ class Terminal:
             return
         was_set = self._modes.is_set(mode)
 
+        if mode == Mode.SYNCHRONIZED_OUTPUT:
+            if enabled == was_set:
+                return
+            self._invalidate_cache()
+            self._modes.set_mode(mode, enabled=enabled)
+            if enabled:
+                self._sync_generation += 1
+                self._sync_hold_pending = True
+                self._held_snapshot = None
+                self._step_event |= StopOn.SYNC_START
+            else:
+                self._sync_hold_pending = False
+                self._held_snapshot = None
+                self._step_event |= StopOn.SYNC_END
+            self._emit_event(
+                RenderHoldChanged(
+                    active=enabled,
+                    sync_generation=self._sync_generation,
+                ),
+            )
+            return
+
         if mode in ALT_SCREEN_MODES:
             self._before_mutate()
             self._clear_cluster_anchor()
@@ -1867,6 +1913,7 @@ class Terminal:
                 self._modes.sync_alt_screen(active_is_alt=False)
             return
 
+        self._before_mutate()
         self._modes.set_mode(mode, enabled=enabled)
         scr = self._screens.active
 
@@ -1893,22 +1940,6 @@ class Terminal:
                 self._save_cursor()
             else:
                 self._restore_cursor()
-        elif mode == Mode.SYNCHRONIZED_OUTPUT and enabled != was_set:
-            if enabled:
-                self._sync_generation += 1
-                self._sync_hold_pending = True
-                self._held_snapshot = None
-                self._step_event |= StopOn.SYNC_START
-            else:
-                self._sync_hold_pending = False
-                self._held_snapshot = None
-                self._step_event |= StopOn.SYNC_END
-            self._emit_event(
-                RenderHoldChanged(
-                    active=enabled,
-                    sync_generation=self._sync_generation,
-                ),
-            )
 
     def _erase_display(
         self,
@@ -2081,6 +2112,7 @@ class Terminal:
 
         # DECSCUSR: CSI Ps SP q
         if prefix == 0 and intermediates == b" " and final == ord("q"):
+            self._before_mutate()
             ps = params.raw_or_default(0, 0)
             shape = CursorShape.BLOCK
             blinking = True
@@ -2448,6 +2480,7 @@ class Terminal:
                 if len(self._title_stack) < 16:
                     self._title_stack.append(self._title)
             elif op == 23 and self._title_stack:  # pop title from stack
+                self._before_mutate()
                 self._title = self._title_stack.pop()
                 self._emit_event(TitleChanged(title=self._title))
         else:
@@ -2462,6 +2495,7 @@ class Terminal:
         self._emit_event(WindowRenamed(name=name))
 
     def _update_cwd(self, raw_uri: str, *, from_osc7: bool = True) -> None:
+        self._before_mutate()
         cleaned = raw_uri.strip()
         if not cleaned or "\x00" in cleaned:
             self._cwd = ""
@@ -2507,6 +2541,7 @@ class Terminal:
         out_term = b"\x07" if terminator == b"\x07" else b"\x1b\\"
 
         if code in (0, 2):
+            self._before_mutate()
             text = data.decode("utf-8", errors="replace")
             self._title = text
             self._emit_event(TitleChanged(title=text))
@@ -2535,6 +2570,7 @@ class Terminal:
             text = data.decode("utf-8", errors="replace")
             parts = text.split(";")
             if len(parts) >= 2 and parts[0] == "4" and parts[1].isdigit():
+                self._before_mutate()
                 sub = int(parts[1])
                 prog = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None
                 changed, status = self._status_store.apply_osc_9_4(sub, prog)
@@ -2587,6 +2623,7 @@ class Terminal:
             parts = text.split(";")
             raw_kind = parts[0][:1] if parts and parts[0] else ""
             if raw_kind in ("A", "B", "C", "D"):
+                self._before_mutate()
                 kind = PromptKind(raw_kind)
                 exit_code: int | None = None
                 is_continuation = any(p.strip() == "k=s" for p in parts[1:])
@@ -2621,6 +2658,7 @@ class Terminal:
                 if self._policy.allow_program_status_query and cap:
                     self._emit_reply(f"\x1b]7501;{cap}".encode("ascii") + out_term)
                 return
+            self._before_mutate()
             changed, rec = self._status_store.apply_osc_7501(data)
             if changed:
                 tid = rec.id if rec is not None else ""
