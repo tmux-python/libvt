@@ -111,6 +111,29 @@ async def _read_cloexec_pipe(loop: asyncio.AbstractEventLoop, fd: int) -> bytes:
             loop.remove_reader(fd)
 
 
+def _make_timeout_error(
+    terminal: Terminal,
+    snap: Snapshot,
+    header: str,
+    *,
+    eof: bool,
+) -> TerminalTimeoutError:
+    from libvt.testing import format_flight_recorder, format_screen_box
+
+    rec = terminal.recorder
+    recent = rec.tail(256) if rec is not None else b""
+    box = format_screen_box(snap, rows=min(snap.rows, 12), cols=min(snap.cols, 80))
+    diag = format_flight_recorder(terminal)
+    full_msg = f"{header}\n{box}\n{diag}"
+    return TerminalTimeoutError(
+        full_msg,
+        parser_state=terminal.parser_state,
+        screen_text=snap.text,
+        recent_bytes=recent,
+        eof=eof,
+    )
+
+
 class ReplyWriter(t.Protocol):
     """Structural writer protocol satisfied by :class:`asyncio.StreamWriter`."""
 
@@ -150,7 +173,9 @@ class AsyncTerminalStream:
         self.reader = reader
         self.writer = writer
         self.terminal = (
-            terminal if terminal is not None else Terminal(rows=rows, cols=cols)
+            terminal
+            if terminal is not None
+            else Terminal(rows=rows, cols=cols, recorder=FlightRecorder())
         )
         self.chunk_size = chunk_size
         self.sync_timeout = sync_timeout
@@ -199,8 +224,11 @@ class AsyncTerminalStream:
         return True
 
     async def _pump_loop(self) -> None:
-        while await self.pump_once():
-            pass
+        try:
+            while await self.pump_once():
+                pass
+        finally:
+            self._frame_event.set()
 
     def start(self) -> asyncio.Task[None]:
         """Start background stream pumping on the running event loop."""
@@ -248,6 +276,14 @@ class AsyncTerminalStream:
         )
         deadline = time.monotonic() + timeout
         while True:
+            if (
+                self._task is not None
+                and self._task.done()
+                and not self._task.cancelled()
+            ):
+                task_exc = self._task.exception()
+                if task_exc is not None:
+                    raise task_exc
             now = time.monotonic()
             if self.terminal.synchronized:
                 self._update_sync_timer(now)
@@ -255,21 +291,23 @@ class AsyncTerminalStream:
             if check(snap):
                 return snap
             if self._eof:
-                msg = (
-                    f"stream reached EOF before predicate matched; "
-                    f"screen text={snap.text!r}"
+                raise _make_timeout_error(
+                    self.terminal,
+                    snap,
+                    "stream reached EOF before predicate matched",
+                    eof=True,
                 )
-                raise TerminalTimeoutError(msg)
             remaining = deadline - now
             if remaining <= 0:
                 live = self.terminal.snapshot()
                 if check(live):
                     return live
-                msg = (
-                    f"timed out after {timeout:.2f}s waiting for terminal state; "
-                    f"screen text={live.text!r}"
+                raise _make_timeout_error(
+                    self.terminal,
+                    live,
+                    f"timed out after {timeout:.2f}s waiting for terminal state",
+                    eof=False,
                 )
-                raise TerminalTimeoutError(msg)
             self._frame_event.clear()
             wait_slice = (
                 min(remaining, self.sync_timeout)
@@ -277,14 +315,10 @@ class AsyncTerminalStream:
                 else remaining
             )
             if self._task is None:
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self.pump_once(), timeout=wait_slice)
-                except TimeoutError as exc:
-                    if self.terminal.synchronized:
-                        self._update_sync_timer(time.monotonic())
-                        continue
-                    msg = f"timed out after {timeout:.2f}s waiting for stream bytes"
-                    raise TerminalTimeoutError(msg) from exc
+                if self.terminal.synchronized:
+                    self._update_sync_timer(time.monotonic())
             else:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
@@ -436,21 +470,23 @@ class PtySession:
             if check(snap):
                 return snap
             if self._eof:
-                msg = (
-                    f"PTY reached EOF before predicate matched; "
-                    f"screen text={snap.text!r}"
+                raise _make_timeout_error(
+                    self.terminal,
+                    snap,
+                    "PTY reached EOF before predicate matched",
+                    eof=True,
                 )
-                raise TerminalTimeoutError(msg)
             remaining = deadline - now
             if remaining <= 0:
                 live = self.terminal.snapshot()
                 if check(live):
                     return live
-                msg = (
-                    f"timed out after {timeout:.2f}s waiting for PTY state; "
-                    f"screen text={live.text!r}"
+                raise _make_timeout_error(
+                    self.terminal,
+                    live,
+                    f"timed out after {timeout:.2f}s waiting for PTY state",
+                    eof=False,
                 )
-                raise TerminalTimeoutError(msg)
             self._frame_event.clear()
             wait_slice = (
                 min(remaining, self.sync_timeout)

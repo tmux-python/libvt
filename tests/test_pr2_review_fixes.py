@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import pickle
+
+import pytest
+
 import libvt
+from libvt.aio import AsyncTerminalStream
 from libvt.config import DEFAULT_PROFILE, TMUX_PROFILE, XTERM_PROFILE, Policy
 from libvt.events import ScreenErased
+from libvt.exc import TerminalTimeoutError
 from libvt.modes import Mode
+from libvt.parser import ParserState
+from libvt.style import AnsiColor
+from libvt.terminal import OutputFormat
 
 
 def test_resize_preserves_pending_wrap_and_wide_glyphs() -> None:
@@ -236,3 +246,57 @@ def test_decslrm_scroll_clear_range_rep_decaln_and_vs16_clamp() -> None:
     vs_t.feed("\x1b[?7lABC\u26a0\ufe0f".encode())
     assert libvt.display_width(vs_t[0].text) <= 4
     assert vs_t[0, 3].width == 1
+
+
+async def test_formatter_vt_bce_roundtrip_html_palette_and_timeout_diagnostics() -> (
+    None
+):
+    """``Formatter`` preserves BCE/HTML styles and timeout diagnostics."""
+    # VT formatter preserves both right-trimmed text AND trailing BCE background!
+    bce_t = libvt.Terminal(rows=2, cols=10)
+    bce_t.feed(b"\x1b[42mHI\x1b[K")
+    snap = bce_t.snapshot()
+    assert snap[0].text == "HI"
+    assert snap[0, 9].style.bg == AnsiColor.GREEN
+
+    vt_str = snap.format(OutputFormat.VT)
+    rt = libvt.Terminal(rows=2, cols=10)
+    rt.feed_str(vt_str)
+    assert rt[0].text == "HI"
+    assert rt[0, 9].style.bg == AnsiColor.GREEN
+
+    # HTML formatter renders ANSI/indexed colors, reverse video, and wavy lines.
+    html_t = libvt.Terminal(rows=2, cols=16)
+    html_t.feed(b"\x1b[31;48;5;208;4:3;9;53mWARN\x1b[0;7mREV\x1b[0m")
+    rendered_html = html_t.snapshot().format(OutputFormat.HTML)
+    assert "color:rgb(" in rendered_html
+    assert "background-color:rgb(255,135,0)" in rendered_html
+    assert "text-decoration-style:wavy" in rendered_html
+    assert "underline" in rendered_html and "overline" in rendered_html
+
+    # TerminalTimeoutError preserves single-arg OSError str/errno and pickles cleanly.
+    manual = TerminalTimeoutError(
+        "timed out",
+        parser_state=ParserState.OSC_STRING,
+        screen_text="hello",
+        recent_bytes=b"\x1b]0;stuck",
+        eof=False,
+    )
+    assert isinstance(manual, TimeoutError)
+    assert manual.errno is None
+    assert str(manual) == "timed out"
+    unpickled = pickle.loads(pickle.dumps(manual))
+    assert str(unpickled) == "timed out"
+    assert unpickled.parser_state == ParserState.OSC_STRING
+    assert unpickled.recent_bytes == b"\x1b]0;stuck"
+
+    # AsyncTerminalStream attaches FlightRecorder and populates timeout fields.
+    reader = asyncio.StreamReader()
+    stream = AsyncTerminalStream(reader, rows=2, cols=10)
+    reader.feed_data(b"hello\x1b]0;stuck")
+    with pytest.raises(TerminalTimeoutError) as exc_info:
+        await stream.wait_for("missing", timeout=0.05)
+    err = exc_info.value
+    assert err.parser_state == ParserState.OSC_STRING
+    assert b"\x1b]0;stuck" in err.recent_bytes
+    assert "Flight Recorder:" in str(err)

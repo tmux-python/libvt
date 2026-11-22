@@ -151,6 +151,50 @@ class Style:
 
 DEFAULT_STYLE = Style()
 
+_ANSI_16_RGB: tuple[tuple[int, int, int], ...] = (
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+)
+_CUBE_STEPS: tuple[int, ...] = (0, 95, 135, 175, 215, 255)
+
+
+def _resolve_color_rgb(
+    color: Color,
+    default_rgb: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    """Resolve *color* to an 8-bit ``(r, g, b)`` triple using standard xterm256."""
+    if color is None:
+        return default_rgb
+    if isinstance(color, RgbColor):
+        return (color.r, color.g, color.b)
+    idx = int(color) if isinstance(color, AnsiColor) else color.index
+    if idx < 16:
+        return _ANSI_16_RGB[idx]
+    if idx < 232:
+        n = idx - 16
+        return (
+            _CUBE_STEPS[n // 36],
+            _CUBE_STEPS[(n // 6) % 6],
+            _CUBE_STEPS[n % 6],
+        )
+    gray = 8 + (idx - 232) * 10
+    return (gray, gray, gray)
+
+
 __all__ = [
     "DEFAULT_STYLE",
     "AnsiColor",

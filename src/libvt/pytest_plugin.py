@@ -46,10 +46,15 @@ class PtyFactory(t.Protocol):
         *,
         rows: int = 24,
         cols: int = 80,
+        scrollback: int = 2_000,
         env: collections.abc.Mapping[str, str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
         tty_mode: TtyMode = "cooked",
         python_executable: str | os.PathLike[str] | None = None,
+        profile: Profile = ...,
+        policy: Policy = ...,
+        limits: Limits = ...,
+        sync_timeout: float = 1.0,
     ) -> contextlib.AbstractAsyncContextManager[PtySession]:
         """Open a POSIX PTY subprocess session."""
 
@@ -122,25 +127,36 @@ def vt_pty() -> PtyFactory:
         pytest.skip("vt_pty requires POSIX pty.openpty()")
 
     from libvt.aio import open_pty
+    from libvt.config import DEFAULT_LIMITS, DEFAULT_POLICY, DEFAULT_PROFILE
 
     def _spawn(
         argv: collections.abc.Sequence[str],
         *,
         rows: int = 24,
         cols: int = 80,
+        scrollback: int = 2_000,
         env: collections.abc.Mapping[str, str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
         tty_mode: TtyMode = "cooked",
         python_executable: str | os.PathLike[str] | None = None,
+        profile: Profile = DEFAULT_PROFILE,
+        policy: Policy = DEFAULT_POLICY,
+        limits: Limits = DEFAULT_LIMITS,
+        sync_timeout: float = 1.0,
     ) -> contextlib.AbstractAsyncContextManager[PtySession]:
         return open_pty(
             argv,
             rows=rows,
             cols=cols,
+            scrollback=scrollback,
             env=env,
             cwd=cwd,
             tty_mode=tty_mode,
             python_executable=python_executable,
+            profile=profile,
+            policy=policy,
+            limits=limits,
+            sync_timeout=sync_timeout,
         )
 
     return _spawn

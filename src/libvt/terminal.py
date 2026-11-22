@@ -94,9 +94,9 @@ from libvt.style import (
     Color,
     Hyperlink,
     IndexedColor,
-    RgbColor,
     Style,
     UnderlineStyle,
+    _resolve_color_rgb,
 )
 
 # DEC Special Graphics ('0') mapping for 0x5F..0x7E (VT100 / xterm / tmux tty-acs.c).
@@ -352,9 +352,14 @@ class Snapshot:
         output_format: OutputFormat = OutputFormat.PLAIN,
         *,
         policy: Policy = DEFAULT_POLICY,
+        profile: Profile = DEFAULT_PROFILE,
     ) -> str:
         """Render this snapshot using :class:`Formatter`."""
-        return Formatter(output_format, policy=policy).format_snapshot(self)
+        return Formatter(
+            output_format,
+            policy=policy,
+            profile=profile,
+        ).format_snapshot(self)
 
     def to_dict(self) -> dict[str, t.Any]:
         """Serialize snapshot state into a deterministic JSON-compatible dict."""
@@ -452,16 +457,18 @@ def _is_safe_uri(uri: str) -> bool:
 class Formatter:
     """Serialize a :class:`Snapshot` or :class:`Terminal` to text, VT, or HTML."""
 
-    __slots__ = ("output_format", "policy")
+    __slots__ = ("output_format", "policy", "profile")
 
     def __init__(
         self,
         output_format: OutputFormat = OutputFormat.PLAIN,
         *,
         policy: Policy = DEFAULT_POLICY,
+        profile: Profile = DEFAULT_PROFILE,
     ) -> None:
         self.output_format = output_format
         self.policy = policy
+        self.profile = profile
 
     def format_snapshot(self, snapshot: Snapshot) -> str:
         """Render *snapshot* in :attr:`output_format`."""
@@ -515,6 +522,44 @@ class Formatter:
                     out.append(_style_to_sgr(style))
                     cur_style = style
                 out.append(row.chars[c])
+            if not row.wrapped and row.used > limit:
+                cur_col_pos = limit
+                span_c = limit
+                row_used = min(snapshot.cols, row.used)
+                while span_c < row_used:
+                    word = row.attr_at(span_c)
+                    ext = row.ext_at(span_c)
+                    style = unpack_style(word, ext)
+                    link = ext.hyperlink if ext is not None else None
+                    end_c = span_c + 1
+                    while end_c < row_used:
+                        nw = row.attr_at(end_c)
+                        ne = row.ext_at(end_c)
+                        if (
+                            unpack_style(nw, ne) != style
+                            or (ne.hyperlink if ne is not None else None) != link
+                        ):
+                            break
+                        end_c += 1
+                    if style != DEFAULT_STYLE or link is not None:
+                        if cur_col_pos != span_c:
+                            out.append(f"\x1b[{r_idx + 1};{span_c + 1}H")
+                            cur_col_pos = span_c
+                        if link != cur_link:
+                            if link is None:
+                                out.append("\x1b]8;;\x1b\\")
+                            else:
+                                param = f"id={link.id}" if link.id else ""
+                                out.append(f"\x1b]8;{param};{link.uri}\x1b\\")
+                            cur_link = link
+                        if style != cur_style:
+                            out.append(_style_to_sgr(style))
+                            cur_style = style
+                        if end_c == snapshot.cols:
+                            out.append("\x1b[K")
+                        else:
+                            out.append(f"\x1b[{end_c - span_c}X")
+                    span_c = end_c
         if cur_link is not None:
             out.append("\x1b]8;;\x1b\\")
         if cur_style != DEFAULT_STYLE:
@@ -525,6 +570,14 @@ class Formatter:
     def _render_html(self, snapshot: Snapshot) -> str:
         lines: list[str] = ['<pre class="libvt-screen">']
         allow_unsafe = self.policy.allow_unsafe_uris
+        def_fg = self.profile.fg_rgb
+        def_bg = self.profile.bg_rgb
+        ul_styles = {
+            UnderlineStyle.DOUBLE: "double",
+            UnderlineStyle.CURLY: "wavy",
+            UnderlineStyle.DOTTED: "dotted",
+            UnderlineStyle.DASHED: "dashed",
+        }
         for row in snapshot._rows:
             view = RowView(row)
             chunks: list[str] = []
@@ -534,16 +587,39 @@ class Formatter:
                 css: list[str] = []
                 if style.bold:
                     css.append("font-weight:bold")
+                if style.dim:
+                    css.append("opacity:0.65")
                 if style.italic:
                     css.append("font-style:italic")
-                if isinstance(style.fg, RgbColor):
-                    css.append(
-                        f"color:rgb({style.fg.r},{style.fg.g},{style.fg.b})",
-                    )
-                if isinstance(style.bg, RgbColor):
-                    css.append(
-                        f"background-color:rgb({style.bg.r},{style.bg.g},{style.bg.b})",
-                    )
+                if style.hidden:
+                    css.append("visibility:hidden")
+                if style.reverse:
+                    fg_r, fg_g, fg_b = _resolve_color_rgb(style.bg, def_bg)
+                    bg_r, bg_g, bg_b = _resolve_color_rgb(style.fg, def_fg)
+                    css.append(f"color:rgb({fg_r},{fg_g},{fg_b})")
+                    css.append(f"background-color:rgb({bg_r},{bg_g},{bg_b})")
+                else:
+                    if style.fg is not None:
+                        fg_r, fg_g, fg_b = _resolve_color_rgb(style.fg, def_fg)
+                        css.append(f"color:rgb({fg_r},{fg_g},{fg_b})")
+                    if style.bg is not None:
+                        bg_r, bg_g, bg_b = _resolve_color_rgb(style.bg, def_bg)
+                        css.append(f"background-color:rgb({bg_r},{bg_g},{bg_b})")
+                dec_lines: list[str] = []
+                if style.underline != UnderlineStyle.NONE:
+                    dec_lines.append("underline")
+                if style.overline:
+                    dec_lines.append("overline")
+                if style.strikethrough:
+                    dec_lines.append("line-through")
+                if dec_lines:
+                    css.append(f"text-decoration-line:{' '.join(dec_lines)}")
+                ul_css = ul_styles.get(style.underline)
+                if ul_css is not None:
+                    css.append(f"text-decoration-style:{ul_css}")
+                if style.underline_color is not None:
+                    ur, ug, ub = _resolve_color_rgb(style.underline_color, def_fg)
+                    css.append(f"text-decoration-color:rgb({ur},{ug},{ub})")
                 span = (
                     f'<span style="{";".join(css)}">{escaped}</span>'
                     if css
