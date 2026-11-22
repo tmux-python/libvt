@@ -1080,11 +1080,33 @@ class Terminal:
                 ),
             )
 
-    def resize(self, *, rows: int, cols: int, reflow: bool = True) -> None:
+    def resize(
+        self,
+        *,
+        rows: int,
+        cols: int,
+        reflow: bool | None = None,
+    ) -> None:
         """Resize terminal screens to ``(rows, cols)``."""
+        eff_reflow = self._profile.reflow_on_resize if reflow is None else reflow
         self._before_mutate()
         self._clear_cluster_anchor()
-        self._screens.resize(rows=rows, cols=cols, reflow=reflow)
+        self._screens.resize(rows=rows, cols=cols, reflow=eff_reflow)
+        if not self._modes.is_set(Mode.DECAWM):
+            self._screens.primary._pending_wrap = False
+            self._screens.alternate._pending_wrap = False
+        if self._screens.active_is_alt:
+            prim = self._screens.primary
+            self._saved_primary = _SavedCursor(
+                row=prim._cur_row,
+                col=prim._cur_col,
+                pending_wrap=prim._pending_wrap,
+                style=self._saved_primary.style,
+                decom=self._saved_primary.decom,
+                g_sets=self._saved_primary.g_sets,
+                gl=self._saved_primary.gl,
+                protected=self._saved_primary.protected,
+            )
         self._generation += 1
         if self._modes.is_set(Mode.IN_BAND_RESIZE):
             self._emit_reply(f"\x1b[48;{rows};{cols};0;0t".encode("ascii"))
@@ -1337,7 +1359,7 @@ class Terminal:
                     can_advance = scr._cur_row < scr.rows - 1 or (
                         scr._cur_row == bottom and left <= c_col <= right
                     )
-                    if can_advance and min_col == 0 and max_col == scr.cols - 1:
+                    if can_advance and min_col == 0 and c_col == scr.cols - 1:
                         scr._rows[scr._cur_row].wrapped = True
                     self._linefeed(scr)
                     self._set_cursor(scr, scr._cur_row, min_col, pending_wrap=False)
@@ -1554,7 +1576,7 @@ class Terminal:
                 can_advance = c_row < scr.rows - 1 or (
                     c_row == bottom and left <= c_col <= right
                 )
-                if can_advance and min_col == 0 and max_col == scr.cols - 1:
+                if can_advance and min_col == 0 and c_col == scr.cols - 1:
                     scr._rows[c_row].wrapped = True
                 self._linefeed(scr)
                 self._set_cursor(scr, scr._cur_row, min_col, pending_wrap=False)

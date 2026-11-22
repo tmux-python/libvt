@@ -800,11 +800,12 @@ class Screen:
 
         combined = hist_thawed + self._rows[: last_active + 1]
         cur_abs_idx = hist_len + self._cur_row
-        cur_col = self._cur_col
+        eff_cur_col = self._cur_col + (1 if self._pending_wrap else 0)
 
         new_all: list[_Row] = []
         new_cur_abs = 0
         new_cur_col = 0
+        new_pending_wrap = False
         cursor_placed = False
 
         idx = 0
@@ -816,54 +817,65 @@ class Screen:
             group_end = idx
             idx += 1
 
-            # Extract logical cells across [group_start .. group_end].
-            cells: list[tuple[str, int, int, _CellExt | None, bool, bool]] = []
+            if group_start <= cur_abs_idx < group_end and eff_cur_col >= len(
+                combined[cur_abs_idx].chars
+            ):
+                cur_abs_idx += 1
+                eff_cur_col = 0
+
+            # Extract real logical cells across [group_start .. group_end].
+            cells: list[tuple[str, int, int, _CellExt | None, int]] = []
+            cur_after_extra: int | None = None
+            carry_cur = False
             for r_i in range(group_start, group_end + 1):
                 src = combined[r_i]
                 is_last = r_i == group_end
                 src_t_used = src.text_used if isinstance(src, _Row) else len(src.text)
                 row_limit = len(src.chars) if not is_last else src_t_used
-                limit = max(row_limit, cur_col + 1) if r_i == cur_abs_idx else row_limit
-                for c_i in range(limit):
+                if r_i == cur_abs_idx and eff_cur_col >= row_limit:
+                    cur_after_extra = eff_cur_col - row_limit
+                for c_i in range(row_limit):
                     word = src.attr_at(c_i)
                     rb = raw_width_bits(word)
-                    is_cur = r_i == cur_abs_idx and c_i == cur_col
-                    is_dummy = is_last and c_i >= row_limit
+                    is_cur = r_i == cur_abs_idx and c_i == eff_cur_col
                     if rb == int(WidthRole.SPACER_HEAD):
                         if is_cur:
-                            cells.append((" ", 0, 1, None, True, True))
+                            carry_cur = True
                         continue
                     if rb == int(WidthRole.SPACER_TAIL):
                         if is_cur and cells:
-                            p_ch, p_w, p_cw, p_ext, _, p_dum = cells[-1]
-                            cells[-1] = (p_ch, p_w, p_cw, p_ext, True, p_dum)
+                            p_ch, p_w, p_cw, p_ext, _ = cells[-1]
+                            cells[-1] = (p_ch, p_w, p_cw, p_ext, 1)
                         continue
                     cw = 2 if rb == int(WidthRole.WIDE) else 1
                     base_word = word & _WIDTH_CLEAR_MASK
+                    cur_off = 0 if (is_cur or carry_cur) else -1
+                    carry_cur = False
                     cells.append(
                         (
                             src.chars[c_i],
                             base_word,
                             cw,
                             src.ext_at(c_i),
-                            is_cur,
-                            is_dummy,
+                            cur_off,
                         )
                     )
 
             if not cells:
                 empty_row = _Row(cols)
-                if group_start <= cur_abs_idx <= group_end and not cursor_placed:
-                    new_cur_abs = len(new_all)
-                    new_cur_col = 0
-                    cursor_placed = True
                 new_all.append(empty_row)
+                if group_start <= cur_abs_idx <= group_end and not cursor_placed:
+                    extra = 0 if cur_after_extra is None else cur_after_extra
+                    new_cur_abs = len(new_all) - 1
+                    new_cur_col = min(cols - 1, extra)
+                    new_pending_wrap = False
+                    cursor_placed = True
                 continue
 
             cur_out = _Row(cols)
             new_all.append(cur_out)
             out_col = 0
-            for ch, base_w, cw, ce, is_cur, is_dummy in cells:
+            for ch, base_w, cw, ce, cur_off in cells:
                 eff_cw = cw
                 eff_ch = ch
                 if eff_cw == 2 and cols == 1:
@@ -871,27 +883,36 @@ class Screen:
                     eff_cw = 1
 
                 if out_col + eff_cw > cols:
-                    if not is_dummy and out_col < cols:
+                    if out_col < cols:
                         cur_out.write_spacer_head(out_col, 0, None)
-                    if not is_dummy:
-                        cur_out.wrapped = True
+                    cur_out.wrapped = True
                     cur_out = _Row(cols)
                     new_all.append(cur_out)
                     out_col = 0
 
-                if is_cur and not cursor_placed:
+                if cur_off >= 0 and not cursor_placed:
                     new_cur_abs = len(new_all) - 1
-                    new_cur_col = out_col
+                    new_cur_col = min(cols - 1, out_col + cur_off)
+                    new_pending_wrap = False
                     cursor_placed = True
 
-                if is_dummy:
-                    out_col += eff_cw
-                elif eff_cw == 2:
+                if eff_cw == 2:
                     cur_out.write_wide(out_col, eff_ch, base_w, ce)
                     out_col += 2
                 else:
                     cur_out.write_narrow(out_col, eff_ch, base_w, ce)
                     out_col += 1
+
+            if (cur_after_extra is not None or carry_cur) and not cursor_placed:
+                extra = 0 if cur_after_extra is None else cur_after_extra
+                new_cur_abs = len(new_all) - 1
+                if extra == 0 and out_col == cols:
+                    new_cur_col = cols - 1
+                    new_pending_wrap = True
+                else:
+                    new_cur_col = min(cols - 1, out_col + extra)
+                    new_pending_wrap = False
+                cursor_placed = True
 
         if not new_all:
             new_all.append(_Row(cols))
@@ -911,7 +932,7 @@ class Screen:
         self._cols = cols
         self._cur_row = max(0, min(rows - 1, new_cur_abs - hist_cut))
         self._cur_col = max(0, min(cols - 1, new_cur_col))
-        self._pending_wrap = False
+        self._pending_wrap = new_pending_wrap
 
     def resize(self, *, rows: int, cols: int, reflow: bool = True) -> None:
         """Resize screen to ``(rows, cols)``, optionally reflowing soft wraps."""
@@ -920,9 +941,13 @@ class Screen:
             raise ValueError(msg)
 
         old_cols = self._cols
+        if rows == len(self._rows) and cols == old_cols:
+            return
+
         if reflow and cols != old_cols:
             self._reflow_primary(rows=rows, cols=cols)
         else:
+            old_cur_col = self._cur_col
             if cols != old_cols:
                 for r in self._rows:
                     r.resize(cols)
@@ -948,7 +973,7 @@ class Screen:
 
             self._cur_row = min(self._cur_row, rows - 1)
             self._cur_col = min(self._cur_col, cols - 1)
-            self._pending_wrap = False
+            self._pending_wrap = self._pending_wrap and old_cur_col < cols
 
         self.scroll_region = ScrollRegion(
             top=0,

@@ -394,7 +394,13 @@ class PtySession:
         """Encode *text* as a :class:`PasteEvent` and write to the PTY."""
         self.send_event(PasteEvent(text=text, sanitize=sanitize))
 
-    def resize(self, *, rows: int, cols: int, reflow: bool = True) -> None:
+    def resize(
+        self,
+        *,
+        rows: int,
+        cols: int,
+        reflow: bool | None = None,
+    ) -> None:
         """Update kernel ``TIOCSWINSZ`` and resize :attr:`terminal`."""
         import fcntl
         import termios

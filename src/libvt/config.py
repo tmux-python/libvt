@@ -13,7 +13,7 @@ class ColorScheme(enum.IntEnum):
     LIGHT = 2
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Profile:
     r"""Terminal identity responses and compatibility switches.
 
@@ -52,6 +52,10 @@ class Profile:
     tmux_window_rename : bool
         When ``True`` (``TMUX_PROFILE``), ``ESC k <name> ESC \`` is consumed as
         a window-rename control string rather than printed onto the grid.
+    reflow_on_resize : bool
+        Default reflow behavior for :meth:`~libvt.terminal.Terminal.resize`
+        when ``reflow=None`` (``True`` on ``DEFAULT_PROFILE`` and
+        ``TMUX_PROFILE``, ``False`` on ``XTERM_PROFILE``).
     """
 
     name: str = "libvt"
@@ -68,12 +72,13 @@ class Profile:
     vs15_narrows_wide_emoji: bool = True
     vs16_always_wide: bool = False
     tmux_window_rename: bool = False
+    reflow_on_resize: bool = True
 
 
 DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Policy:
     r"""Default-deny host security and strictness policy.
 
@@ -131,7 +136,7 @@ class Policy:
     strict: bool = False
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Limits:
     """Resource ceilings protecting memory and CPU against hostile byte streams.
 
@@ -189,6 +194,7 @@ DEFAULT_PROFILE = Profile()
 XTERM_PROFILE = Profile(
     name="xterm",
     osc_7501_capabilities="",
+    reflow_on_resize=False,
 )
 TMUX_PROFILE = Profile(
     name="tmux",
