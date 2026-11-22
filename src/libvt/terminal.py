@@ -2257,6 +2257,12 @@ class Terminal:
                 if col_iter <= floor:
                     break
             self._set_cursor(scr, c_row, col_iter, pending_wrap=False)
+        elif ch_final == "a":  # HPR
+            if not self._profile.hpr_vpr_enabled:
+                return
+            n = params.get(0, 1)
+            ceil = right if self._modes.is_set(Mode.DECOM) else scr.cols - 1
+            self._set_cursor(scr, c_row, min(ceil, c_col + n), pending_wrap=False)
         elif ch_final == "d":  # VPA
             row_1 = params.get(0, 1)
             if self._modes.is_set(Mode.DECOM):
@@ -2264,6 +2270,12 @@ class Terminal:
             else:
                 target_r = min(scr.rows - 1, row_1 - 1)
             self._set_cursor(scr, max(0, target_r), c_col)
+        elif ch_final == "e":  # VPR
+            if not self._profile.hpr_vpr_enabled:
+                return
+            n = params.get(0, 1)
+            ceil = bottom if self._modes.is_set(Mode.DECOM) else scr.rows - 1
+            self._set_cursor(scr, min(ceil, c_row + n), c_col, pending_wrap=False)
         elif ch_final in ("H", "f"):  # CUP / HVP
             row_1 = params.get(0, 1)
             col_1 = params.get(1, 1)

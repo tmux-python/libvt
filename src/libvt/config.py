@@ -60,6 +60,10 @@ class Profile:
         When ``True`` (``XTERM_PROFILE`` and ``TMUX_PROFILE``), ``CSI 3 J``
         executed while the alternate screen is active still clears primary
         scrollback history.
+    hpr_vpr_enabled : bool
+        When ``True``, ``HPR`` (``CSI Ps a``) and ``VPR`` (``CSI Ps e``) move
+        the cursor relatively; when ``False`` (``TMUX_PROFILE``), both are
+        quietly ignored.
     """
 
     name: str = "libvt"
@@ -78,6 +82,7 @@ class Profile:
     tmux_window_rename: bool = False
     reflow_on_resize: bool = True
     ed3_clears_scrollback_on_alt: bool = False
+    hpr_vpr_enabled: bool = True
 
 
 DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
@@ -209,6 +214,7 @@ TMUX_PROFILE = Profile(
     vs15_narrows_wide_emoji=False,
     tmux_window_rename=True,
     ed3_clears_scrollback_on_alt=True,
+    hpr_vpr_enabled=False,
 )
 DEFAULT_POLICY = Policy()
 TMUX_CAPTURE_POLICY = Policy(allow_passthrough=True)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import libvt
-from libvt.config import DEFAULT_PROFILE, TMUX_PROFILE, XTERM_PROFILE
+from libvt.config import DEFAULT_PROFILE, TMUX_PROFILE, XTERM_PROFILE, Policy
 from libvt.events import ScreenErased
 from libvt.modes import Mode
 
@@ -155,3 +155,37 @@ def test_ed3_preserves_viewport_and_pending_wrap_and_profile_alt() -> None:
         p_term.feed(b"hist1\r\nhist2\r\nvis\x1b[?1049hALT\x1b[3J")
         assert p_term[0].text == "ALT"
         assert p_term.history == ()
+
+
+def test_hpr_vpr_margins_decom_and_tmux_ignore() -> None:
+    """``HPR`` and ``VPR`` honor ``DECOM`` margins and ``TMUX_PROFILE`` ignore."""
+    term = libvt.Terminal(rows=4, cols=8)
+    term.feed(b"A\x1b[2aB\x1b[1eC")
+    assert term[0].text == "A  B"
+    assert term[1].text == "    C"
+
+    # HPR clears pending_wrap.
+    wrap_t = libvt.Terminal(rows=2, cols=4)
+    wrap_t.feed(b"ABCD\x1b[1aE")
+    assert wrap_t.lines == ("ABCE", "")
+
+    # DECOM off (?6l): HPR/VPR cross DECLRMM and DECSTBM margins to screen edges.
+    margin_t = libvt.Terminal(rows=4, cols=8)
+    margin_t.feed(b"\x1b[?69h\x1b[2;3r\x1b[3;6s\x1b[2;3H\x1b[10a\x1b[10e")
+    assert (margin_t.cursor.row, margin_t.cursor.col) == (3, 7)
+
+    # DECOM on (?6h): HPR/VPR clamp to active margins without double-adding origin.
+    margin_t.feed(b"\x1b[?6h\x1b[1a\x1b[1e")
+    assert (margin_t.cursor.row, margin_t.cursor.col) == (2, 3)
+    margin_t.feed(b"\x1b[99a\x1b[99e")
+    assert (margin_t.cursor.row, margin_t.cursor.col) == (2, 5)
+
+    # TMUX_PROFILE ignores HPR/VPR quietly even under Policy(strict=True).
+    tm = libvt.Terminal(
+        rows=2, cols=8, profile=TMUX_PROFILE, policy=Policy(strict=True)
+    )
+    tm.feed(b"A\x1b[3aB\x1b[2eC")
+    assert tm[0].text == "ABC"
+
+    spans = libvt.explain(b"\x1b[3a\x1b[2e")
+    assert [s.mnemonic for s in spans] == ["HPR", "VPR"]
