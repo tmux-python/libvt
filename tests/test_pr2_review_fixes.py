@@ -189,3 +189,50 @@ def test_hpr_vpr_margins_decom_and_tmux_ignore() -> None:
 
     spans = libvt.explain(b"\x1b[3a\x1b[2e")
     assert [s.mnemonic for s in spans] == ["HPR", "VPR"]
+
+
+def test_decslrm_scroll_clear_range_rep_decaln_and_vs16_clamp() -> None:
+    """``DECSLRM`` scroll, ``ECH``, ``REP``, ``DECALN``, and ``?7l`` ``VS16`` hold."""
+    # DECSLRM scroll_up updates text_used bidirectionally.
+    scr_t = libvt.Terminal(rows=2, cols=6)
+    scr_t.feed(b"AB\x1b[?69h\x1b[1;2s\x1b[1;1H\x1b[S")
+    assert scr_t[0].text == ""
+
+    scr_t2 = libvt.Terminal(rows=2, cols=6)
+    scr_t2.feed(b"\r\nCD\x1b[?69h\x1b[1;2s\x1b[1;1H\x1b[S")
+    assert scr_t2[0].text == "CD"
+
+    scr_t3 = libvt.Terminal(rows=2, cols=6)
+    scr_t3.feed(b"AB\x1b[?69h\x1b[1;2s\x1b[1;1H\x1b[T")
+    assert scr_t3[1].text == "AB"
+
+    # Partial ECH trims text_used when erasing to the end of written text.
+    ech_t = libvt.Terminal(rows=2, cols=10)
+    ech_t.feed(b"ABCD\x1b[3G\x1b[2X")
+    assert ech_t[0].text == "AB"
+
+    # _Row.freeze() does not inflate FrozenRow.used to full screen width.
+    fr_t = libvt.Terminal(rows=2, cols=80, scrollback=5)
+    fr_t.feed(b"\x1b[31mA\x1b[0m\r\nB\r\nC")
+    assert fr_t._screens.primary._history[0].used == 1
+
+    # Non-print sequences clear REP _last_printed state.
+    rep_t = libvt.Terminal(rows=2, cols=10)
+    rep_t.feed(b"A\x1b[C\x1b[3b")
+    assert rep_t[0].text == "A"
+    rep_t.reset()
+    rep_t.feed(b"A\r\x1b[3b")
+    assert rep_t[0].text == "A"
+
+    # DECALN resets margins and wrapped flags before filling 'E'.
+    aln_t = libvt.Terminal(rows=2, cols=4)
+    aln_t.feed(b"ABCDEF\x1b[?69h\x1b[2;3s\x1b#8")
+    assert aln_t.lines == ("EEEE", "EEEE")
+    assert aln_t[0].wrapped is False
+    assert aln_t.screen.scroll_region == libvt.ScrollRegion(0, 1, 0, 3)
+
+    # ?7l right-margin VS16 keeps display_width <= cols without 2-col overflow.
+    vs_t = libvt.Terminal(rows=2, cols=4)
+    vs_t.feed("\x1b[?7lABC\u26a0\ufe0f".encode())
+    assert libvt.display_width(vs_t[0].text) <= 4
+    assert vs_t[0, 3].width == 1

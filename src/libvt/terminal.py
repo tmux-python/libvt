@@ -1522,6 +1522,15 @@ class Terminal:
                         if (
                             w_override == 2
                             and cur_role == int(WidthRole.NARROW)
+                            and pc >= eff_right
+                        ):
+                            # Cannot wrap (e.g. ?7l or bottom margin): keep cell narrow
+                            # without appending a selector that inflates display_width.
+                            continue
+
+                        if (
+                            w_override == 2
+                            and cur_role == int(WidthRole.NARROW)
                             and pc + 1 < scr.cols
                         ):
                             scr.heal_before_edit(pr, pc, pc + 2)
@@ -1732,6 +1741,7 @@ class Terminal:
         )
 
     def _handle_execute(self, byte: int) -> None:
+        self._last_printed = ""
         scr = self._screens.active
         _, _, left, right = self._effective_margins(scr)
         if byte == 0x07:  # BEL
@@ -1800,6 +1810,7 @@ class Terminal:
         )
 
     def _handle_esc(self, intermediates: bytes, final: int) -> None:
+        self._last_printed = ""
         scr = self._screens.active
         if not intermediates:
             if final == 0x37:  # ESC 7 DECSC
@@ -1856,8 +1867,16 @@ class Terminal:
                 self._g_sets[slot] = "B"
         elif intermediates == b"#" and final == 0x38:  # DECALN
             self._before_mutate()
+            fill = "E" * scr.cols
             for r in scr._rows:
-                r.write_ascii_slice(0, "E" * scr.cols, 0, None)
+                r.reset_blank(scr.cols)
+                r.write_ascii_slice(0, fill, 0, None)
+            scr.scroll_region = ScrollRegion(
+                top=0,
+                bottom=scr.rows - 1,
+                left=0,
+                right=scr.cols - 1,
+            )
             self._set_cursor(scr, 0, 0, pending_wrap=False)
         else:
             inter_s = intermediates.decode("ascii", errors="replace")
@@ -2068,6 +2087,8 @@ class Terminal:
         intermediates: bytes,
         final: int,
     ) -> None:
+        prev_printed = self._last_printed
+        self._last_printed = ""
         scr = self._screens.active
         top, bottom, left, right = self._effective_margins(scr)
 
@@ -2419,9 +2440,9 @@ class Terminal:
             )
             self._clear_cluster_anchor()
         elif ch_final == "b":  # REP
-            if self._last_printed:
+            if prev_printed:
                 count = min(self._limits.max_rep_count, params.get(0, 1))
-                self._handle_print(self._last_printed * count)
+                self._handle_print(prev_printed * count)
         elif ch_final == "r":  # DECSTBM
             t_arg = params.get(0, 1) - 1
             b_arg = params.get(1, scr.rows) - 1
@@ -2513,6 +2534,7 @@ class Terminal:
             self._unhandled("csi", f"CSI {ch_final}")
 
     def _handle_window_rename(self, raw: bytes) -> None:
+        self._last_printed = ""
         try:
             name = raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
@@ -2563,6 +2585,7 @@ class Terminal:
         )
 
     def _handle_osc(self, code: int, data: bytes, terminator: bytes) -> None:
+        self._last_printed = ""
         scr = self._screens.active
         out_term = b"\x07" if terminator == b"\x07" else b"\x1b\\"
 
@@ -2752,6 +2775,7 @@ class Terminal:
         final: int,
         data: bytes,
     ) -> None:
+        self._last_printed = ""
         # DECRQSS: DCS $ q <req> ST
         if prefix == 0 and intermediates == b"$" and final == ord("q"):
             self._handle_decrqss(data)
@@ -2817,6 +2841,7 @@ class Terminal:
         self._unhandled("dcs", f"DCS {inter_s}{chr(final)}")
 
     def _handle_apc(self, data: bytes) -> None:
+        self._last_printed = ""
         if data.startswith(b"G"):
             if self._record_events or self._on_event is not None:
                 body = data[1:]

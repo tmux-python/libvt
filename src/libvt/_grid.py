@@ -207,7 +207,8 @@ class FrozenRow:
         if self.cells is not None:
             return len(self.cells)
         run_end = self.runs[-1][0] if self.runs else 0
-        return max(len(self.text), run_end)
+        ext_end = (self.exts[-1][0] + 1) if self.exts else 0
+        return max(len(self.text), run_end, ext_end)
 
     def rstrip_text(self) -> str:
         """Return right-trimmed row text."""
@@ -558,7 +559,7 @@ class _Row:
                 self._set_raw(c, " ", bce_word, WidthRole.NARROW, bce_ext)
             if bce_word != 0 or bce_ext is not None:
                 self.used = max(self.used, hi)
-            elif hi >= cols:
+            elif hi >= self.used:
                 while (
                     self.used > lo
                     and self.chars[self.used - 1] == " "
@@ -566,7 +567,7 @@ class _Row:
                     and self.ext_at(self.used - 1) is None
                 ):
                     self.used -= 1
-            if hi >= cols:
+            if hi >= self.text_used:
                 while self.text_used > lo and not self.is_protected(self.text_used - 1):
                     self.text_used -= 1
             return
@@ -601,10 +602,10 @@ class _Row:
                     self.ext.pop(c, None)
             if bce_word != 0:
                 self.used = max(self.used, hi)
-            elif hi >= cols:
+            elif hi >= self.used:
                 # Clamp used to lo without erasing explicit spaces printed left of lo!
                 self.used = min(self.used, lo)
-        if hi >= cols:
+        if hi >= self.text_used:
             self.text_used = min(self.text_used, lo)
 
     def insert_blanks(
@@ -675,9 +676,11 @@ class _Row:
 
         for c in range(col, col + shift):
             self._set_raw(c, " ", bce_word, WidthRole.NARROW, bce_ext)
-        if bce_word != 0 or bce_ext is not None or self.used > col:
+        if self.used <= right + 1 and (
+            bce_word != 0 or bce_ext is not None or self.used > col
+        ):
             self.used = min(right + 1, max(self.used + shift, col + shift))
-        if self.text_used > col:
+        if self.text_used <= right + 1 and self.text_used > col:
             self.text_used = min(right + 1, self.text_used + shift)
 
     def delete_cells(
@@ -740,11 +743,12 @@ class _Row:
 
         for c in range(right - shift + 1, right + 1):
             self._set_raw(c, " ", bce_word, WidthRole.NARROW, bce_ext)
-        if bce_word != 0 or bce_ext is not None:
-            self.used = max(self.used, right + 1)
-        elif self.used > col:
-            self.used = max(col, self.used - shift)
-        if self.text_used > col:
+        if self.used <= right + 1:
+            if bce_word != 0 or bce_ext is not None:
+                self.used = max(self.used, right + 1)
+            elif self.used > col:
+                self.used = max(col, self.used - shift)
+        if self.text_used <= right + 1 and self.text_used > col:
             self.text_used = max(col, self.text_used - shift)
 
     def resize(self, cols: int) -> None:
@@ -801,19 +805,22 @@ class _Row:
         if len(text) != t_used:
             cells = tuple(self.chars[:t_used])
 
+        u = min(cols, self.used)
         runs: tuple[tuple[int, int], ...]
-        if self.attrs is None:
-            runs = () if self.uniform_attr == 0 else ((cols, self.uniform_attr),)
+        if u == 0:
+            runs = ()
+        elif self.attrs is None:
+            runs = () if self.uniform_attr == 0 else ((u, self.uniform_attr),)
         else:
             run_list: list[tuple[int, int]] = []
-            cur_word = self.attrs[0] if cols > 0 else 0
-            for c in range(1, cols):
+            cur_word = self.attrs[0]
+            for c in range(1, u):
                 w = self.attrs[c]
                 if w != cur_word:
                     run_list.append((c, cur_word))
                     cur_word = w
-            if cols > 0 and (cur_word != 0 or run_list):
-                run_list.append((cols, cur_word))
+            if cur_word != 0:
+                run_list.append((u, cur_word))
             runs = tuple(run_list)
 
         exts = tuple(sorted(self.ext.items())) if self.ext else ()

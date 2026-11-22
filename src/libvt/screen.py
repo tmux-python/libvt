@@ -697,7 +697,7 @@ class Screen:
                 role = unpack_width_role(word)
                 base = word & _WIDTH_CLEAR_MASK
                 dst_row._set_raw(c, src_row.chars[c], base, role, src_row.ext_at(c))
-            dst_row.used = max(dst_row.used, min(src_row.used, r_col + 1))
+            _sync_partial_scroll_bounds(dst_row, src_row, left, r_col)
 
         for clr_r in range(b_row - shift + 1, b_row + 1):
             self._rows[clr_r].wrapped = False
@@ -756,7 +756,7 @@ class Screen:
                 role = unpack_width_role(word)
                 base = word & _WIDTH_CLEAR_MASK
                 dst_row._set_raw(c, src_row.chars[c], base, role, src_row.ext_at(c))
-            dst_row.used = max(dst_row.used, min(src_row.used, r_col + 1))
+            _sync_partial_scroll_bounds(dst_row, src_row, left, r_col)
 
         for clr_r in range(t_row, t_row + shift):
             self._rows[clr_r].wrapped = False
@@ -1008,6 +1008,39 @@ class Screen:
         self._tabstops = set(range(8, self._cols, 8))
         self._tabstops_sorted = sorted(self._tabstops)
         self.keyboard_stack.reset()
+
+
+def _sync_partial_scroll_bounds(
+    dst_row: _Row,
+    src_row: _Row,
+    left: int,
+    r_col: int,
+) -> None:
+    limit = r_col + 1
+    if dst_row.used <= limit:
+        cand_u = (
+            min(src_row.used, limit) if src_row.used > left else min(dst_row.used, left)
+        )
+        floor_u = min(dst_row.used, left)
+        while (
+            cand_u > floor_u
+            and dst_row.chars[cand_u - 1] == " "
+            and dst_row.attr_at(cand_u - 1) == 0
+            and dst_row.ext_at(cand_u - 1) is None
+        ):
+            cand_u -= 1
+        dst_row.used = cand_u
+    if dst_row.text_used <= limit:
+        cand_t = (
+            min(src_row.text_used, limit)
+            if src_row.text_used > left
+            else min(dst_row.text_used, left)
+        )
+        if src_row.text_used > limit:
+            floor_t = min(dst_row.text_used, left)
+            while cand_t > floor_t and dst_row.chars[cand_t - 1] == " ":
+                cand_t -= 1
+        dst_row.text_used = cand_t
 
 
 class ScreenSet:
