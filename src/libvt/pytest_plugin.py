@@ -49,6 +49,7 @@ class PtyFactory(t.Protocol):
         env: collections.abc.Mapping[str, str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
         tty_mode: TtyMode = "cooked",
+        python_executable: str | os.PathLike[str] | None = None,
     ) -> contextlib.AbstractAsyncContextManager[PtySession]:
         """Open a POSIX PTY subprocess session."""
 
@@ -130,6 +131,7 @@ def vt_pty() -> PtyFactory:
         env: collections.abc.Mapping[str, str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
         tty_mode: TtyMode = "cooked",
+        python_executable: str | os.PathLike[str] | None = None,
     ) -> contextlib.AbstractAsyncContextManager[PtySession]:
         return open_pty(
             argv,
@@ -138,6 +140,7 @@ def vt_pty() -> PtyFactory:
             env=env,
             cwd=cwd,
             tty_mode=tty_mode,
+            python_executable=python_executable,
         )
 
     return _spawn

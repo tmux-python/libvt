@@ -559,6 +559,7 @@ class Parser:
     """Streaming VT500 / ANSI escape-sequence byte parser."""
 
     __slots__ = (
+        "_abort_dispatch_osc",
         "_csi_colon_mask",
         "_csi_cur",
         "_csi_has_digit",
@@ -580,6 +581,7 @@ class Parser:
         "_str_overflow",
         "_tmux_dcs_state",
         "_tmux_passthrough",
+        "_tmux_window_rename",
         "_utf8",
         "_utf8_pending",
     )
@@ -589,6 +591,8 @@ class Parser:
         *,
         encoding: ParserEncoding = "utf-8",
         tmux_passthrough: bool = True,
+        tmux_window_rename: bool = False,
+        abort_dispatch_osc: bool = False,
         limits: Limits = DEFAULT_LIMITS,
     ) -> None:
         if encoding not in ("utf-8", "latin-1"):
@@ -597,6 +601,8 @@ class Parser:
         self._encoding: ParserEncoding = encoding
         self._latin1: bool = encoding == "latin-1"
         self._tmux_passthrough: bool = tmux_passthrough
+        self._tmux_window_rename: bool = tmux_window_rename
+        self._abort_dispatch_osc: bool = abort_dispatch_osc
         self._limits = limits
         self._state: ParserState = ParserState.GROUND
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
@@ -699,6 +705,11 @@ class Parser:
             if cleaned:
                 sink.on_print(cleaned)
 
+    def _notify_overflow(self, sink: ActionSink, kind: str, limit: int) -> None:
+        cb = getattr(sink, "on_overflow", None)
+        if cb is not None:
+            cb(kind, limit)
+
     def _dispatch_osc(self, sink: ActionSink, terminator: bytes) -> None:
         if self._str_overflow:
             self._abort_string()
@@ -726,8 +737,13 @@ class Parser:
         self._abort_string()
 
     def _dispatch_apc(self, sink: ActionSink) -> None:
-        if self._str_kind == 0x5F and not self._str_overflow:
-            sink.on_apc(bytes(self._str_buf))
+        if not self._str_overflow:
+            if self._str_kind == 0x5F:
+                sink.on_apc(bytes(self._str_buf))
+            elif self._str_kind == 0x6B:
+                cb = getattr(sink, "on_window_rename", None)
+                if cb is not None:
+                    cb(bytes(self._str_buf))
         self._abort_string()
 
     def _enter_dcs_passthrough(self, final_byte: int) -> None:
@@ -875,6 +891,7 @@ class Parser:
                     else:
                         self._str_buf.clear()
                         self._str_overflow = True
+                        self._notify_overflow(sink, "osc", max_osc)
                 if pos >= n:
                     break
                 b = mv[pos]
@@ -915,6 +932,7 @@ class Parser:
                     else:
                         self._str_buf.clear()
                         self._str_overflow = True
+                        self._notify_overflow(sink, "dcs", max_dcs)
                 if pos >= n:
                     break
                 b = mv[pos]
@@ -943,13 +961,20 @@ class Parser:
                     ):
                         break
                     pos += 1
-                if pos > start and self._str_kind == 0x5F and not self._str_overflow:
+                if (
+                    pos > start
+                    and self._str_kind in (0x5F, 0x6B)
+                    and not self._str_overflow
+                ):
                     chunk_len = pos - start
-                    if len(self._str_buf) + chunk_len <= max_apc:
+                    cap = max_apc if self._str_kind == 0x5F else max_osc
+                    if len(self._str_buf) + chunk_len <= cap:
                         self._str_buf.extend(mv[start:pos])
                     else:
                         self._str_buf.clear()
                         self._str_overflow = True
+                        kind_name = "apc" if self._str_kind == 0x5F else "esc"
+                        self._notify_overflow(sink, kind_name, cap)
                 if pos >= n:
                     break
                 b = mv[pos]
@@ -993,12 +1018,21 @@ class Parser:
                         else:
                             self._str_buf.clear()
                             self._str_overflow = True
+                            self._notify_overflow(sink, "dcs", max_dcs)
                     self._str_esc_origin = None
                     self._state = ParserState.DCS_PASSTHROUGH
                     continue
-                # Any other byte aborts the unclosed string per DEC STD 070 §5.1.2.3
-                # and re-evaluates b starting from ESCAPE.
-                self._abort_string()
+                # Non-'\' byte exits string state; opt-in abort_dispatch_osc commits OSC
+                # except on CAN/SUB (0x18/0x1A), else abort-and-drop per DEC STD 070.
+                if (
+                    origin == ParserState.OSC_STRING
+                    and self._abort_dispatch_osc
+                    and b not in (0x18, 0x1A)
+                ):
+                    self._dispatch_osc(sink, b"\x1b\\")
+                else:
+                    self._abort_string()
+                self._intermediates.clear()
                 self._state = ParserState.ESCAPE
                 pos -= 1
                 continue
@@ -1045,7 +1079,9 @@ class Parser:
                     self._str_buf.clear()
                     self._str_overflow = False
                     self._state = ParserState.DCS_ENTRY
-                elif b in (0x58, 0x5E, 0x5F):  # SOS, PM, APC
+                elif b in (0x58, 0x5E, 0x5F) or (
+                    b == 0x6B and self._tmux_window_rename
+                ):  # SOS, PM, APC, or tmux ESC k rename
                     self._str_buf.clear()
                     self._str_overflow = False
                     self._str_kind = b

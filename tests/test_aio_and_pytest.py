@@ -93,8 +93,8 @@ async def test_open_pty_controlling_tty_signals_tty_mode_and_errors(
         "print('DSR=' + repr(reply.decode('ascii', 'replace')), flush=True)\n"
         "while not winch:\n"
         "    signal.pause()\n"
-        "print('WINCH=1', flush=True)\n"
         "try:\n"
+        "    print('WINCH=1', flush=True)\n"
         "    while True:\n"
         "        signal.pause()\n"
         "except KeyboardInterrupt:\n"
@@ -131,6 +131,24 @@ async def test_open_pty_controlling_tty_signals_tty_mode_and_errors(
     with pytest.raises(FileNotFoundError):
         async with open_pty(("definitely-missing-libvt-command-xyz",)):
             pass
+
+    # Interactive bash + background sleep pipeline reaps cleanly via killpg(SIGHUP),
+    # and custom Policy still receives local hostname in osc7_hosts!
+    bash_bin = shutil.which("bash")
+    if bash_bin is not None:
+        async with open_pty(
+            (bash_bin, "--norc", "--noprofile", "-i"),
+            rows=6,
+            cols=60,
+            policy=libvt.Policy(allow_passthrough=True),
+        ) as bash_sess:
+            bash_sess.send(
+                f"printf '\\033]7;file://{host}/tmp\\007'\n"
+                "sleep 30 &\n"
+                "printf 'BG_%s\\n' OK\n"
+            )
+            await bash_sess.wait_for("BG_OK", timeout=3.0)
+            assert bash_sess.terminal.cwd == "/tmp"
 
 
 def test_assert_screen_literal_borders_and_assert_screen_box(
@@ -190,8 +208,7 @@ def test_assert_screen_literal_borders_and_assert_screen_box(
 
     spoof_term = vt_factory(rows=1, cols=10, recorder=vt_recorder)
     spoof_term.feed(b"\x1b[31mhi")
-    spoof_term.screen._rows[0].chars[2] = "\u202e"
-    spoof_term.screen._rows[0].used = 3
+    spoof_term.screen._rows[0].write_narrow(2, "\u202e", 0, None)
     with pytest.raises(AssertionError) as exc_info:
         assert_screen_box(spoof_term, "┌──────────┐\n│mismatch  │\n└──────────┘")
     msg = str(exc_info.value)

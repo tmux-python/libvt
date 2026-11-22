@@ -6,7 +6,9 @@ import asyncio
 import collections.abc
 import contextlib
 import dataclasses
+import errno
 import os
+import signal
 import socket
 import struct
 import sys
@@ -15,6 +17,7 @@ import typing as t
 
 from libvt.config import (
     DEFAULT_LIMITS,
+    DEFAULT_OSC7_HOSTS,
     DEFAULT_POLICY,
     DEFAULT_PROFILE,
     Limits,
@@ -28,32 +31,53 @@ from libvt.terminal import FlightRecorder, Snapshot, Terminal
 type TtyMode = t.Literal["cooked", "cbreak", "raw"]
 
 _PTY_TRAMPOLINE = (
-    "import errno, fcntl, os, signal, sys, termios\n"
-    "err_fd = int(sys.argv[1])\n"
+    "stage = 'bootstrap'\n"
+    "err_fd = -1\n"
     "try:\n"
+    "    import errno, fcntl, os, signal, sys, termios\n"
+    "    err_fd = int(sys.argv[1])\n"
     "    os.set_inheritable(err_fd, False)\n"
+    "    stage = 'ctty'\n"
     "    if hasattr(termios, 'TIOCSCTTY'):\n"
-    "        try:\n"
-    "            fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
-    "        except OSError as exc:\n"
-    "            if exc.errno not in (errno.EPERM, errno.EINVAL):\n"
-    "                raise\n"
+    "        fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+    "    stage = 'signal'\n"
     "    signal.signal(signal.SIGPIPE, signal.SIG_DFL)\n"
+    "    if hasattr(signal, 'SIGXFSZ'):\n"
+    "        signal.signal(signal.SIGXFSZ, signal.SIG_DFL)\n"
+    "    stage = 'exec'\n"
+    "    os.write(err_fd, b'\\x00')\n"
     "    os.execvp(sys.argv[2], sys.argv[2:])\n"
     "except BaseException as exc:\n"
-    "    code = getattr(exc, 'errno', None)\n"
-    "    if not isinstance(code, int):\n"
-    "        code = errno.ENOEXEC\n"
-    "    msg = getattr(exc, 'strerror', None) or str(exc)\n"
-    "    os.write(err_fd, f'{code}:{msg}'.encode('utf-8', 'replace'))\n"
-    "    os._exit(127)\n"
+    "    try:\n"
+    "        import errno as _e, os as _os\n"
+    "        if err_fd >= 0:\n"
+    "            code = getattr(exc, 'errno', None)\n"
+    "            if not isinstance(code, int):\n"
+    "                code = _e.ENOEXEC\n"
+    "            msg = (getattr(exc, 'strerror', None) or str(exc))[:360]\n"
+    "            pkt = b'\\x01' + f'{stage}:{code}:{msg}'.encode('utf-8', 'replace')\n"
+    "            _os.write(err_fd, pkt[:500])\n"
+    "    except BaseException:\n"
+    "        pass\n"
+    "    import os as _os2\n"
+    "    _os2._exit(127)\n"
 )
 
 
 def _raise_exec_error(err_payload: bytes, cmd: str, default_errno: int) -> t.NoReturn:
-    code_s, _, err_msg = err_payload.decode("utf-8", "replace").partition(":")
+    if not err_payload:
+        msg = f"PTY launcher exited before pre-exec handoff while starting {cmd!r}"
+        raise RuntimeError(msg)
+    idx = err_payload.find(b"\x01")
+    body = err_payload[idx + 1 :] if idx != -1 else err_payload
+    parts = body.decode("utf-8", "replace").split(":", 2)
+    if len(parts) == 3:
+        stage, code_s, err_msg = parts
+    else:
+        stage, code_s, err_msg = "exec", "", body.decode("utf-8", "replace")
     err_no = int(code_s) if code_s.isdigit() else default_errno
-    raise OSError(err_no, err_msg or os.strerror(err_no), cmd)
+    target = cmd if stage == "exec" else f"open_pty({stage})"
+    raise OSError(err_no, err_msg or os.strerror(err_no), target)
 
 
 async def _read_cloexec_pipe(loop: asyncio.AbstractEventLoop, fd: int) -> bytes:
@@ -65,7 +89,7 @@ async def _read_cloexec_pipe(loop: asyncio.AbstractEventLoop, fd: int) -> bytes:
         while True:
             try:
                 data = os.read(fd, 4_096)
-            except BlockingIOError:
+            except (BlockingIOError, InterruptedError):
                 return
             except OSError as exc:
                 loop.remove_reader(fd)
@@ -298,13 +322,37 @@ class PtySession:
         """Return ``True`` once the PTY master reaches EOF."""
         return self._eof
 
+    def _drain_nonblocking_master(self) -> None:
+        """Consume any buffered non-blocking bytes from ``master_fd``."""
+        if self._closed or self._eof:
+            return
+        while True:
+            try:
+                chunk = os.read(self._master_fd, 16_384)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    chunk = b""
+                else:
+                    return
+            if not chunk:
+                self._eof = True
+                return
+            self.terminal.feed(chunk)
+
     def _on_readable(self) -> None:
         if self._closed:
             return
         try:
             chunk = os.read(self._master_fd, 16_384)
-        except OSError:
-            chunk = b""
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                chunk = b""
+            else:
+                raise
         if not chunk:
             self._eof = True
             if self._loop is not None:
@@ -407,21 +455,35 @@ class PtySession:
                 await asyncio.wait_for(self._frame_event.wait(), timeout=wait_slice)
 
     async def aclose(self) -> int:
-        """Stop reading, close PTY master fd, and terminate/reap child process."""
+        """Signal the owned process group, drain PTY output, and close master fd."""
+        if self.process.returncode is None:
+            pid = self.process.pid
+            for sig, wait_s in (
+                (signal.SIGHUP, 0.4),
+                (signal.SIGTERM, 0.4),
+            ):
+                if self.process.returncode is not None:
+                    break
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, sig)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self.process.wait(), timeout=wait_s)
+            if self.process.returncode is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    self.process.kill()
+                await self.process.wait()
+
         if not self._closed:
+            self._drain_nonblocking_master()
             self._closed = True
             if self._loop is not None:
                 with contextlib.suppress(Exception):
                     self._loop.remove_reader(self._master_fd)
             with contextlib.suppress(OSError):
                 os.close(self._master_fd)
-        if self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=1.0)
-            except TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+
         self.terminal.notify_process_exit()
         return self.process.returncode or 0
 
@@ -436,6 +498,7 @@ async def open_pty(
     env: collections.abc.Mapping[str, str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
     tty_mode: TtyMode = "cooked",
+    python_executable: str | os.PathLike[str] | None = None,
     profile: Profile = DEFAULT_PROFILE,
     policy: Policy = DEFAULT_POLICY,
     limits: Limits = DEFAULT_LIMITS,
@@ -452,7 +515,17 @@ async def open_pty(
         msg = f"unsupported tty_mode: {tty_mode!r}"
         raise ValueError(msg)
 
-    import errno
+    if python_executable is None:
+        if getattr(sys, "frozen", False) or not sys.executable:
+            msg = (
+                "open_pty requires python_executable in frozen or embedded "
+                "Python runtimes"
+            )
+            raise RuntimeError(msg)
+        py_bin = sys.executable
+    else:
+        py_bin = os.fspath(python_executable)
+
     import fcntl
     import pty
     import termios
@@ -479,7 +552,7 @@ async def open_pty(
         child_env = dict(os.environ if env is None else env)
         child_env.setdefault("TERM", "xterm-256color")
         proc = await asyncio.create_subprocess_exec(
-            sys.executable,
+            py_bin,
             "-I",
             "-S",
             "-c",
@@ -501,11 +574,13 @@ async def open_pty(
         err_w_closed = True
 
         err_payload = await _read_cloexec_pipe(loop, err_r)
-        if err_payload:
+        if err_payload != b"\x00":
             await proc.wait()
             _raise_exec_error(err_payload, argv[0], errno.ENOEXEC)
     except BaseException:
         if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             await proc.wait()
@@ -523,12 +598,12 @@ async def open_pty(
             os.close(err_r)
 
     eff_policy = policy
-    if policy == DEFAULT_POLICY:
+    if policy.osc7_hosts is None:
         fqdn = socket.gethostname().lower()
         short = fqdn.partition(".")[0]
         eff_policy = dataclasses.replace(
             policy,
-            osc7_hosts=policy.osc7_hosts | frozenset({fqdn, short}),
+            osc7_hosts=DEFAULT_OSC7_HOSTS | frozenset({fqdn, short}),
         )
 
     recorder = FlightRecorder(max_bytes=limits.max_recorder_bytes)

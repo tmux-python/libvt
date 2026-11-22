@@ -15,7 +15,7 @@ class ColorScheme(enum.IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class Profile:
-    """Terminal identity responses and compatibility switches.
+    r"""Terminal identity responses and compatibility switches.
 
     Attributes
     ----------
@@ -29,9 +29,8 @@ class Profile:
         Version banner emitted in ``DCS > | <xtversion> ST`` (``CSI > q``).
     osc_7501_capabilities : str
         Payload body returned for ``OSC 7501 ; ?`` queries when enabled
-        (for example
-        ``"?:states=idle,working,done,blocked,error:kinds=permission,question,auth"``
-        or ``"?"`` for bare ``tmux`` compatibility).
+        (``""`` when unsupported, ``"?"`` for ``tmux``, or full capability
+        list on ``DEFAULT_PROFILE``).
     color_scheme : ColorScheme
         Default scheme reported for ``CSI ? 996 n`` color-scheme queries.
     fg_rgb : tuple[int, int, int]
@@ -42,11 +41,20 @@ class Profile:
         When ``True`` (``TMUX_PROFILE``), ``pending_wrap`` treats the cursor as
         occupying phantom column ``cols`` on ``CUB`` / ``BS`` and allows ``BS``
         at column ``0`` to step onto the end of a soft-wrapped predecessor row,
-        matching ``tmux``'s ``screen-write.c``. When ``False`` (default),
-        ``CUB`` / ``BS`` follow ``xterm`` / ``Ghostty`` rules.
+        matching ``tmux``'s ``screen-write.c``.
+    vs15_narrows_wide_emoji : bool
+        When ``True`` (default), ``U+FE0E`` narrows standalone wide emoji
+        listed in ``emoji-variation-sequences.txt`` from ``2`` columns to ``1``.
+        ``False`` on ``TMUX_PROFILE`` to match ``tmux 3.8a``.
+    vs16_always_wide : bool
+        When ``True``, ``U+FE0F`` widens any narrow spacing base rather than
+        only ``emoji-variation-sequences.txt`` bases.
+    tmux_window_rename : bool
+        When ``True`` (``TMUX_PROFILE``), ``ESC k <name> ESC \`` is consumed as
+        a window-rename control string rather than printed onto the grid.
     """
 
-    name: str = "xterm"
+    name: str = "libvt"
     da1: bytes = b"\x1b[?62;22c"
     da2: bytes = b"\x1b[>1;10;0c"
     xtversion: str = "libvt 0.1"
@@ -57,14 +65,17 @@ class Profile:
     fg_rgb: tuple[int, int, int] = (0xE5, 0xE5, 0xE5)
     bg_rgb: tuple[int, int, int] = (0x1E, 0x1E, 0x1E)
     pending_wrap_phantom_col: bool = False
+    vs15_narrows_wide_emoji: bool = True
+    vs16_always_wide: bool = False
+    tmux_window_rename: bool = False
 
 
-_DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
+DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
 
 
 @dataclass(frozen=True, slots=True)
 class Policy:
-    """Default-deny host security and strictness policy.
+    r"""Default-deny host security and strictness policy.
 
     Attributes
     ----------
@@ -81,26 +92,30 @@ class Policy:
         Permit ``OSC 10 ; ?``, ``OSC 11 ; ?``, and ``CSI ? 996 n`` palette and
         color-scheme replies (default ``True``).
     allow_program_status_query : bool
-        Force ``OSC 7501 ; ?`` capability replies even when neither ``on_event``
-        nor ``record_events`` is enabled (default ``False``, matching
-        ``libghostty-vt``).
+        Permit ``OSC 7501 ; ?`` capability replies whenever
+        ``profile.osc_7501_capabilities`` is non-empty (default ``True``).
     allow_unsafe_uris : bool
         Allow schemes outside ``http://``, ``https://``, and ``mailto:`` in
         HTML ``<a href>`` output (default ``False``).
     allow_passthrough : bool
-        Re-feed unwrapped ``DCS tmux; ESC ESC ... ST`` inner byte streams into
-        :class:`~libvt.terminal.Terminal` in addition to emitting
+        Replay unwrapped ``DCS tmux; ESC ESC ... ST`` inner byte streams
+        through a persistent passthrough parser in addition to emitting
         :class:`~libvt.events.Passthrough` (default ``False``, matching
         ``tmux``'s ``allow-passthrough off``).
-    osc7_hosts : frozenset[str]
+    abort_dispatch_osc : bool
+        When ``True``, dispatch an accumulated ``OSC`` string if interrupted by
+        a non-``\`` ``ESC`` byte (matching ``tmux`` / ``Ghostty`` state-exit
+        behavior). Defaults to ``False`` (DEC STD 070 abort-and-drop).
+    osc7_hosts : frozenset[str] | None
         Lowercase hostnames in ``OSC 7`` ``file://<host>/...`` URIs permitted
-        to update :attr:`~libvt.terminal.Terminal.cwd` (default
-        ``frozenset({"", "localhost"})``; :func:`~libvt.aio.open_pty` adds the
-        local machine hostname automatically).
+        to update :attr:`~libvt.terminal.Terminal.cwd`. ``None`` (default)
+        uses ``{"", "localhost"}`` in sans-I/O :class:`~libvt.terminal.Terminal`
+        and automatically adds the local hostname in
+        :func:`~libvt.aio.open_pty`.
     strict : bool
-        Raise :exc:`~libvt.exc.ProtocolError` on unrecognized escape sequences
-        instead of ignoring or recording :class:`~libvt.events.UnhandledSequence`
-        (default ``False``).
+        Raise :exc:`~libvt.exc.ProtocolError` on unrecognized or overflowing
+        escape sequences instead of ignoring or recording
+        :class:`~libvt.events.UnhandledSequence` (default ``False``).
     """
 
     allow_title_report: bool = False
@@ -108,10 +123,11 @@ class Policy:
     allow_clipboard_read: bool = False
     allow_clipboard_write: bool = True
     allow_color_queries: bool = True
-    allow_program_status_query: bool = False
+    allow_program_status_query: bool = True
     allow_unsafe_uris: bool = False
     allow_passthrough: bool = False
-    osc7_hosts: frozenset[str] = _DEFAULT_OSC7_HOSTS
+    abort_dispatch_osc: bool = False
+    osc7_hosts: frozenset[str] | None = None
     strict: bool = False
 
 
@@ -128,7 +144,9 @@ class Limits:
     max_osc_bytes : int
         Maximum payload bytes buffered for an ``OSC`` sequence.
     max_dcs_bytes : int
-        Maximum payload bytes buffered for a ``DCS`` sequence.
+        Maximum payload bytes buffered for a ``DCS`` sequence (default
+        ``8_388_608``, sized above ``max_apc_bytes`` so 4 MiB graphics wrapped
+        in ``DCS tmux;`` fit without truncation).
     max_apc_bytes : int
         Maximum payload bytes buffered for an ``APC`` sequence.
     max_reply_bytes : int
@@ -138,10 +156,14 @@ class Limits:
     max_prompt_zones : int
         Maximum ``OSC 133`` prompt zones retained on a terminal.
     max_status_records : int
-        Maximum concurrent ``OSC 7501`` task records retained in the store.
+        Maximum concurrent ``OSC 7501`` task records retained in the store
+        (default ``256``).
     max_events : int
         Maximum unread :data:`~libvt.events.Event` items retained when
         ``record_events=True``.
+    max_event_bytes : int
+        Maximum cumulative payload bytes retained across unread events when
+        ``record_events=True`` (default ``16_777_216``).
     max_keyboard_stack : int
         Maximum entries per screen in the Kitty ``CSI u`` keyboard stack.
     max_recorder_bytes : int
@@ -151,31 +173,40 @@ class Limits:
     max_grapheme_codepoints: int = 32
     max_csi_params: int = 32
     max_osc_bytes: int = 131_072
-    max_dcs_bytes: int = 4_194_304
+    max_dcs_bytes: int = 8_388_608
     max_apc_bytes: int = 4_194_304
     max_reply_bytes: int = 65_536
     max_rep_count: int = 4_096
     max_prompt_zones: int = 1_024
-    max_status_records: int = 64
+    max_status_records: int = 256
     max_events: int = 4_096
+    max_event_bytes: int = 16_777_216
     max_keyboard_stack: int = 8
     max_recorder_bytes: int = 4_096
 
 
-XTERM_PROFILE = Profile()
-DEFAULT_PROFILE = XTERM_PROFILE
+DEFAULT_PROFILE = Profile()
+XTERM_PROFILE = Profile(
+    name="xterm",
+    osc_7501_capabilities="",
+)
 TMUX_PROFILE = Profile(
     name="tmux",
     osc_7501_capabilities="?",
     pending_wrap_phantom_col=True,
+    vs15_narrows_wide_emoji=False,
+    tmux_window_rename=True,
 )
 DEFAULT_POLICY = Policy()
+TMUX_CAPTURE_POLICY = Policy(allow_passthrough=True)
 DEFAULT_LIMITS = Limits()
 
 __all__ = [
     "DEFAULT_LIMITS",
+    "DEFAULT_OSC7_HOSTS",
     "DEFAULT_POLICY",
     "DEFAULT_PROFILE",
+    "TMUX_CAPTURE_POLICY",
     "TMUX_PROFILE",
     "XTERM_PROFILE",
     "ColorScheme",

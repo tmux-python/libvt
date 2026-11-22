@@ -31,13 +31,24 @@ from libvt.status import BlockKind, StatusState
 
 def test_osc_7501_rex_grammar_hierarchy_urgency_and_queries() -> None:
     """Rex ``OSC 7501`` enforces grammar, hierarchy, urgency, and pruning."""
-    silent_term = libvt.Terminal(rows=4, cols=30)
-    silent_term.feed(b"\x1b]7501;?\x07")
-    assert silent_term.drain_replies() == b""
+    pull_term = libvt.Terminal(rows=4, cols=30, record_events=False)
+    pull_term.feed(b"\x1b]7501;?\x07")
+    pull_reply = pull_term.drain_replies()
+    assert pull_reply.startswith(b"\x1b]7501;?:")
+    assert pull_reply.endswith(b"\x07")
+
+    suppressed = libvt.Terminal(
+        rows=4,
+        cols=30,
+        policy=Policy(allow_program_status_query=False),
+        record_events=True,
+    )
+    suppressed.feed(b"\x1b]7501;?\x07")
+    assert suppressed.drain_replies() == b""
 
     term = libvt.Terminal(rows=6, cols=40, record_events=True)
     term.feed(b"\x1b]7501;?\x07")
-    assert term.drain_replies().endswith(b"\x07")
+    assert term.drain_replies() == pull_reply
     term.feed(b"\x1b]7501;?\x1b\\")
     reply_st = term.drain_replies()
     assert reply_st.startswith(b"\x1b]7501;?:")
@@ -106,14 +117,19 @@ def test_osc_133_abs_row_osc_7_osc_52_and_tmux_passthrough() -> None:
     assert [z.abs_row for z in zones] == sorted(z.abs_row for z in zones)
     assert zones[-1].exit_code == 0
 
-    # OSC 7: localhost updates cwd & cwd_uri; remote updates cwd_uri only.
+    # OSC 7: localhost updates cwd & cwd_uri; remote / non-file / NUL clears cwd!
     term.feed(b"\x1b]7;file://localhost/tmp/my%20dir\x07")
     assert term.cwd == "/tmp/my dir"
     assert term.cwd_uri == "file://localhost/tmp/my%20dir"
     term.feed(b"\x1b]7;file://remote-box.example/srv\x07")
-    assert term.cwd == "/tmp/my dir"
+    assert term.cwd == ""
     assert term.cwd_uri == "file://remote-box.example/srv"
     assert term.snapshot().cwd_uri == "file://remote-box.example/srv"
+    term.feed(b"\x1b]7;kitty-shell-cwd://localhost/srv\x07")
+    assert term.cwd == ""
+    assert term.cwd_uri == "kitty-shell-cwd://localhost/srv"
+    term.feed(b"\x1b]7;file://localhost/bad%00path\x07")
+    assert term.cwd == ""
 
     # Empty OSC 7 clears both cwd and cwd_uri.
     term.feed(b"\x1b]7;\x07")
@@ -163,7 +179,27 @@ def test_osc_133_abs_row_osc_7_osc_52_and_tmux_passthrough() -> None:
         b"\x1b\x1b\\\x1b\\",
     )
     assert "nested2" in allow_term.program_statuses
-    assert any(isinstance(e, Passthrough) for e in allow_term.drain_events())
+    # Split DCS tmux; envelopes preserve inner parser state across packets!
+    allow_term.feed(b"\x1bPtmux;\x1b\x1b]2;hel\x1b\\" + b"\x1bPtmux;lo\x07\x1b\\")
+    assert allow_term.title == "hello"
+    assert allow_term.text == ""
+
+    # TMUX_PROFILE consumes ESC k <name> ESC \ without printing to cells, and
+    # OSC 10/11 + OSC 110/111 dynamic color overrides/resets work cleanly.
+    tmux_term = libvt.Terminal(
+        rows=3,
+        cols=20,
+        profile=libvt.TMUX_PROFILE,
+        policy=Policy(strict=True),
+    )
+    tmux_term.feed(b"\x1bkbuild-win\x1b\\OK\x1b]10;rgb:11/22/33\x1b\\\x1b]110\x1b\\")
+    assert tmux_term.text == "OK"
+    assert tmux_term.window_name == "build-win"
+    assert libvt.render(b"line1\nline2", rows=2, cols=10, newline_mode=True) == (
+        "line1\nline2"
+    )
+    assert libvt.DEFAULT_LIMITS.max_dcs_bytes > libvt.DEFAULT_LIMITS.max_apc_bytes
+    assert libvt.DEFAULT_LIMITS.max_status_records == 256
 
 
 def test_kitty_keyboard_stack_and_input_encoding() -> None:

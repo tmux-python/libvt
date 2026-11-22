@@ -27,8 +27,10 @@ from libvt._ucd import (
 from libvt.codec import ExplainedSpan, explain, format_explain
 from libvt.config import (
     DEFAULT_LIMITS,
+    DEFAULT_OSC7_HOSTS,
     DEFAULT_POLICY,
     DEFAULT_PROFILE,
+    TMUX_CAPTURE_POLICY,
     TMUX_PROFILE,
     XTERM_PROFILE,
     ColorScheme,
@@ -57,6 +59,7 @@ from libvt.events import (
     SixelGraphic,
     TitleChanged,
     UnhandledSequence,
+    WindowRenamed,
     WorkingDirectoryChanged,
 )
 from libvt.exc import (
@@ -123,9 +126,11 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 __all__ = [
     "BLANK_CELL",
     "DEFAULT_LIMITS",
+    "DEFAULT_OSC7_HOSTS",
     "DEFAULT_POLICY",
     "DEFAULT_PROFILE",
     "DEFAULT_STYLE",
+    "TMUX_CAPTURE_POLICY",
     "TMUX_PROFILE",
     "UNICODE_VERSION",
     "XTERM_PROFILE",
@@ -203,6 +208,7 @@ __all__ = [
     "UnhandledSequence",
     "UnsafePasteError",
     "WidthRole",
+    "WindowRenamed",
     "WorkingDirectoryChanged",
     "__author__",
     "__copyright__",

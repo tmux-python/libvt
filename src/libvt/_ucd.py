@@ -18,7 +18,11 @@ import array
 import base64
 import enum
 import sys
+import typing as t
 import zlib
+
+if t.TYPE_CHECKING:
+    from libvt.config import Profile
 
 
 class WidthRole(enum.IntEnum):
@@ -61,46 +65,45 @@ _ACTIVE_BIT = 1
 UNICODE_VERSION = "17.0.0"
 
 _PACKED_B85 = (
-    "c-rk<XWOJS6usa^SAAbydmWWkS65xj+I#P9*4}&Xy?&a12>bYhWEdFI2@n{{;XK34KoW9GZf-&f9"
-    "j5dMQiOC09Uw-h(rI*%PNy^IOxmM;I*ZPxL+Sl<vQPn?OXtz~bOBvR7tzJpl}qT-^n4jzP7At%u1"
-    "tSlm3|^ROjpx2bS)jB>*#tqI(giXQhj6kxrvU^&2$UhO1IH*x}ENzJLxWO|L&%HBm}jw&h5R~ulw"
-    "l!^!xxlNDm1i9?s5>(4+JiJx)*1lk^llP0!G?^c+1;FVKth61_}IIzg{EKlRlHId#Kp%9YpYjr9C"
-    "x`gyCdJm02wJml@&G^O|Gea)Q@oZ^3&em<g)=@a4Vr`+$)Qd&PxzrUa_>8tenYx+hA`z?J(-_sBD"
-    "BmG1_(=YTZ{YJm1*Z;`y=L||FV8&nI!OZ0!000000000000000001yq{7wJRzZQT)0002f#GVERv"
-    "-1J%JsEjA2ZU4)2)|Vfn)-Usq{=qm``cdtFjT}72P6#CEd}5Q(1(Q#@(+LRo4N%Dcj{Bm>EJMUUY"
-    "*iZHE|(b2?Sm8W5*V)IXI_UdpNYX<RWgIYGANs^1Uu;>(f5g<7@vl&Z2cq6glK-<qhlStvMHEQ1i"
-    "0EGCRxMkkcxyo*UHoasC`%^aq;%VhTm+O9c9ZoFm2eQj>>7$W7ot|7!bmlLc^<zi%Dq<<D!rT*lk"
-    "iKlXHd>wlpAA1FGj>VKIRll-e_bSnX}-Hvudf0A1QH~n9SsjvTmMgMp0BPJR3CHJHJccB-y^6#%4"
-    "nxE!J{wssc4kUXodk{;lmajAxtzA9rs{dWszc|x@WJ`aNNjS+$My$v_X<YsztL=z-uK!ngj^+AK)"
-    "c>WXMVff9f5VW!n?2$=#Mc=G-0Z<_=_@qd#cQ5o@2!sh*y@c8nf~Uvin&jpdTDR>$lh0VYreZT6T"
-    "6W2suS@1izKR-xy9YI=IZ3Hj8)bmvCz8G#Wl4Y`PwLu+98|#uV&D*cx2=l+Kk#`Bg5Ex!|{HqFHR"
-    "?|;wL-tIjZBYdV*RL#*!}|arL5zW$)g?=DB;bDqp^=NjyW_5OIB(k>J;tdL0S<ov^B7mA2Shxatj"
-    "&#)1Y}FJY{0uc<m0Yu=ZSd3>EM{kr*!tZ$8c)PD(=yCm=VETogr32hs)%lF^BMz__=m@64;YL?p;"
-    "r_Jl=qAx$@di0|$x0BBGT=iwt(g?fXyp`kDhb6vCRlO3(0OPM+?BX6BqW?_u8?4w*v3Ib5B_wNbN"
-    "1M|E+;i>oGiIhAJ>-&g7<wpR9I8W3+Gd3;w3ObELfG})l&r0EG6`h}i?gW5;Oxky3=F)kaFsLLRS"
-    "t72ZmZQ;dEVN5rn$=k@gC!zLL!uBF_8y_^^#G+=`t6rMu{_|E9AEbS8|C75*E{7O8scGwjxy;{!+"
-    "+2FLc)vIY)VIP)a+@b1COq49{_ssdCato1|3h`9u=+>vTdUYK1ZNUVJX29x{8Z=67dd6M<p1aN4&"
-    "3JeRr|mK6ZN7@1!9Gxz?%xobe!0L^0U7Cz|*h9yJa`rQ_VZ8@1DWX5nT9GwOh7I%s|)m8fA=FYh7"
-    "!}$0!@cM~`Hj4%Tz@%!%;d^*Mb?Z3jr0qL~_H&&z(&EPbBIVfsvGuI<H8(!0KvP|6*T)lg+85=E8"
-    "rwPt&1a5^^H=m^vwg03rH&I{f1hZ{b8!~)%4rn6pE33>GUO?>kHXiDWv@rSeKi^}PO#-xA3e<S`i"
-    "!D&jy=g=os%HiwmK_H0ezwQ`U-0O8*%GNMUHxPobGA_#6vv9Lp;PoJj6ph#6vv9Lp;PAS3K~;Pdr"
-    "omy58z>MXdhTeZw*DW8R}@fvR^$Rd1=A#P4pLQGhq;wXipV5x~3SULWf!)f?Zd-rrX+jdf7~%zXh"
-    "M#b&+^cu~H8w(owRj-&9gD?srSj7aErq+cH+Em6t=l*M=y^<X^MeD#^bIope<=iNX1o{b(`%VXU6"
-    "?x&G<<nQ{<qQZw?^e7LXyIkm2C0<s_cC)+FsxvBW^hZ6EGW{y_o00AMJ*M5qa1M1|MI>l_qS;{!E"
-    "!ehtt=Fu2<-h;^A<O+g`TbwT{eKf}kE?ACkB$dbJTc7~DCP<H-W4xV<W*2r?EIQ+_dwn3B(SKE=U"
-    "6-!`@R5i18X-1x>b1>I-hK3X`rn-RmeLW2hvVSZFW-~f2p6Y=EvII+>%LATUu=WZo0snVQ%q2JBI"
-    "cCNA^%xTE94G`1U8^=D3TV`o_17vJW)EwIuOvHhw3*sImNY{cv6Ee#-AOXR0NZ75OVU;X8*54)(p"
-    "a@Xm60UP#%l0!N1Sc0ugxkW16J#*MhFwGwGPp85Jcx<0u;yDHOSAROX7mO`e{i1ZZzTzmO9<t}nq"
-    "L8tBR&1&yJ*~dM-eqUgNy$ZxT9UTC4;TQ2OR&WUbhEPU_U?U(8pbH$`ev9+yfw5b!>Xmc-LT|l>%"
-    "b{}575)8e50)M75CIH%rZd*7hvooNhG_+j!0Y}!Re5Ne|LRmmvVRZ&phlQX&q~?9J+(euAE=)`v<"
-    "hg7B%fgxbN>sdZ=I?%)km3vOzQ9pd_eoR>m5!Z?>_5)bN$}uv)o3F#0|MN_Av{#@tLk(ojRItO79"
-    ";4V0_vG9~AXE<PRMH7v@vb#8&x37slT{1D!xe{Xoofip4P%4w;VXSXCixQt`{d`uQI}Sil<H+i*W"
-    "St7xe+9UYfYeS~ZJm^n>tKPq$XaovP0ImhyEGN&&+KM1Wfn`7c|IYKj7232;_zq|}F8JbeV!eHlM"
-    "jdH^{d%?DLL#2`#xmT4Z#>Lj~P~~qPf>lwv$!RX9{MyN|fSEr|cbH>b12*|8=@z)g1a3Bxv4>D?p"
-    "UAZLSw%eN_%yw~F{AdeGUQqxYNXvkSv1$mWr!^;jxf~ll4Y`Z1bpc7O6~_(eFZ6eg_psk5OyzxS*"
-    "|i6HKu)vbk%!V>I|K?d(6}_Z3$)#ILDNFRhy0|A-)FSb1K%`f@W`J&3R4CB=MQ}|5Jp6|5o0wIEL"
-    "1KcgbIu?N^`eV^{vxlaJrS%`SSk>h4#8G1sp<EuYr*t<8Q`wvD@zhG4m?!n#<0^F16maLoF^{J7c"
-    "A0bB0}z25@y$gw|j#K5Gn4*(YY59z2SMg"
+    "c-rk<XPe_R5FVQqEU*hl=O7EZ1C9fZcJ$tR3%&Q=d;gSwD0uimIEfugvLws4?6|yspE!xFIx`xLI"
+    "vu6tiW0<h3hfZ1Q|UC?rPJvQI+ONjpU$GQ=}_|ioRzDH&ZYC{e7b-xq>Jd{)sw??NpioGW^_Q8(d"
+    "Ef+o_vnbQM!Vzq^sx{T}{X7n$hFhB-hs^pA&RF-9R_eO>{Gzq+94#x{YoR_U{h5Q$ti4%hcYr`gJ"
+    "$mlics6`{;hf#RIGRgY*zROpnl`^cX!(PtcR}6g^GP(6jU$Jx?#toL;1tykmX2MoRtgO5w??^jdO"
+    "%J^8#*o1bseTLIGcb`sJ%^seE}dtUzEPd*>ehxC#1^keDwCrMsEO};;)&*_Wg`%C&tar-rWL*LSO"
+    "^gaDRKhjV1GyOupCeMFc;r9uYOu&vmK!b_%KLP*%00000000000001BwD^<$qQ4ygg#Z8m#)&-xc"
+    "31Zu<2xN`I6F$HJIe1OdY$`fFoepou(MwP&{v3&0~`jbmIBZN=t4tA=|{eIox7O?|J*0m&2B$vUL"
+    "Mj|C2^)bi4<81qsL~ADLAECyFYpHNrk8#YGl!6`nxvs)}?-|M%V6ZoLS?Vh<l`J5e&=tmXzZw6w|"
+    "WCe0A5Up@)@gJwFuvi!`24`Hu|$)exdh%`fLaN-2_k&z)sf4%wCe#U^%JXukXpE#or(Wy#mec=P("
+    "l9ZqQZkBtALg3K1>KTnH||7CgfD*?LR=3C0YNHu|<{HyxbSN<c1{BPSvT<1QgK2LvVa?wRfg(J2w"
+    "{9jmfcBJWh-GZ1KrF>z~XwB+jU-@rC{|Q9~gwuW(P7UUcjXQM*@3{V7D4HkFtt$U>I`EYLA@bi(A"
+    "ITJw>kRH)YGtjuz1$q}w3^4*duz(SyDaxP|MgQPq)(S}>2CMv)>nCJzP*u&ZSZ^13YM3N#v*w>m$"
+    "cfVQu=aVc`YK+*k}`Pe#x$cvo@kMWcgZ$Y)Vu1ehk{_*uZhTXE-r1481oT<5S($pxfe<2-XMGRsC"
+    "mf@o-B|XKu}#`a{L4#_ZNwSjW3Jsqz&{n}`YO1}^nwa>cIC<(ez~ozSX7<+j@Iu;>ijph2TVH&SZ"
+    "13x{^KwZBAXb!S_1+nSD`n@0fkKGrbxpN&K7I?mKf+~)YVEYVHnQb;8utFeV67tM2MA5RdHHPKy9"
+    "Qqh(v@)~--zU}PShoz3C7OfKS0Q0YX^x_^JqW^5`8=Tlru(zAR;gZ#OV@zoVDPH&bjETud2dQK&y"
+    "6y{@gmRao)>$!&9i=y>7<zp>C2PZ-6^B-cv%4zCpzOf84D`IN@Z~exRti%s?yA*Te&6VPW_ZgY^&"
+    "OL9Ar*zVm`a08d+8{lbe;-Up~P9jRnnWe%c;Z^4y$3XLj7pfwrZ{n^rcveFZP!cJw<74kaIguQ>m"
+    "v~buUqq75QY~Hff<&vx&6aFT;tMDizkyJF&T}a>(4i>c5?YP6YbZ!fD<D2wdtWSXKZ4b7VT9&(!+"
+    "|r!E0;4b=0sU4+a(&@Uc_mhYyJ^-IjG?pQoH3CuL^7-g!h@P|#EVe5zC(WmG26N_CM4FG^q)r|eO"
+    "@Bp8cD{ZuWhtPhmvPYVz-7k{Q{U2J-3h!ubJTF0AS!&kDBU<f?3Y8nzJ_q$zj;iZd%yY9t?s!$4C"
+    "(bMF^5dFGzK$cZ?6qR|({_)foKyEKeA8U^YWa8XMx**!uNi5J0(#E${TWr=ECTVrxF$i>ZOvs32#"
+    "<RD#9aS!X)ht)y<tw$?X>`Z@CSeJ2Y>JffA9x?@CSeJ2Y<uz2YQ6@XKP<q+dVGx)!n{txTbwgd-g"
+    "0)Hg;4tN?pf)d-IGUjHFk>-Uwy@Z;yKaB<R=t_2T>e0>-f~3V^jQ0JvDs)&VW@@n`qx2gP|5^=H8"
+    "pS0rLaLbo&hx|nH+QVyUjib2$aqPOYlGKEvt7rf)sKf7LyE}Z32w0`<2H_rTBzL}NS@Uss25%QD^"
+    ")2_txQr@mlcUrWTOIQAR2c?V~ccEX;(mYU3I+V{t6a&^Pd5*bu%Bx;BVK3B|YqMlkEC0On^C9!|K"
+    "jrgZ)$@P-&%DWenP^Z(6Wf}BD7}X~!6N6FexjhdQh-Y<s+Omqiovf!v+F=vONd}vy>BH{*ZEvJp8"
+    "<RFk6l0OC!F&DoF7A}AFt#K>uGLd%cJe2SCsu}!`0$}bo6QbN4HQHM!PtwIr<}?!=_v6OWT&OK9C"
+    "6Ck|ej;<W>@|&3{urTpOpK$|ud)YKeJC`f^HyPT_$B_gPyQv+SQ0lDDfsk-m*C=zSf2`+D?$T*@|"
+    "r!HpKrbnPBfpIl_zmFb`-6p}5LjHi4+@(KXHz5MHP$31q?X?l8dv3DTv;~rnXFR;d53B*=s2LNr@"
+    "MRJQ3R04oLl+ixu2=D`F1IIVt>N<L0=-R7%=iIO`Yp?!NC_i(>u79_ALIlv~mCo3&9+Cr$8MYlXq"
+    "M+yZl%=6*`pZKZ$oWA4fEr;mJu7+t_SpJxL!f&2kSZWlPp2$b#Zjj+Nez(_@T3a8KnJvc+dknG{O"
+    "+>;x7Y7o#^pC_MAWWphHcTf=4bj^b;a3yV;X+|fZ<6GY*5te;6G#lRG3apBb@w)EDXPWhI|4o^#i"
+    "fMA!gTDC}g|JeU-UzaV0DTtEYeXU=geJZcY8wy@-Y~)6#XAsv}<JkJ-aC_M<ZI9@n+YoN_GvCVTi"
+    "={88-8v)v~ypDVV5tx)8h_Af0%OoyS=usGT}Sgq7BNnfyy-YDjhS*cf+CMNkd(6C6~)CDWc={lt;"
+    "pVDXl#u@DN@p{8N{aUb2SDtT$YD}SKEglDO)ig$Ce9ub!G0)h{^2V&v$8wiTd8iO}3uVz>E9WjYd"
+    "GUm$hSxNc!y=Gf=TA~Qz-cRJ?n|r;rnzuiDa`SdDWNfAEZWoHWvMl^-tMvImKjSht3f$ds8@~Qs2"
+    "q}O06C><y{$<0hS!qS#B3a&i2XlCc-U|G`;x0~?RTH_wb_0R**^BAZ#Djez5MiIaINnD6c}>-y4C"
+    "XOY~Q-{XKCBGEp8~9yUeYR_P4*og$viDFRYK7{2H+3dC>a}AO?>8i9-OR#y$Wz@IN@`B5("
 )
 
 
@@ -133,6 +136,8 @@ def _pack_state(
     ep_state: int,
     incb_state: int,
     vs_base: int,
+    has_spacing: int,
+    multi_scalar: int,
 ) -> int:
     return (
         _ACTIVE_BIT
@@ -141,19 +146,23 @@ def _pack_state(
         | (ep_state << 6)
         | (incb_state << 8)
         | (vs_base << 10)
+        | (has_spacing << 11)
+        | (multi_scalar << 12)
     )
 
 
 def init_cluster_state(cp: int, *, mode_2027: bool = True) -> int:
     """Return initial packed cluster state for base codepoint *cp*."""
     entry = ucd_lookup(cp)
+    w = entry & 0b11
     gcb = (entry >> 2) & 0x0F
     incb = (entry >> 6) & 0x03
     ep = 1 if (entry & EXT_PICT_BIT) else 0
     vs_b = 1 if (entry & EMOJI_VS_BASE_BIT) else 0
     ri_odd = 1 if (mode_2027 and gcb == GCB_REGIONAL_INDICATOR) else 0
     incb_st = 1 if incb == INCB_CONSONANT else 0
-    return _pack_state(gcb, ri_odd, ep, incb_st, vs_b)
+    has_sp = 1 if w >= 1 else 0
+    return _pack_state(gcb, ri_odd, ep, incb_st, vs_b, has_sp, 0)
 
 
 def char_width(ch: str) -> int:
@@ -169,6 +178,8 @@ def step_cluster(
     cp: int,
     *,
     mode_2027: bool,
+    vs15_narrows: bool = True,
+    vs16_always_wide: bool = False,
 ) -> tuple[bool, int, int]:
     """Evaluate UAX #29 continuation between *prev_state* and codepoint *cp*.
 
@@ -177,9 +188,9 @@ def step_cluster(
     tuple[bool, int, int]
         ``(extends_previous, next_state, width_override)`` where
         ``width_override`` is ``-1`` (keep current cluster width), ``1``
-        (narrow via ``VS15`` on an emoji variation base), or ``2`` (widen via
-        ``VS16`` on an emoji variation base, emoji modifier, ZWJ pictographic,
-        Regional Indicator pair, or wide glyph after ``Prepend``).
+        (narrow via ``VS15`` on an emoji variation base or first narrow glyph
+        after ``Prepend``), or ``2`` (widen via ``VS16``, spacing continuation,
+        emoji modifier, ZWJ pictographic, or Regional Indicator pair).
     """
     entry = ucd_lookup(cp)
     gcb = (entry >> 2) & 0x0F
@@ -193,10 +204,16 @@ def step_cluster(
         ep_state = (prev_state >> 6) & 0x03
         incb_state = (prev_state >> 8) & 0x03
         vs_base = (prev_state >> 10) & 0x01
+        has_spacing = (prev_state >> 11) & 0x01
+        multi_scalar = (prev_state >> 12) & 0x01
 
         if not mode_2027:
             if gcb == GCB_EXTEND:
-                return True, _pack_state(gcb, 0, ep_state, incb_state, 0), -1
+                return (
+                    True,
+                    _pack_state(gcb, 0, ep_state, incb_state, 0, has_spacing, 1),
+                    -1,
+                )
             if w == 0:
                 return False, CLUSTER_NONE, -1
             return False, init_cluster_state(cp, mode_2027=False), -1
@@ -224,15 +241,18 @@ def step_cluster(
 
         if joined:
             w_override = -1
-            if cp == 0xFE0F and vs_base:
+            if cp == 0xFE0F and (vs_base or (vs16_always_wide and has_spacing)):
                 w_override = 2
-            elif cp == 0xFE0E and vs_base:
+            elif cp == 0xFE0E and vs_base and vs15_narrows and not multi_scalar:
                 w_override = 1
-            elif (
-                ((entry & EMOJI_MOD_BIT) and ep_state == 1)
+            elif not has_spacing and w >= 1:
+                w_override = w
+            elif has_spacing and (
+                w >= 1
+                or gcb == GCB_SPACING_MARK
+                or ((entry & EMOJI_MOD_BIT) and ep_state == 1)
                 or (ep_state == 2 and ep)
                 or (ri_odd == 1 and gcb == GCB_REGIONAL_INDICATOR)
-                or (prev_g == GCB_PREPEND and w == 2)
             ):
                 w_override = 2
 
@@ -255,16 +275,33 @@ def step_cluster(
             else:
                 next_incb = 0
 
-            next_vs = (
-                1 if (prev_g == GCB_PREPEND and (entry & EMOJI_VS_BASE_BIT)) else 0
-            )
+            next_vs = 1 if (entry & EMOJI_VS_BASE_BIT) else 0
+            next_sp = 1 if (has_spacing or w >= 1 or gcb == GCB_SPACING_MARK) else 0
+            next_multi = 0 if (not has_spacing and w >= 1) else 1
             return (
                 True,
-                _pack_state(gcb, next_ri, next_ep, next_incb, next_vs),
+                _pack_state(
+                    gcb,
+                    next_ri,
+                    next_ep,
+                    next_incb,
+                    next_vs,
+                    next_sp,
+                    next_multi,
+                ),
                 w_override,
             )
 
-    if w == 0 and gcb in (GCB_CR, GCB_LF, GCB_CONTROL, GCB_EXTEND, GCB_ZWJ):
+    if w == 0 and gcb in (
+        GCB_CR,
+        GCB_LF,
+        GCB_CONTROL,
+        GCB_EXTEND,
+        GCB_ZWJ,
+        GCB_SPACING_MARK,
+        GCB_V,
+        GCB_T,
+    ):
         return False, CLUSTER_NONE, -1
     return False, init_cluster_state(cp, mode_2027=mode_2027), -1
 
@@ -300,10 +337,17 @@ def segment_graphemes(text: str) -> list[str]:
     return clusters
 
 
-def display_width(text: str, *, mode_2027: bool = True) -> int:
+def display_width(
+    text: str,
+    *,
+    mode_2027: bool = True,
+    profile: Profile | None = None,
+) -> int:
     """Return rendered terminal column width of *text*."""
     if text.isascii():
         return sum(1 for ch in text if " " <= ch <= "~")
+    vs15_narrows = profile.vs15_narrows_wide_emoji if profile is not None else True
+    vs16_wide = profile.vs16_always_wide if profile is not None else False
     total = 0
     cur_w = 0
     state = CLUSTER_NONE
@@ -313,7 +357,13 @@ def display_width(text: str, *, mode_2027: bool = True) -> int:
             cur_w = 1
             state = init_cluster_state(cp, mode_2027=mode_2027)
             continue
-        extends, state, w_override = step_cluster(state, cp, mode_2027=mode_2027)
+        extends, state, w_override = step_cluster(
+            state,
+            cp,
+            mode_2027=mode_2027,
+            vs15_narrows=vs15_narrows,
+            vs16_always_wide=vs16_wide,
+        )
         if extends:
             if w_override != -1:
                 cur_w = w_override

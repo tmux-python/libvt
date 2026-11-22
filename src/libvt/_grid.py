@@ -263,13 +263,25 @@ class FrozenRow:
         if self.exts:
             row.ext = {c: ce for c, ce in self.exts if c < width}
         row.used = limit
+        row.text_used = min(
+            len(self.cells) if self.cells is not None else len(self.text), width
+        )
         return row
 
 
 class _Row:
     """Mutableviewport row with lazy 64-bit ``array('Q')`` promotion."""
 
-    __slots__ = ("attrs", "chars", "ext", "has_wide", "uniform_attr", "used", "wrapped")
+    __slots__ = (
+        "attrs",
+        "chars",
+        "ext",
+        "has_wide",
+        "text_used",
+        "uniform_attr",
+        "used",
+        "wrapped",
+    )
 
     def __init__(self, cols: int) -> None:
         self.chars: list[str] = [" "] * cols
@@ -278,6 +290,7 @@ class _Row:
         self.has_wide: bool = False
         self.ext: dict[int, _CellExt] | None = None
         self.used: int = 0
+        self.text_used: int = 0
         self.wrapped: bool = False
 
     def _ensure_attrs(self) -> array.array[int]:
@@ -323,6 +336,7 @@ class _Row:
             if self.ext is not None:
                 self.ext.clear()
             self.used = cols if bce_word != 0 else 0
+        self.text_used = 0
         self.wrapped = False
 
     def _set_raw(
@@ -360,18 +374,31 @@ class _Row:
         if col < 0 or col >= cols:
             return
         role = raw_width_bits(self.attrs[col])
+        healed_pair_end = -1
         if role == int(WidthRole.WIDE):
             self.chars[col] = " "
             self.attrs[col] &= _WIDTH_CLEAR_MASK
+            healed_pair_end = col + 1
             if col + 1 < cols:
                 self.chars[col + 1] = " "
                 self.attrs[col + 1] &= _WIDTH_CLEAR_MASK
+                healed_pair_end = col + 2
         elif role == int(WidthRole.SPACER_TAIL):
             self.chars[col] = " "
             self.attrs[col] &= _WIDTH_CLEAR_MASK
+            healed_pair_end = col + 1
             if col - 1 >= 0:
                 self.chars[col - 1] = " "
                 self.attrs[col - 1] &= _WIDTH_CLEAR_MASK
+        if healed_pair_end != -1 and self.text_used == healed_pair_end:
+            pair_lo = max(0, healed_pair_end - 2)
+            self.text_used = pair_lo
+            if (
+                self.used == healed_pair_end
+                and self.attr_at(healed_pair_end - 1) == 0
+                and self.ext_at(healed_pair_end - 1) is None
+            ):
+                self.used = pair_lo
 
     def write_narrow(
         self,
@@ -384,6 +411,7 @@ class _Row:
         self._heal_wide_boundary(col)
         self._set_raw(col, ch, pen_word, WidthRole.NARROW, cell_ext)
         self.used = max(self.used, col + 1)
+        self.text_used = max(self.text_used, col + 1)
 
     def write_spacer_head(
         self,
@@ -395,6 +423,7 @@ class _Row:
         self._heal_wide_boundary(col)
         self._set_raw(col, "", bce_word, WidthRole.SPACER_HEAD, bce_ext)
         self.used = max(self.used, col + 1)
+        self.text_used = max(self.text_used, col + 1)
 
     def write_ascii_slice(
         self,
@@ -438,6 +467,7 @@ class _Row:
                 self.ext.pop(idx, None)
 
         self.used = max(self.used, end)
+        self.text_used = max(self.text_used, end)
 
     def write_wide(
         self,
@@ -452,6 +482,7 @@ class _Row:
         self._set_raw(col, ch, pen_word, WidthRole.WIDE, cell_ext)
         self._set_raw(col + 1, "", pen_word, WidthRole.SPACER_TAIL, cell_ext)
         self.used = max(self.used, col + 2)
+        self.text_used = max(self.text_used, col + 2)
 
     def append_grapheme(
         self,
@@ -489,6 +520,7 @@ class _Row:
             self.has_wide = True
             self._set_raw(target + 1, "", pen_word, WidthRole.SPACER_TAIL, cell_ext)
             self.used = max(self.used, target + 2)
+            self.text_used = max(self.text_used, target + 2)
         elif (
             width_override == 1
             and cur_role == int(WidthRole.WIDE)
@@ -497,6 +529,10 @@ class _Row:
             attrs = self._ensure_attrs()
             attrs[target] &= _WIDTH_CLEAR_MASK
             self._set_raw(target + 1, " ", pen_word, WidthRole.NARROW, cell_ext)
+            if self.text_used == target + 2:
+                self.text_used = target + 1
+                if self.used == target + 2 and pen_word == 0 and cell_ext is None:
+                    self.used = target + 1
 
     def clear_range(
         self,
@@ -530,6 +566,9 @@ class _Row:
                     and self.ext_at(self.used - 1) is None
                 ):
                     self.used -= 1
+            if hi >= cols:
+                while self.text_used > lo and not self.is_protected(self.text_used - 1):
+                    self.text_used -= 1
             return
 
         if lo == 0 and hi == cols:
@@ -565,6 +604,8 @@ class _Row:
             elif hi >= cols:
                 # Clamp used to lo without erasing explicit spaces printed left of lo!
                 self.used = min(self.used, lo)
+        if hi >= cols:
+            self.text_used = min(self.text_used, lo)
 
     def insert_blanks(
         self,
@@ -636,6 +677,8 @@ class _Row:
             self._set_raw(c, " ", bce_word, WidthRole.NARROW, bce_ext)
         if bce_word != 0 or bce_ext is not None or self.used > col:
             self.used = min(right + 1, max(self.used + shift, col + shift))
+        if self.text_used > col:
+            self.text_used = min(right + 1, self.text_used + shift)
 
     def delete_cells(
         self,
@@ -701,6 +744,8 @@ class _Row:
             self.used = max(self.used, right + 1)
         elif self.used > col:
             self.used = max(col, self.used - shift)
+        if self.text_used > col:
+            self.text_used = max(col, self.text_used - shift)
 
     def resize(self, cols: int) -> None:
         """Resize row in place to *cols* columns (non-reflow path)."""
@@ -720,6 +765,7 @@ class _Row:
             if self.attrs is not None:
                 del self.attrs[cols:]
             self.used = min(self.used, cols)
+            self.text_used = min(self.text_used, cols)
             if self.ext:
                 for k in [k for k in self.ext if k >= cols]:
                     del self.ext[k]
@@ -742,17 +788,18 @@ class _Row:
         dup.has_wide = self.has_wide
         dup.ext = self.ext.copy() if self.ext else None
         dup.used = self.used
+        dup.text_used = self.text_used
         dup.wrapped = self.wrapped
         return dup
 
     def freeze(self) -> FrozenRow:
         """Seal this row into a compact run-length-encoded :class:`FrozenRow`."""
         cols = len(self.chars)
-        used = self.used
-        text = "".join(self.chars[:used])
+        t_used = self.text_used
+        text = "".join(self.chars[:t_used])
         cells: tuple[str, ...] | None = None
-        if len(text) != used:
-            cells = tuple(self.chars[:used])
+        if len(text) != t_used:
+            cells = tuple(self.chars[:t_used])
 
         runs: tuple[tuple[int, int], ...]
         if self.attrs is None:
@@ -780,8 +827,8 @@ class _Row:
         )
 
     def rstrip_text(self) -> str:
-        """Return row text up to ``used`` written columns."""
-        return "".join(self.chars[: self.used])
+        """Return row text up to ``text_used`` written columns."""
+        return "".join(self.chars[: self.text_used])
 
 
 type RowLike = _Row | FrozenRow

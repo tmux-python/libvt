@@ -147,11 +147,26 @@ def test_string_esc_abort_and_oversized_payload_recovery() -> None:
     assert p.state == ParserState.GROUND
 
     # Ubiquitty OSC-G4 on Terminal: unclosed OSC 2 followed by ESC [ 31 m drops title.
-    term = libvt.Terminal(rows=4, cols=20, limits=Limits(max_osc_bytes=16))
-    term.feed(b"\x1b]2;unterminated\x1b[32mok")
+    term = libvt.Terminal(
+        rows=4,
+        cols=20,
+        limits=Limits(max_osc_bytes=16),
+        record_events=True,
+    )
+    term.feed(b"\x1b]2;cut\x1b[32mok")
     assert term.title == ""
     assert term.text == "ok"
     assert term[0, 0].style.fg == AnsiColor.GREEN
+
+    # Opt-in abort_dispatch_osc=True commits interrupted OSC payloads on ESC (not CAN).
+    opt_term = libvt.Terminal(
+        rows=4,
+        cols=20,
+        policy=libvt.Policy(abort_dispatch_osc=True),
+    )
+    opt_term.feed(b"\x1b]2;committed\x1b[31mR\x1b]2;cancelled\x18X")
+    assert opt_term.title == "committed"
+    assert opt_term.text == "RX"
 
     # Double ESC inside OSC cancels OSC and treats second ESC \ as standalone ST no-op.
     term.reset()
@@ -167,10 +182,12 @@ def test_string_esc_abort_and_oversized_payload_recovery() -> None:
     assert not any(isinstance(a, DcsDispatch) for a in strict_dcs)
 
     term.reset()
+    term.drain_events()
     term.feed(b"\x1b]2;" + (b"x" * 64) + b"\x07clean")
     assert term.title == ""
     assert term.text == "clean"
     assert term.parser_state == ParserState.GROUND
+    assert any(isinstance(ev, libvt.UnhandledSequence) for ev in term.drain_events())
 
     # Exercise SGR memo FIFO eviction past 256 unique entries.
     for idx in range(300):

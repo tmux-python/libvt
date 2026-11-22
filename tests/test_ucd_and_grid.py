@@ -11,11 +11,14 @@ import libvt
 from libvt._ucd import (
     EXT_PICT_BIT,
     WidthRole,
+    char_width,
     display_width,
     segment_graphemes,
     ucd_lookup,
 )
+from libvt.config import TMUX_PROFILE, XTERM_PROFILE
 from libvt.modes import Mode
+from libvt.terminal import Formatter, OutputFormat
 
 
 def test_unicode_17_grapheme_break_test_vectors() -> None:
@@ -90,6 +93,17 @@ def test_unicode_width_flags_zwj_incb_and_variation_selectors() -> None:
     assert display_width("❤\ufe0f") == 2
     assert display_width("#\ufe0f\u20e3") == 2
     assert display_width("⌚\ufe0e") == 1
+    assert display_width("⌚\ufe0e\ufe0f") == 1
+    assert display_width("⌚\u0301\ufe0e") == 2
+    assert display_width("⌚\ufe0e", profile=TMUX_PROFILE) == 2
+    assert display_width("क्ष") == 2
+    assert display_width("स्त्र") == 2
+    assert display_width("\u0995\u09cb") == 2
+    assert char_width("\u09cb") == 0
+    assert char_width("\u1161") == 0
+    assert char_width("\u0600") == 0
+    assert display_width("\u06001") == 1
+    assert display_width("\u1100\u1161\u11a8") == 2
 
     term = libvt.Terminal(rows=4, cols=10)
     term.feed("🇯🇵🇺🇸!".encode())
@@ -107,7 +121,22 @@ def test_unicode_width_flags_zwj_incb_and_variation_selectors() -> None:
     assert term[0, 0].text == "🧑‍🌾"
     assert term[0, 0].width == 2
     assert term[0, 2].text == "क्ष"
-    assert term[0, 3].text == "A"
+    assert term[0, 2].width == 2
+    assert term[0, 4].text == "A"
+
+    # Prepend + narrow ASCII stays 1 column on Terminal as well as display_width.
+    term.reset()
+    term.feed_str("\u06001!")
+    assert term[0, 0].text == "\u06001"
+    assert term[0, 0].width == 1
+    assert term[0, 1].text == "!"
+
+    # TMUX_PROFILE preserves width 2 on VS15 (matching live tmux 3.8a).
+    tmux_term = libvt.Terminal(rows=2, cols=10, profile=TMUX_PROFILE)
+    tmux_term.feed_str("⌚\ufe0e!")
+    assert tmux_term[0, 0].width == 2
+    assert tmux_term.cursor.col == 3
+    assert XTERM_PROFILE.name == "xterm"
 
     # VS16 widening at right margin (col == cols - 1) wraps cleanly with SPACER_HEAD.
     narrow_term = libvt.Terminal(rows=3, cols=4)
@@ -120,14 +149,50 @@ def test_unicode_width_flags_zwj_incb_and_variation_selectors() -> None:
     assert narrow_term.cursor.row == 1
     assert narrow_term.cursor.col == 2
 
-    # Overwriting (1, 0) with narrow 'Z' heals (0, 3) SPACER_HEAD and keeps wrapped.
+    # Overwriting (1, 0) with narrow 'Z' heals (0, 3) SPACER_HEAD and clears wrapped!
     narrow_term.feed(b"\x1b[2;1HZ")
     assert narrow_term[0, 3].width_role == WidthRole.NARROW
     assert narrow_term[0, 3].text == " "
-    assert narrow_term[0].wrapped is True
+    assert narrow_term[0].wrapped is False
     assert narrow_term[1, 0].text == "Z"
     assert narrow_term[1, 1].text == " "
     assert narrow_term[1, 1].width_role == WidthRole.NARROW
+    vt_replayed = libvt.render(
+        Formatter(OutputFormat.VT).format_snapshot(narrow_term.snapshot()),
+        rows=3,
+        cols=8,
+    )
+    narrow_term.resize(rows=3, cols=8)
+    assert narrow_term.text == "abc\nZ"
+    assert vt_replayed == narrow_term.text
+    narrow_term.resize(rows=3, cols=4)
+    assert narrow_term.screen._rows[0].used == 3
+
+    # Wide-to-wide CUP overwrite at (1, 0) also repairs pre-edit SPACER_HEAD!
+    w2w_term = libvt.Terminal(rows=3, cols=4)
+    w2w_term.feed_str("abc❤️")
+    w2w_term.feed_str("\x1b[2;1H日")
+    assert w2w_term[0, 3].width_role == WidthRole.NARROW
+    assert w2w_term[0].wrapped is False
+    assert w2w_term[1, 0].text == "日"
+
+    # BCE EL 0 with colored background keeps background style without padding .text!
+    bce_term = libvt.Terminal(rows=3, cols=80)
+    bce_term.feed(b"\x1b[44mfoo\x1b[K\r\nbar")
+    assert bce_term[0].text == "foo"
+    assert bce_term[1].text == "bar"
+    assert bce_term[0, 10].style.bg is not None
+    bce_term.resize(rows=3, cols=40)
+    assert bce_term[0].text == "foo"
+    assert bce_term[1].text == "bar"
+
+    # RowView stays anchored to viewport row coordinates across scroll recycling!
+    scroll_term = libvt.Terminal(rows=2, cols=10, scrollback=5)
+    scroll_term.feed(b"row-0\r\nrow-1")
+    top_view = scroll_term[0]
+    assert top_view.text == "row-0"
+    scroll_term.feed(b"\r\nrow-2")
+    assert top_view.text == "row-1"
 
     # Disabling ?2027 leaves narrow base + VS16 at width 1.
     legacy = libvt.Terminal(rows=2, cols=6)

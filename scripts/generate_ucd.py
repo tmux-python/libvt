@@ -194,12 +194,16 @@ def build_tables(ucd_dir: pathlib.Path) -> tuple[bytes, bytes]:
             incb = INCB_IDS[incb_map.get(cp, "None")]
             gc = gc_map.get(cp, "Cn")
             eaw = eaw_map.get(cp, "N")
-            if 0xD800 <= cp <= 0xDFFF or cp < 0x20 or 0x7F <= cp < 0xA0:
+            if (
+                0xD800 <= cp <= 0xDFFF
+                or cp < 0x20
+                or 0x7F <= cp < 0xA0
+                or gc in ("Mn", "Me", "Cf", "Mc")
+                or gcb in (GCB_IDS["V"], GCB_IDS["T"])
+            ):
                 width = 0
             elif cp == 0x00AD or 0x1F1E6 <= cp <= 0x1F1FF:
                 width = 1
-            elif gc in ("Mn", "Me", "Cf") and gcb != GCB_IDS["Prepend"]:
-                width = 0
             elif eaw in ("W", "F"):
                 width = 2
             else:
@@ -256,7 +260,11 @@ import array
 import base64
 import enum
 import sys
+import typing as t
 import zlib
+
+if t.TYPE_CHECKING:
+    from libvt.config import Profile
 
 
 class WidthRole(enum.IntEnum):
@@ -332,6 +340,8 @@ def _pack_state(
     ep_state: int,
     incb_state: int,
     vs_base: int,
+    has_spacing: int,
+    multi_scalar: int,
 ) -> int:
     return (
         _ACTIVE_BIT
@@ -340,19 +350,23 @@ def _pack_state(
         | (ep_state << 6)
         | (incb_state << 8)
         | (vs_base << 10)
+        | (has_spacing << 11)
+        | (multi_scalar << 12)
     )
 
 
 def init_cluster_state(cp: int, *, mode_2027: bool = True) -> int:
     """Return initial packed cluster state for base codepoint *cp*."""
     entry = ucd_lookup(cp)
+    w = entry & 0b11
     gcb = (entry >> 2) & 0x0F
     incb = (entry >> 6) & 0x03
     ep = 1 if (entry & EXT_PICT_BIT) else 0
     vs_b = 1 if (entry & EMOJI_VS_BASE_BIT) else 0
     ri_odd = 1 if (mode_2027 and gcb == GCB_REGIONAL_INDICATOR) else 0
     incb_st = 1 if incb == INCB_CONSONANT else 0
-    return _pack_state(gcb, ri_odd, ep, incb_st, vs_b)
+    has_sp = 1 if w >= 1 else 0
+    return _pack_state(gcb, ri_odd, ep, incb_st, vs_b, has_sp, 0)
 
 
 def char_width(ch: str) -> int:
@@ -368,6 +382,8 @@ def step_cluster(
     cp: int,
     *,
     mode_2027: bool,
+    vs15_narrows: bool = True,
+    vs16_always_wide: bool = False,
 ) -> tuple[bool, int, int]:
     """Evaluate UAX #29 continuation between *prev_state* and codepoint *cp*.
 
@@ -376,9 +392,9 @@ def step_cluster(
     tuple[bool, int, int]
         ``(extends_previous, next_state, width_override)`` where
         ``width_override`` is ``-1`` (keep current cluster width), ``1``
-        (narrow via ``VS15`` on an emoji variation base), or ``2`` (widen via
-        ``VS16`` on an emoji variation base, emoji modifier, ZWJ pictographic,
-        Regional Indicator pair, or wide glyph after ``Prepend``).
+        (narrow via ``VS15`` on an emoji variation base or first narrow glyph
+        after ``Prepend``), or ``2`` (widen via ``VS16``, spacing continuation,
+        emoji modifier, ZWJ pictographic, or Regional Indicator pair).
     """
     entry = ucd_lookup(cp)
     gcb = (entry >> 2) & 0x0F
@@ -392,10 +408,16 @@ def step_cluster(
         ep_state = (prev_state >> 6) & 0x03
         incb_state = (prev_state >> 8) & 0x03
         vs_base = (prev_state >> 10) & 0x01
+        has_spacing = (prev_state >> 11) & 0x01
+        multi_scalar = (prev_state >> 12) & 0x01
 
         if not mode_2027:
             if gcb == GCB_EXTEND:
-                return True, _pack_state(gcb, 0, ep_state, incb_state, 0), -1
+                return (
+                    True,
+                    _pack_state(gcb, 0, ep_state, incb_state, 0, has_spacing, 1),
+                    -1,
+                )
             if w == 0:
                 return False, CLUSTER_NONE, -1
             return False, init_cluster_state(cp, mode_2027=False), -1
@@ -423,15 +445,18 @@ def step_cluster(
 
         if joined:
             w_override = -1
-            if cp == 0xFE0F and vs_base:
+            if cp == 0xFE0F and (vs_base or (vs16_always_wide and has_spacing)):
                 w_override = 2
-            elif cp == 0xFE0E and vs_base:
+            elif cp == 0xFE0E and vs_base and vs15_narrows and not multi_scalar:
                 w_override = 1
-            elif (
-                ((entry & EMOJI_MOD_BIT) and ep_state == 1)
+            elif not has_spacing and w >= 1:
+                w_override = w
+            elif has_spacing and (
+                w >= 1
+                or gcb == GCB_SPACING_MARK
+                or ((entry & EMOJI_MOD_BIT) and ep_state == 1)
                 or (ep_state == 2 and ep)
                 or (ri_odd == 1 and gcb == GCB_REGIONAL_INDICATOR)
-                or (prev_g == GCB_PREPEND and w == 2)
             ):
                 w_override = 2
 
@@ -454,16 +479,35 @@ def step_cluster(
             else:
                 next_incb = 0
 
-            next_vs = (
-                1 if (prev_g == GCB_PREPEND and (entry & EMOJI_VS_BASE_BIT)) else 0
+            next_vs = 1 if (entry & EMOJI_VS_BASE_BIT) else 0
+            next_sp = (
+                1 if (has_spacing or w >= 1 or gcb == GCB_SPACING_MARK) else 0
             )
+            next_multi = 0 if (not has_spacing and w >= 1) else 1
             return (
                 True,
-                _pack_state(gcb, next_ri, next_ep, next_incb, next_vs),
+                _pack_state(
+                    gcb,
+                    next_ri,
+                    next_ep,
+                    next_incb,
+                    next_vs,
+                    next_sp,
+                    next_multi,
+                ),
                 w_override,
             )
 
-    if w == 0 and gcb in (GCB_CR, GCB_LF, GCB_CONTROL, GCB_EXTEND, GCB_ZWJ):
+    if w == 0 and gcb in (
+        GCB_CR,
+        GCB_LF,
+        GCB_CONTROL,
+        GCB_EXTEND,
+        GCB_ZWJ,
+        GCB_SPACING_MARK,
+        GCB_V,
+        GCB_T,
+    ):
         return False, CLUSTER_NONE, -1
     return False, init_cluster_state(cp, mode_2027=mode_2027), -1
 
@@ -499,10 +543,17 @@ def segment_graphemes(text: str) -> list[str]:
     return clusters
 
 
-def display_width(text: str, *, mode_2027: bool = True) -> int:
+def display_width(
+    text: str,
+    *,
+    mode_2027: bool = True,
+    profile: Profile | None = None,
+) -> int:
     """Return rendered terminal column width of *text*."""
     if text.isascii():
         return sum(1 for ch in text if " " <= ch <= "~")
+    vs15_narrows = profile.vs15_narrows_wide_emoji if profile is not None else True
+    vs16_wide = profile.vs16_always_wide if profile is not None else False
     total = 0
     cur_w = 0
     state = CLUSTER_NONE
@@ -512,7 +563,13 @@ def display_width(text: str, *, mode_2027: bool = True) -> int:
             cur_w = 1
             state = init_cluster_state(cp, mode_2027=mode_2027)
             continue
-        extends, state, w_override = step_cluster(state, cp, mode_2027=mode_2027)
+        extends, state, w_override = step_cluster(
+            state,
+            cp,
+            mode_2027=mode_2027,
+            vs15_narrows=vs15_narrows,
+            vs16_always_wide=vs16_wide,
+        )
         if extends:
             if w_override != -1:
                 cur_w = w_override

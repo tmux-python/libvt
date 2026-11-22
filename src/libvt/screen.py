@@ -193,64 +193,77 @@ def _slice_indices(s: slice, length: int) -> range:
 class RowView(collections.abc.Sequence[Cell]):
     """Read-only sequence view over one live viewport or scrollback row."""
 
-    __slots__ = ("_col_range", "_row")
+    __slots__ = ("_col_range", "_row", "_row_idx", "_screen")
 
-    def __init__(self, row: RowLike, col_range: range | None = None) -> None:
+    def __init__(
+        self,
+        row: RowLike,
+        col_range: range | None = None,
+        *,
+        screen: Screen | None = None,
+        row_idx: int = -1,
+    ) -> None:
         self._row = row
-        total_cols = len(row.chars) if isinstance(row, _Row) else row.cols
+        self._screen = screen
+        self._row_idx = row_idx
+        total_cols = (
+            screen.cols
+            if screen is not None
+            else (len(row.chars) if isinstance(row, _Row) else row.cols)
+        )
         self._col_range = range(total_cols) if col_range is None else col_range
+
+    def _current_row(self) -> RowLike:
+        if self._screen is not None and 0 <= self._row_idx < len(self._screen._rows):
+            return self._screen._rows[self._row_idx]
+        return self._row
 
     @property
     def wrapped(self) -> bool:
         """Return ``True`` when this row soft-wrapped onto the next line."""
-        return self._row.wrapped
+        return self._current_row().wrapped
 
     @property
     def text(self) -> str:
         """Return right-trimmed rendered text for this row slice."""
-        total_cols = (
-            len(self._row.chars) if isinstance(self._row, _Row) else self._row.cols
-        )
+        row = self._current_row()
+        total_cols = len(row.chars) if isinstance(row, _Row) else row.cols
         if self._col_range.start == 0 and self._col_range.stop == total_cols:
-            return self._row.rstrip_text()
-        limit = min(self._col_range.stop, self._row.used)
+            return row.rstrip_text()
+        row_t_used = row.text_used if isinstance(row, _Row) else row.used
+        limit = min(self._col_range.stop, row_t_used)
         if limit <= self._col_range.start:
             return ""
-        if isinstance(self._row, _Row):
-            raw = "".join(self._row.chars[self._col_range.start : limit])
+        if isinstance(row, _Row):
+            raw = "".join(row.chars[self._col_range.start : limit])
         else:
-            raw = "".join(
-                self._row.char_at(c) for c in range(self._col_range.start, limit)
-            )
+            raw = "".join(row.char_at(c) for c in range(self._col_range.start, limit))
         return raw.rstrip(" ")
 
     @property
     def runs(self) -> tuple[RowRun, ...]:
         """Return coalesced ``(style, hyperlink)`` spans up to ``used`` columns."""
-        limit = min(self._col_range.stop, self._row.used)
+        row = self._current_row()
+        limit = min(self._col_range.stop, row.used)
         start_c = self._col_range.start
         if limit <= start_c:
             return ()
         out: list[RowRun] = []
         run_start = start_c
-        first_ext = self._row.ext_at(start_c)
-        cur_style = unpack_style(self._row.attr_at(start_c), first_ext)
+        first_ext = row.ext_at(start_c)
+        cur_style = unpack_style(row.attr_at(start_c), first_ext)
         cur_link = first_ext.hyperlink if first_ext is not None else None
         buf: list[str] = []
 
         for c in range(start_c, limit):
-            word = self._row.attr_at(c)
+            word = row.attr_at(c)
             role_bits = raw_width_bits(word)
             if role_bits in (int(WidthRole.SPACER_TAIL), int(WidthRole.SPACER_HEAD)):
                 continue
-            ext = self._row.ext_at(c)
+            ext = row.ext_at(c)
             st = unpack_style(word, ext)
             lnk = ext.hyperlink if ext is not None else None
-            ch = (
-                self._row.chars[c]
-                if isinstance(self._row, _Row)
-                else self._row.char_at(c)
-            )
+            ch = row.chars[c] if isinstance(row, _Row) else row.char_at(c)
             if st != cur_style or lnk != cur_link:
                 out.append(
                     RowRun(
@@ -291,12 +304,18 @@ class RowView(collections.abc.Sequence[Cell]):
 
     def __getitem__(self, index: int | slice) -> Cell | RowView:
         """Index one :class:`Cell` or slice a sub-range :class:`RowView`."""
+        row = self._current_row()
         if isinstance(index, slice):
             sub = _slice_indices(index, len(self._col_range))
             base = self._col_range.start
-            return RowView(self._row, range(base + sub.start, base + sub.stop))
+            return RowView(
+                row,
+                range(base + sub.start, base + sub.stop),
+                screen=self._screen,
+                row_idx=self._row_idx,
+            )
         norm = _normalize_index(index, len(self._col_range), axis="col")
-        return _materialize_cell(self._row, self._col_range.start + norm)
+        return _materialize_cell(row, self._col_range.start + norm)
 
 
 class RegionView(collections.abc.Sequence[RowView]):
@@ -375,12 +394,14 @@ def slice_grid(
     rows: collections.abc.Sequence[RowLike],
     cols: int,
     key: int | slice | tuple[slice | int, slice | int],
+    *,
+    screen: Screen | None = None,
 ) -> RowView | Cell | RegionView:
     """Implement ``grid[r]``, ``grid[r, c]``, and ``grid[r1:r2, c1:c2]``."""
     height = len(rows)
     if isinstance(key, int):
         nr = _normalize_index(key, height, axis="row")
-        return RowView(rows[nr])
+        return RowView(rows[nr], screen=screen, row_idx=nr)
     if isinstance(key, slice):
         r_range = _slice_indices(key, height)
         return RegionView(rows[r_range.start : r_range.stop], range(cols))
@@ -526,13 +547,22 @@ class Screen:
         """Clear all sealed scrollback rows (``ED 3``)."""
         self._history.clear()
 
-    def _clear_row_spacer_head(self, row_obj: _Row) -> None:
+    def _clear_row_spacer_head(self, row_obj: _Row) -> bool:
         if not row_obj.has_wide or row_obj.attrs is None:
-            return
+            return False
         last = self._cols - 1
         if raw_width_bits(row_obj.attrs[last]) == int(WidthRole.SPACER_HEAD):
             row_obj.chars[last] = " "
             row_obj.attrs[last] &= _WIDTH_CLEAR_MASK
+            if row_obj.text_used == last + 1:
+                row_obj.text_used = last
+                while (
+                    row_obj.text_used > 0
+                    and row_obj.chars[row_obj.text_used - 1] == " "
+                    and row_obj.attr_at(row_obj.text_used - 1) == 0
+                    and row_obj.ext_at(row_obj.text_used - 1) is None
+                ):
+                    row_obj.text_used -= 1
             while (
                 row_obj.used > 0
                 and row_obj.chars[row_obj.used - 1] == " "
@@ -540,20 +570,41 @@ class Screen:
                 and row_obj.ext_at(row_obj.used - 1) is None
             ):
                 row_obj.used -= 1
+            return True
+        return False
+
+    def heal_before_edit(self, row: int, col_start: int, col_end: int) -> None:
+        """Repair cross-row ``SPACER_HEAD`` pairs before mutating cells."""
+        if not (0 <= row < len(self._rows)):
+            return
+        if col_start <= 1 and row > 0:
+            prev = self._rows[row - 1]
+            if self._clear_row_spacer_head(prev):
+                prev.wrapped = False
+                self._rows[row]._heal_wide_boundary(0)
+        if col_end > self._cols - 1:
+            cur = self._rows[row]
+            if self._clear_row_spacer_head(cur):
+                cur.wrapped = False
+                if row + 1 < len(self._rows):
+                    self._rows[row + 1]._heal_wide_boundary(0)
 
     def heal_wrapped_spacer_head(self, row: int) -> None:
-        """Clear a preceding row's ``SPACER_HEAD`` when ``(row, 0)`` splits."""
+        """Clear preceding ``SPACER_HEAD`` and ``wrapped`` if ``(row, 0)`` splits."""
         if row <= 0 or row > len(self._rows):
             return
         prev = self._rows[row - 1]
         if not prev.has_wide or prev.attrs is None:
             return
         if row == len(self._rows) or not prev.wrapped:
-            self._clear_row_spacer_head(prev)
+            if self._clear_row_spacer_head(prev):
+                prev.wrapped = False
             return
         cur = self._rows[row]
-        if raw_width_bits(cur.attr_at(0)) != int(WidthRole.WIDE):
-            self._clear_row_spacer_head(prev)
+        if raw_width_bits(cur.attr_at(0)) != int(
+            WidthRole.WIDE
+        ) and self._clear_row_spacer_head(prev):
+            prev.wrapped = False
 
     @property
     def lines(self) -> tuple[str, ...]:
@@ -582,7 +633,7 @@ class Screen:
         key: int | slice | tuple[slice | int, slice | int],
     ) -> RowView | Cell | RegionView:
         """Index a row, single ``(row, col)`` cell, or 2D region view."""
-        return slice_grid(self._rows, self._cols, key)
+        return slice_grid(self._rows, self._cols, key, screen=self)
 
     def scroll_up(
         self,
@@ -766,30 +817,38 @@ class Screen:
             idx += 1
 
             # Extract logical cells across [group_start .. group_end].
-            cells: list[tuple[str, int, int, _CellExt | None, bool]] = []
+            cells: list[tuple[str, int, int, _CellExt | None, bool, bool]] = []
             for r_i in range(group_start, group_end + 1):
                 src = combined[r_i]
                 is_last = r_i == group_end
-                limit = len(src.chars) if not is_last else src.used
-                if r_i == cur_abs_idx:
-                    limit = max(limit, cur_col + 1)
+                src_t_used = src.text_used if isinstance(src, _Row) else len(src.text)
+                row_limit = len(src.chars) if not is_last else src_t_used
+                limit = max(row_limit, cur_col + 1) if r_i == cur_abs_idx else row_limit
                 for c_i in range(limit):
                     word = src.attr_at(c_i)
                     rb = raw_width_bits(word)
                     is_cur = r_i == cur_abs_idx and c_i == cur_col
+                    is_dummy = is_last and c_i >= row_limit
                     if rb == int(WidthRole.SPACER_HEAD):
                         if is_cur:
-                            cells.append((" ", 0, 1, None, True))
+                            cells.append((" ", 0, 1, None, True, True))
                         continue
                     if rb == int(WidthRole.SPACER_TAIL):
                         if is_cur and cells:
-                            prev_ch, prev_w, prev_cw, prev_ext, _ = cells[-1]
-                            cells[-1] = (prev_ch, prev_w, prev_cw, prev_ext, True)
+                            p_ch, p_w, p_cw, p_ext, _, p_dum = cells[-1]
+                            cells[-1] = (p_ch, p_w, p_cw, p_ext, True, p_dum)
                         continue
                     cw = 2 if rb == int(WidthRole.WIDE) else 1
                     base_word = word & _WIDTH_CLEAR_MASK
                     cells.append(
-                        (src.chars[c_i], base_word, cw, src.ext_at(c_i), is_cur)
+                        (
+                            src.chars[c_i],
+                            base_word,
+                            cw,
+                            src.ext_at(c_i),
+                            is_cur,
+                            is_dummy,
+                        )
                     )
 
             if not cells:
@@ -804,7 +863,7 @@ class Screen:
             cur_out = _Row(cols)
             new_all.append(cur_out)
             out_col = 0
-            for ch, base_w, cw, ce, is_cur in cells:
+            for ch, base_w, cw, ce, is_cur, is_dummy in cells:
                 eff_cw = cw
                 eff_ch = ch
                 if eff_cw == 2 and cols == 1:
@@ -812,9 +871,10 @@ class Screen:
                     eff_cw = 1
 
                 if out_col + eff_cw > cols:
-                    if out_col < cols:
+                    if not is_dummy and out_col < cols:
                         cur_out.write_spacer_head(out_col, 0, None)
-                    cur_out.wrapped = True
+                    if not is_dummy:
+                        cur_out.wrapped = True
                     cur_out = _Row(cols)
                     new_all.append(cur_out)
                     out_col = 0
@@ -824,21 +884,14 @@ class Screen:
                     new_cur_col = out_col
                     cursor_placed = True
 
-                if eff_cw == 2:
+                if is_dummy:
+                    out_col += eff_cw
+                elif eff_cw == 2:
                     cur_out.write_wide(out_col, eff_ch, base_w, ce)
                     out_col += 2
                 else:
                     cur_out.write_narrow(out_col, eff_ch, base_w, ce)
                     out_col += 1
-
-            # Re-trim trailing space added only to track cursor position.
-            while (
-                cur_out.used > 0
-                and cur_out.chars[cur_out.used - 1] == " "
-                and cur_out.attr_at(cur_out.used - 1) == 0
-                and cur_out.ext_at(cur_out.used - 1) is None
-            ):
-                cur_out.used -= 1
 
         if not new_all:
             new_all.append(_Row(cols))

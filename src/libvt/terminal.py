@@ -24,14 +24,17 @@ from libvt._grid import (
 )
 from libvt._ucd import (
     CLUSTER_NONE,
+    GCB_PREPEND,
     WidthRole,
     char_width,
     init_cluster_state,
     sanitize_terminal_text,
     step_cluster,
+    ucd_lookup,
 )
 from libvt.config import (
     DEFAULT_LIMITS,
+    DEFAULT_OSC7_HOSTS,
     DEFAULT_POLICY,
     DEFAULT_PROFILE,
     Limits,
@@ -59,6 +62,7 @@ from libvt.events import (
     SixelGraphic,
     TitleChanged,
     UnhandledSequence,
+    WindowRenamed,
     WorkingDirectoryChanged,
 )
 from libvt.exc import ProtocolError
@@ -491,7 +495,8 @@ class Formatter:
         for r_idx, row in enumerate(snapshot._rows):
             if r_idx > 0:
                 out.append("\r\n" if not snapshot._rows[r_idx - 1].wrapped else "")
-            for c in range(row.used):
+            limit = row.used if row.wrapped else row.text_used
+            for c in range(limit):
                 word = row.attr_at(c)
                 rb = raw_width_bits(word)
                 if rb in (int(WidthRole.SPACER_TAIL), int(WidthRole.SPACER_HEAD)):
@@ -597,6 +602,49 @@ class _TerminalSink:
     def on_apc(self, data: bytes) -> None:
         self._term._handle_apc(data)
 
+    def on_overflow(self, kind: str, limit: int) -> None:
+        self._term._unhandled(kind, f"{kind.upper()} overflow (>{limit} bytes)")
+
+    def on_window_rename(self, data: bytes) -> None:
+        self._term._handle_window_rename(data)
+
+
+def _event_byte_cost(event: Event) -> int:
+    if isinstance(event, Passthrough):
+        return 64 + len(event.data)
+    if isinstance(event, SixelGraphic):
+        return 64 + len(event.data.payload)
+    if isinstance(event, KittyGraphic):
+        return 64 + len(event.command.payload)
+    if isinstance(event, ClipboardWrite):
+        return 64 + len(event.text)
+    return 64
+
+
+def _parse_osc_rgb(spec: bytes) -> tuple[int, int, int] | None:
+    text = spec.decode("ascii", errors="ignore").strip()
+    if text.startswith("#") and len(text) == 7:
+        try:
+            return (int(text[1:3], 16), int(text[3:5], 16), int(text[5:7], 16))
+        except ValueError:
+            return None
+    if text.lower().startswith("rgb:"):
+        parts = text[4:].split("/")
+        if len(parts) != 3:
+            return None
+        vals: list[int] = []
+        for comp in parts:
+            if not (1 <= len(comp) <= 4):
+                return None
+            try:
+                raw = int(comp, 16)
+            except ValueError:
+                return None
+            scale = (1 << (4 * len(comp))) - 1
+            vals.append((raw * 255) // scale)
+        return (vals[0], vals[1], vals[2])
+    return None
+
 
 def _hex_encode(text: str) -> str:
     return text.encode("utf-8").hex()
@@ -631,18 +679,19 @@ class Terminal:
         record_events: bool = False,
         recorder: FlightRecorder | None = None,
         encoding: ParserEncoding = "utf-8",
+        newline_mode: bool = False,
     ) -> None:
         self._profile = profile
         self._policy = policy
         self._limits = limits
         self._encoding: ParserEncoding = encoding
+        self._newline_mode: bool = newline_mode
         self._on_event = on_event
         self._on_pty_write = on_pty_write
         self._record_events = record_events
         self._recorder = recorder
-        self._events: collections.deque[Event] = collections.deque(
-            maxlen=limits.max_events,
-        )
+        self._events: collections.deque[Event] = collections.deque()
+        self._event_bytes: int = 0
         self._screens = ScreenSet(
             rows=rows,
             cols=cols,
@@ -650,7 +699,15 @@ class Terminal:
             keyboard_stack_depth=limits.max_keyboard_stack,
         )
         self._modes = ModeState()
-        self._parser = Parser(encoding=encoding, limits=limits)
+        if newline_mode:
+            self._modes.set_mode(Mode.LNM, enabled=True)
+        self._parser = Parser(
+            encoding=encoding,
+            tmux_window_rename=profile.tmux_window_rename,
+            abort_dispatch_osc=policy.abort_dispatch_osc,
+            limits=limits,
+        )
+        self._passthrough_parser: Parser | None = None
         self._sink = _TerminalSink(self)
         self._sgr_memo: dict[tuple[Style, CsiParams], Style] = {}
         self._style: Style = DEFAULT_STYLE
@@ -667,7 +724,11 @@ class Terminal:
         self._last_printed_pos: tuple[int, int] | None = None
         self._cluster_state: int = CLUSTER_NONE
         self._cluster_len: int = 0
+        self._pending_prepend: str = ""
         self._title: str = ""
+        self._window_name: str = ""
+        self._fg_rgb: tuple[int, int, int] = profile.fg_rgb
+        self._bg_rgb: tuple[int, int, int] = profile.bg_rgb
         self._title_stack: list[str] = []
         self._cwd: str = ""
         self._cwd_uri: str = ""
@@ -765,6 +826,11 @@ class Terminal:
     def title(self) -> str:
         """Return window title set by ``OSC 0`` / ``OSC 2``."""
         return self._title
+
+    @property
+    def window_name(self) -> str:
+        r"""Return ``tmux`` window name set by ``ESC k <name> ESC \``."""
+        return self._window_name
 
     @property
     def cwd(self) -> str:
@@ -892,7 +958,18 @@ class Terminal:
 
     def _emit_event(self, event: Event) -> None:
         if self._record_events:
-            self._events.append(event)
+            max_ev = self._limits.max_events
+            max_bytes = self._limits.max_event_bytes
+            cost = _event_byte_cost(event)
+            if max_ev > 0 and max_bytes > 0:
+                while self._events and (
+                    len(self._events) >= max_ev or self._event_bytes + cost > max_bytes
+                ):
+                    dropped = self._events.popleft()
+                    self._event_bytes -= _event_byte_cost(dropped)
+                if cost <= max_bytes:
+                    self._events.append(event)
+                    self._event_bytes += cost
         if self._on_event is not None:
             self._on_event(event)
 
@@ -909,6 +986,7 @@ class Terminal:
             return ()
         out = tuple(self._events)
         self._events.clear()
+        self._event_bytes = 0
         return out
 
     def drain_replies(self) -> bytes:
@@ -972,6 +1050,7 @@ class Terminal:
         self._last_printed_pos = None
         self._cluster_state = CLUSTER_NONE
         self._cluster_len = 0
+        self._pending_prepend = ""
 
     def _sync_pen_cache(self) -> None:
         self._pen_word = pack_pen_base(self._style)
@@ -1026,6 +1105,8 @@ class Terminal:
         was_sync = self.synchronized
         was_alt = self._screens.active_is_alt
         self._modes = ModeState()
+        if self._newline_mode:
+            self._modes.set_mode(Mode.LNM, enabled=True)
         self._sync_hold_pending = False
         self._held_snapshot = None
         if was_sync:
@@ -1050,12 +1131,16 @@ class Terminal:
             scr.keyboard_stack.reset()
         else:
             self._parser.reset()
+            self._passthrough_parser = None
             self._screens.active_is_alt = False
             self._screens.primary.reset()
             self._screens.alternate.reset()
             self._saved_primary = _SavedCursor()
             self._saved_alt = _SavedCursor()
             self._title = ""
+            self._window_name = ""
+            self._fg_rgb = self._profile.fg_rgb
+            self._bg_rgb = self._profile.bg_rgb
             self._title_stack.clear()
             self._cwd = ""
             self._cwd_uri = ""
@@ -1240,7 +1325,7 @@ class Terminal:
         insert_mode = self._modes.is_set(Mode.IRM)
         _, bottom, left, right = self._effective_margins(scr)
 
-        if text.isascii() and not insert_mode:
+        if text.isascii() and not insert_mode and not self._pending_prepend:
             mode_2027_ascii = self._modes.is_set(Mode.GRAPHEME_CLUSTERING)
             pos = 0
             total = len(text)
@@ -1260,14 +1345,13 @@ class Terminal:
                 avail = max_col - c_col + 1
                 seg = text[pos : pos + avail]
                 seg_len = len(seg)
+                scr.heal_before_edit(scr._cur_row, c_col, c_col + seg_len)
                 scr._rows[scr._cur_row].write_ascii_slice(
                     c_col,
                     seg,
                     self._pen_word,
                     self._cell_ext,
                 )
-                if c_col <= 1:
-                    scr.heal_wrapped_spacer_head(scr._cur_row)
                 pos += seg_len
                 end_col = c_col + seg_len - 1
                 if c_col + seg_len > max_col:
@@ -1296,15 +1380,42 @@ class Terminal:
             return
 
         mode_2027 = self._modes.is_set(Mode.GRAPHEME_CLUSTERING)
+        vs15_narrows = self._profile.vs15_narrows_wide_emoji
+        vs16_wide = self._profile.vs16_always_wide
         max_cluster = self._limits.max_grapheme_codepoints
 
         for ch in text:
             cp = ord(ch)
-            if self._last_printed_pos is not None:
+            if self._pending_prepend:
+                extends, next_state, _ = step_cluster(
+                    self._cluster_state,
+                    cp,
+                    mode_2027=mode_2027,
+                    vs15_narrows=vs15_narrows,
+                    vs16_always_wide=vs16_wide,
+                )
+                if extends:
+                    w_prep = char_width(ch)
+                    if w_prep == 0:
+                        if len(self._pending_prepend) < max_cluster - 1:
+                            self._pending_prepend += ch
+                        self._cluster_state = next_state
+                        continue
+                    ch_full = self._pending_prepend + ch
+                    self._pending_prepend = ""
+                else:
+                    self._pending_prepend = ""
+                    ch_full = ch
+            else:
+                ch_full = ch
+
+            if len(ch_full) == 1 and self._last_printed_pos is not None:
                 extends, next_state, w_override = step_cluster(
                     self._cluster_state,
                     cp,
                     mode_2027=mode_2027,
+                    vs15_narrows=vs15_narrows,
+                    vs16_always_wide=vs16_wide,
                 )
                 if extends:
                     self._cluster_state = next_state
@@ -1364,6 +1475,12 @@ class Terminal:
                                 )
                             continue
 
+                        if (
+                            w_override == 2
+                            and cur_role == int(WidthRole.NARROW)
+                            and pc + 1 < scr.cols
+                        ):
+                            scr.heal_before_edit(pr, pc, pc + 2)
                         row_obj.append_grapheme(
                             pc,
                             ch,
@@ -1410,15 +1527,21 @@ class Terminal:
                                 clear_cluster=False,
                             )
                         continue
-            else:
+            elif len(ch_full) == 1:
                 _, next_state, _ = step_cluster(
                     CLUSTER_NONE,
                     cp,
                     mode_2027=mode_2027,
+                    vs15_narrows=vs15_narrows,
+                    vs16_always_wide=vs16_wide,
                 )
 
             width = char_width(ch)
             if width == 0:
+                if mode_2027 and ((ucd_lookup(cp) >> 2) & 0x0F) == GCB_PREPEND:
+                    self._last_printed_pos = None
+                    self._pending_prepend = ch
+                    self._cluster_state = next_state
                 continue
 
             c_row = scr._cur_row
@@ -1455,8 +1578,11 @@ class Terminal:
                     c_row = scr._cur_row
                     c_col = scr._cur_col
                 else:
-                    ch = "\ufffd"
+                    ch_full = "\ufffd"
                     width = 1
+
+            if not just_wrapped_wide:
+                scr.heal_before_edit(c_row, c_col, c_col + width)
 
             row_obj = scr._rows[c_row]
             if insert_mode:
@@ -1473,7 +1599,7 @@ class Terminal:
             if width == 2 and c_col + 1 <= max_col:
                 row_obj.write_wide(
                     c_col,
-                    ch,
+                    ch_full,
                     self._pen_word,
                     self._cell_ext,
                 )
@@ -1497,7 +1623,7 @@ class Terminal:
             else:
                 row_obj.write_narrow(
                     c_col,
-                    ch,
+                    ch_full,
                     self._pen_word,
                     self._cell_ext,
                 )
@@ -1519,13 +1645,10 @@ class Terminal:
                         clear_cluster=False,
                     )
 
-            if c_col <= 1 and not just_wrapped_wide:
-                scr.heal_wrapped_spacer_head(c_row)
-
-            self._last_printed = ch
+            self._last_printed = ch_full
             self._last_printed_pos = (c_row, placed_col)
             self._cluster_state = next_state
-            self._cluster_len = 1
+            self._cluster_len = len(ch_full)
 
     def _cursor_left(self, scr: Screen, count: int, *, is_backspace: bool) -> None:
         _, top, left, right = (
@@ -1778,6 +1901,7 @@ class Terminal:
         c_row = scr._cur_row
         c_col = scr._cur_col
         if mode == 0:
+            scr.heal_before_edit(c_row, c_col, scr.cols)
             scr._rows[c_row].clear_range(
                 c_col,
                 scr.cols,
@@ -1785,8 +1909,6 @@ class Terminal:
                 bce_e,
                 selective=selective,
             )
-            if c_col <= 1:
-                scr.heal_wrapped_spacer_head(c_row)
             scr._rows[c_row].wrapped = False
             for r in range(c_row + 1, scr.rows):
                 scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e, selective=selective)
@@ -1799,6 +1921,7 @@ class Terminal:
         elif mode == 1:
             for r in range(c_row):
                 scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e, selective=selective)
+            scr.heal_before_edit(c_row, 0, c_col + 1)
             scr._rows[c_row].clear_range(
                 0,
                 c_col + 1,
@@ -1806,9 +1929,6 @@ class Terminal:
                 bce_e,
                 selective=selective,
             )
-            scr.heal_wrapped_spacer_head(c_row)
-            if c_row + 1 < scr.rows:
-                scr.heal_wrapped_spacer_head(c_row + 1)
             if c_row > 0:
                 self._notify_erase(Rect(0, 0, c_row, scr.cols), cause)
             self._notify_erase(Rect(c_row, 0, 1, c_col + 1), cause)
@@ -1840,6 +1960,7 @@ class Terminal:
         c_row = scr._cur_row
         c_col = scr._cur_col
         if mode == 0:
+            scr.heal_before_edit(c_row, c_col, scr.cols)
             scr._rows[c_row].clear_range(
                 c_col,
                 scr.cols,
@@ -1847,11 +1968,10 @@ class Terminal:
                 bce_e,
                 selective=selective,
             )
-            if c_col <= 1:
-                scr.heal_wrapped_spacer_head(c_row)
             scr._rows[c_row].wrapped = False
             self._notify_erase(Rect(c_row, c_col, 1, scr.cols - c_col), cause)
         elif mode == 1:
+            scr.heal_before_edit(c_row, 0, c_col + 1)
             scr._rows[c_row].clear_range(
                 0,
                 c_col + 1,
@@ -1859,11 +1979,11 @@ class Terminal:
                 bce_e,
                 selective=selective,
             )
-            scr.heal_wrapped_spacer_head(c_row)
             if c_col + 1 >= scr.cols:
                 scr._rows[c_row].wrapped = False
             self._notify_erase(Rect(c_row, 0, 1, c_col + 1), cause)
         elif mode == 2:
+            scr.heal_before_edit(c_row, 0, scr.cols)
             scr._rows[c_row].clear_range(
                 0,
                 scr.cols,
@@ -1871,7 +1991,6 @@ class Terminal:
                 bce_e,
                 selective=selective,
             )
-            scr.heal_wrapped_spacer_head(c_row)
             self._notify_erase(Rect(c_row, 0, 1, scr.cols), cause)
         self._set_cursor(scr, c_row, c_col, pending_wrap=False)
 
@@ -2095,9 +2214,8 @@ class Terminal:
             self._before_mutate()
             n = min(scr.cols - c_col, params.get(0, 1))
             bce_w, bce_e = self._bce_pair()
+            scr.heal_before_edit(c_row, c_col, c_col + n)
             scr._rows[c_row].clear_range(c_col, c_col + n, bce_w, bce_e)
-            if c_col <= 1:
-                scr.heal_wrapped_spacer_head(c_row)
             if c_col + n >= scr.cols:
                 scr._rows[c_row].wrapped = False
             self._notify_erase(Rect(c_row, c_col, 1, n), EraseCause.ECH)
@@ -2106,6 +2224,7 @@ class Terminal:
             self._before_mutate()
             n = params.get(0, 1)
             bce_w, bce_e = self._bce_pair()
+            scr.heal_before_edit(c_row, c_col, right + 1)
             scr._rows[c_row].insert_blanks(
                 c_col,
                 n,
@@ -2114,13 +2233,14 @@ class Terminal:
                 bce_word=bce_w,
                 bce_ext=bce_e,
             )
-            if c_col <= 1:
-                scr.heal_wrapped_spacer_head(c_row)
             self._set_cursor(scr, c_row, c_col, pending_wrap=False)
         elif ch_final == "P":  # DCH
             self._before_mutate()
             n = params.get(0, 1)
             bce_w, bce_e = self._bce_pair()
+            scr.heal_before_edit(c_row, c_col, right + 1)
+            if c_col == 0 and left == 0 and c_row > 0:
+                scr._rows[c_row - 1].wrapped = False
             scr._rows[c_row].delete_cells(
                 c_col,
                 n,
@@ -2129,8 +2249,6 @@ class Terminal:
                 bce_word=bce_w,
                 bce_ext=bce_e,
             )
-            if c_col <= 1:
-                scr.heal_wrapped_spacer_head(c_row)
             if right == scr.cols - 1:
                 scr._rows[c_row].wrapped = False
             self._set_cursor(scr, c_row, c_col, pending_wrap=False)
@@ -2313,24 +2431,54 @@ class Terminal:
         else:
             self._unhandled("csi", f"CSI {ch_final}")
 
-    def _update_cwd(self, raw_uri: str) -> None:
-        cleaned = sanitize_terminal_text(raw_uri.strip())
-        if not cleaned:
+    def _handle_window_rename(self, raw: bytes) -> None:
+        try:
+            name = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return
+        self._window_name = name
+        self._emit_event(WindowRenamed(name=name))
+
+    def _update_cwd(self, raw_uri: str, *, from_osc7: bool = True) -> None:
+        cleaned = raw_uri.strip()
+        if not cleaned or "\x00" in cleaned:
             self._cwd = ""
             self._cwd_uri = ""
             self._emit_event(WorkingDirectoryChanged(uri="", path=""))
             return
-        self._cwd_uri = cleaned
-        if cleaned.startswith("file://"):
-            parsed = urllib.parse.urlsplit(cleaned)
-            host = (parsed.hostname or "").lower()
-            path = urllib.parse.unquote(parsed.path)
-            if host in self._policy.osc7_hosts:
-                self._cwd = path
-            self._emit_event(WorkingDirectoryChanged(uri=cleaned, path=path))
+        safe_uri = sanitize_terminal_text(cleaned)
+        self._cwd_uri = safe_uri
+        if not from_osc7 and not cleaned.startswith("file://"):
+            self._cwd = safe_uri
+            self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=safe_uri))
             return
-        self._cwd = cleaned
-        self._emit_event(WorkingDirectoryChanged(uri=cleaned, path=cleaned))
+        parsed = urllib.parse.urlsplit(cleaned)
+        if parsed.scheme.lower() != "file" or not parsed.path.startswith("/"):
+            self._cwd = ""
+            self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=""))
+            return
+        raw_host = urllib.parse.unquote(parsed.hostname or "").lower()
+        allowed_hosts = (
+            self._policy.osc7_hosts
+            if self._policy.osc7_hosts is not None
+            else DEFAULT_OSC7_HOSTS
+        )
+        raw_path = urllib.parse.unquote_to_bytes(parsed.path)
+        if b"\x00" in raw_path:
+            self._cwd = ""
+            self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=""))
+            return
+        decoded_path = os.fsdecode(raw_path)
+        if raw_host in allowed_hosts:
+            self._cwd = decoded_path
+        else:
+            self._cwd = ""
+        self._emit_event(
+            WorkingDirectoryChanged(
+                uri=safe_uri,
+                path=sanitize_terminal_text(decoded_path),
+            ),
+        )
 
     def _handle_osc(self, code: int, data: bytes, terminator: bytes) -> None:
         scr = self._screens.active
@@ -2343,7 +2491,7 @@ class Terminal:
         elif code == 1:
             return
         elif code == 7:
-            self._update_cwd(data.decode("utf-8", errors="replace"))
+            self._update_cwd(data.decode("utf-8", errors="replace"), from_osc7=True)
         elif code == 8:
             text = data.decode("utf-8", errors="replace")
             sep = text.find(";")
@@ -2371,15 +2519,30 @@ class Terminal:
                 if changed:
                     self._emit_event(ProgramStatusChanged(status=status, task_id=""))
             elif len(parts) >= 2 and parts[0] == "9":
-                self._update_cwd(";".join(parts[1:]))
-        elif code in (10, 11) and data == b"?" and self._policy.allow_color_queries:
-            r, g, b = self._profile.fg_rgb if code == 10 else self._profile.bg_rgb
-            reply = (
-                f"\x1b]{code};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}".encode(
-                    "ascii",
-                )
-            )
-            self._emit_reply(reply + out_term)
+                self._update_cwd(";".join(parts[1:]), from_osc7=False)
+        elif code in (10, 11):
+            if data == b"?":
+                if self._policy.allow_color_queries:
+                    r, g, b = self._fg_rgb if code == 10 else self._bg_rgb
+                    reply = (
+                        f"\x1b]{code};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"
+                    ).encode("ascii")
+                    self._emit_reply(reply + out_term)
+                return
+            parsed_rgb = _parse_osc_rgb(data)
+            if parsed_rgb is not None:
+                if code == 10:
+                    self._fg_rgb = parsed_rgb
+                else:
+                    self._bg_rgb = parsed_rgb
+        elif code == 12:
+            return
+        elif code == 110:
+            self._fg_rgb = self._profile.fg_rgb
+        elif code == 111:
+            self._bg_rgb = self._profile.bg_rgb
+        elif code == 112:
+            return
         elif code == 52:
             semi = data.find(b";")
             if semi == -1:
@@ -2432,13 +2595,8 @@ class Terminal:
                     )
         elif code == 7501:
             if data == b"?":
-                has_consumer = (
-                    self._policy.allow_program_status_query
-                    or self._on_event is not None
-                    or self._record_events
-                )
-                if has_consumer:
-                    cap = self._profile.osc_7501_capabilities
+                cap = self._profile.osc_7501_capabilities
+                if self._policy.allow_program_status_query and cap:
                     self._emit_reply(f"\x1b]7501;{cap}".encode("ascii") + out_term)
                 return
             changed, rec = self._status_store.apply_osc_7501(data)
@@ -2530,10 +2688,22 @@ class Terminal:
             if self._record_events or self._on_event is not None:
                 self._emit_event(Passthrough(data=unwrapped))
             if self._policy.allow_passthrough and self._passthrough_depth < 2:
-                inner_parser = Parser(
-                    encoding=self._encoding,
-                    limits=self._limits,
-                )
+                if self._passthrough_depth == 0:
+                    if self._passthrough_parser is None:
+                        self._passthrough_parser = Parser(
+                            encoding=self._encoding,
+                            tmux_window_rename=self._profile.tmux_window_rename,
+                            abort_dispatch_osc=self._policy.abort_dispatch_osc,
+                            limits=self._limits,
+                        )
+                    inner_parser = self._passthrough_parser
+                else:
+                    inner_parser = Parser(
+                        encoding=self._encoding,
+                        tmux_window_rename=self._profile.tmux_window_rename,
+                        abort_dispatch_osc=self._policy.abort_dispatch_osc,
+                        limits=self._limits,
+                    )
                 self._passthrough_depth += 1
                 try:
                     inner_parser.feed_to(unwrapped, self._sink)
@@ -2594,9 +2764,16 @@ def render(
     rows: int = 24,
     cols: int = 80,
     profile: Profile = DEFAULT_PROFILE,
+    newline_mode: bool = False,
 ) -> str:
     """Emulate *data* on a fresh ``(rows, cols)`` terminal and return ``text``."""
-    term = Terminal(rows=rows, cols=cols, scrollback=0, profile=profile)
+    term = Terminal(
+        rows=rows,
+        cols=cols,
+        scrollback=0,
+        profile=profile,
+        newline_mode=newline_mode,
+    )
     if isinstance(data, str):
         term.feed_str(data)
     else:

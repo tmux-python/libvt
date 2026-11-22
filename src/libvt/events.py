@@ -143,6 +143,19 @@ class TitleChanged:
 
 
 @dataclass(frozen=True, slots=True)
+class WindowRenamed:
+    r"""Emitted when ``ESC k <name> ESC \`` updates the ``tmux`` window name.
+
+    Attributes
+    ----------
+    name : str
+        Reported window name string.
+    """
+
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkingDirectoryChanged:
     """Emitted when ``OSC 7`` or ``OSC 9;9`` updates the working directory.
 
@@ -329,6 +342,7 @@ class UnhandledSequence:
 type Event = (
     Bell
     | TitleChanged
+    | WindowRenamed
     | WorkingDirectoryChanged
     | ClipboardWrite
     | PromptMark
@@ -363,5 +377,6 @@ __all__ = [
     "SixelGraphic",
     "TitleChanged",
     "UnhandledSequence",
+    "WindowRenamed",
     "WorkingDirectoryChanged",
 ]
