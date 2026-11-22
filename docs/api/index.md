@@ -57,6 +57,18 @@ Mode-aware `KeyEvent`, `MouseEvent`, `PasteEvent`, and VT sequence `explain`.
 `AsyncTerminalStream`, POSIX `open_pty`, `assert_screen`, and `vt_*` fixtures.
 :::
 
+:::{grid-item-card} `libvt.graphics`
+:link: graphics
+:link-type: doc
+Zero-dependency `SIXEL` and Kitty `APC G` `ImageMeta` and `ImagePlacement`.
+:::
+
+:::{grid-item-card} `libvt.tmux`
+:link: tmux
+:link-type: doc
+`decode_tmux_capture`, `TmuxPaneMetadata`, and `-CC` `%output` unescaping.
+:::
+
 ::::
 
 ## Policy and Guarantees
@@ -99,6 +111,8 @@ events
 status
 input
 codec
+graphics
+tmux
 aio
 testing
 pytest_plugin

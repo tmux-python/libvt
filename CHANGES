@@ -78,6 +78,29 @@ and `vt_pty` fixtures alongside {func}`~libvt.testing.assert_screen`,
 {class}`~libvt.terminal.FlightRecorder` ring buffers. See
 {doc}`topics/sync-and-asyncio` for details.
 
+#### Incremental sync deltas, `tmux` capture reconstruction, and graphics (#13–#18)
+
+{meth}`~libvt.terminal.Terminal.sync_token` and
+{meth}`~libvt.terminal.Terminal.changes_since` emit non-destructive
+multi-consumer {class}`~libvt.terminal.ScreenDelta` updates across both
+`"committed"` (`?2026`-held) and `"working"` views, paired with
+{meth}`~libvt.terminal.ScreenDelta.apply_lines` and
+{meth}`~libvt.terminal.ScreenDelta.apply_rows`.
+
+{func}`~libvt.tmux.decode_tmux_capture`,
+{class}`~libvt.tmux.TmuxPaneMetadata`, and
+{func}`~libvt.tmux.unescape_tmux_control_output` reconstruct live
+{class}`~libvt.terminal.Terminal` and {class}`~libvt.terminal.Snapshot`
+state from `tmux capture-pane` (handling bare `SO`/`SI` ACS borders,
+`GRID_FLAG_TAB` tabstops, `-F` / `-J` soft wraps, phantom-column
+`pending_wrap`, and `-a` saved primary screens).
+{mod}`libvt.graphics` tracks zero-dependency `SIXEL` and Kitty `APC G`
+image metadata ({class}`~libvt.graphics.ImageMeta`) and grid placements
+({class}`~libvt.graphics.ImagePlacement`) across scroll regions and
+profile-specific erase policies. {exc}`~libvt.exc.TerminalTimeoutError`
+attaches multi-line viewport and flight-recorder diagnostics via PEP 678
+`__notes__` while keeping `str(exc)` single-line.
+
 ### Documentation
 
 - Add Architecture Decision Records `0001`–`0010` documenting clean-room
