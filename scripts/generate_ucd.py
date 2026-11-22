@@ -233,12 +233,80 @@ def build_tables(ucd_dir: pathlib.Path) -> tuple[bytes, bytes]:
     return stage1_bytes, stage2_bytes
 
 
+def _format_bmp_escape(cp: int) -> str:
+    if cp == ord('"'):
+        return r"\x22"
+    if cp in (ord("\\"), ord("-"), ord("]"), ord("^")):
+        return "\\" + chr(cp)
+    if 0x20 <= cp <= 0x7E:
+        return chr(cp)
+    if cp <= 0xFF:
+        return f"\\x{cp:02x}"
+    return f"\\u{cp:04x}"
+
+
+def build_safe_narrow_bmp_pattern(stage1: bytes, stage2: bytes) -> str:
+    """Build character-class regex pattern for bulk-sliceable narrow BMP runs."""
+    safe_cps: list[int] = []
+    for cp in range(0x0020, 0x10000):
+        if 0x007F <= cp <= 0x009F or 0xD800 <= cp <= 0xDFFF:
+            continue
+        b_idx = int.from_bytes(stage1[(cp >> 8) * 2 : (cp >> 8) * 2 + 2], "little")
+        off = ((b_idx << 8) | (cp & 0xFF)) * 2
+        entry = int.from_bytes(stage2[off : off + 2], "little")
+        width = entry & 0b11
+        gcb = (entry >> 2) & 0x0F
+        incb = (entry >> 6) & 0x03
+        ext_pict = bool(entry & (1 << 8))
+        emoji_mod = bool(entry & (1 << 9))
+        vs_base = bool(entry & (1 << 10))
+        bidi_spoof = bool(entry & (1 << 11))
+        if (
+            width == 1
+            and gcb == 0
+            and incb == 0
+            and not ext_pict
+            and not emoji_mod
+            and not bidi_spoof
+            and not (cp >= 0x80 and vs_base)
+        ):
+            safe_cps.append(cp)
+
+    parts: list[str] = []
+    idx = 0
+    total = len(safe_cps)
+    while idx < total:
+        start = safe_cps[idx]
+        end = start
+        while idx + 1 < total and safe_cps[idx + 1] == end + 1:
+            idx += 1
+            end = safe_cps[idx]
+        if start == end:
+            parts.append(_format_bmp_escape(start))
+        elif end == start + 1:
+            parts.append(_format_bmp_escape(start) + _format_bmp_escape(end))
+        else:
+            parts.append(f"{_format_bmp_escape(start)}-{_format_bmp_escape(end)}")
+        idx += 1
+    return "[" + "".join(parts) + "]+"
+
+
 def render_module(stage1: bytes, stage2: bytes) -> str:
     """Format ``src/libvt/_ucd.py`` source text."""
     blob = len(stage1).to_bytes(4, "little") + stage1 + stage2
     compressed = base64.b85encode(zlib.compress(blob, level=9)).decode("ascii")
     lines = [compressed[i : i + 76] for i in range(0, len(compressed), 76)]
     b85_literal = "\n".join(f'    "{ln}"' for ln in lines)
+    bmp_pat = build_safe_narrow_bmp_pattern(stage1, stage2)
+    pat_chunks: list[str] = []
+    p_idx = 0
+    while p_idx < len(bmp_pat):
+        end_p = min(len(bmp_pat), p_idx + 72)
+        while end_p < len(bmp_pat) and bmp_pat[end_p - 1] == "\\":
+            end_p -= 1
+        pat_chunks.append(bmp_pat[p_idx:end_p])
+        p_idx = end_p
+    bmp_pat_literal = "\n".join(f'    r"{chunk}"' for chunk in pat_chunks)
 
     return f'''"""Generated two-stage Unicode {UNICODE_VERSION} width and UAX #29 table.
 
@@ -259,6 +327,7 @@ from __future__ import annotations
 import array
 import base64
 import enum
+import re
 import sys
 import typing as t
 import zlib
@@ -305,6 +374,10 @@ CLUSTER_NONE = 0
 _ACTIVE_BIT = 1
 
 UNICODE_VERSION = "{UNICODE_VERSION}"
+
+SAFE_NARROW_BMP_RE: t.Final[re.Pattern[str]] = re.compile(
+{bmp_pat_literal}
+)
 
 _PACKED_B85 = (
 {b85_literal}
@@ -596,6 +669,7 @@ def sanitize_terminal_text(text: str) -> str:
 __all__ = [
     "BIDI_SPOOF_BIT",
     "CLUSTER_NONE",
+    "SAFE_NARROW_BMP_RE",
     "UNICODE_VERSION",
     "WidthRole",
     "char_width",
