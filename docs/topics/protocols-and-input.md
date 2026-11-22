@@ -21,9 +21,10 @@ fallback):
 ('ci/approve', 'pytest')
 ```
 
-`OSC 7501 ; ?` capability queries stay silent unless `on_event`,
-`record_events=True`, or `Policy(allow_program_status_query=True)`
-indicates an active status consumer.
+`OSC 7501 ; ?` capability queries answer whenever
+`Policy.allow_program_status_query` is `True` (the default) and
+`Profile.osc_7501_capabilities` is non-empty, independent of whether
+`on_event` or `record_events=True` is attached.
 
 ## Semantic prompts (`OSC 133`) and queries
 

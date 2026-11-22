@@ -42,17 +42,18 @@ empirical testing:
      pairs, flushing `drain_replies()` automatically and enforcing
      `sync_timeout` via `Terminal.expire_synchronized_output(sync_gen)` in both
      background-task (`async with`) and on-demand `wait_for()` modes.
-   - `open_pty(argv, *, rows=24, cols=80, env=None, cwd=None, tty_mode="cooked")`
+   - `open_pty(argv, *, rows=24, cols=80, env=None, cwd=None, tty_mode="cooked", python_executable=None)`
      spawns a child process attached to a stdlib `pty.openpty()` master/slave
      pair via an isolated `-I -S` child trampoline (`start_new_session=True`,
-     `TIOCSCTTY` controlling terminal acquisition, `SIGPIPE` reset to
-     `SIG_DFL`, and `CLOEXEC` `err_fd` exec-failure propagation without
-     `preexec_fn`), configures `TIOCSWINSZ` and optional `"cbreak"` / `"raw"`
-     termios modes, augments default `Policy.osc7_hosts` with the local
-     hostname, pumps output + `drain_replies()`, and exposes `send()`,
-     `send_key()`, `paste()`, `resize()`, and `wait_for()`. On Windows
-     (`sys.platform == "win32"`), `open_pty()` raises `NotImplementedError`
-     cleanly while the entire Sans-I/O core works unchanged.
+     strict `TIOCSCTTY` controlling terminal acquisition, `SIGPIPE`/`SIGXFSZ`
+     reset to `SIG_DFL`, and a pre-exec marker + bounded stage/errno packet on
+     a `CLOEXEC` `err_fd` pipe without `preexec_fn`), configures `TIOCSWINSZ`
+     and optional `"cbreak"` / `"raw"` termios modes, augments unset
+     `Policy.osc7_hosts` with the local hostname, and reaps owned process
+     groups on `aclose()` via `os.killpg` (`SIGHUP` -> `SIGTERM` -> `SIGKILL`)
+     after draining final PTY bytes. On Windows (`sys.platform == "win32"`),
+     `open_pty()` raises `NotImplementedError` cleanly while the entire
+     Sans-I/O core works unchanged.
 3. **Strictly `vt_`-prefixed, `Protocol`-typed `pytest11` plugin
    (`libvt.pytest_plugin`)**:
    - Register `vt_terminal`, `vt_factory` (typed via `TerminalFactory`

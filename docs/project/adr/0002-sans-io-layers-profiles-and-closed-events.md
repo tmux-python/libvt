@@ -57,19 +57,21 @@ security gates (`Policy`), resource bounds (`Limits`), outbound wire replies
 2. **Three immutable configuration objects (`libvt.config`)**:
    - `Profile`: Terminal identity and compatibility behavior (`name`, `da1`,
      `da2`, `xtversion`, `osc_7501_capabilities`, `color_scheme`,
-     `fg_rgb`, `bg_rgb`, `pending_wrap_phantom_col`), with presets
-     `DEFAULT_PROFILE` (`XTERM_PROFILE`) and `TMUX_PROFILE`.
+     `fg_rgb`, `bg_rgb`, `pending_wrap_phantom_col`,
+     `vs15_narrows_wide_emoji`, `vs16_always_wide`, `tmux_window_rename`),
+     with presets `DEFAULT_PROFILE`, `XTERM_PROFILE`, and `TMUX_PROFILE`.
    - `Policy`: Default-deny host security gates (`allow_title_report=False`,
      `allow_checksum_report=False`, `allow_clipboard_read=False`,
      `allow_clipboard_write=True`, `allow_color_queries=True`,
-     `allow_program_status_query=False`, `allow_unsafe_uris=False`,
-     `allow_passthrough=False`, `osc7_hosts=frozenset({"", "localhost"})`,
-     `strict=False`).
+     `allow_program_status_query=True`, `allow_unsafe_uris=False`,
+     `allow_passthrough=False`, `abort_dispatch_osc=False`,
+     `osc7_hosts=None`, `strict=False`) plus `TMUX_CAPTURE_POLICY`.
    - `Limits`: Hard memory and CPU bounds (`max_grapheme_codepoints=32`,
-     `max_csi_params=32`, `max_osc_bytes=131_072`, `max_dcs_bytes=4_194_304`,
+     `max_csi_params=32`, `max_osc_bytes=131_072`, `max_dcs_bytes=8_388_608`,
      `max_apc_bytes=4_194_304`, `max_reply_bytes=65_536`,
      `max_rep_count=4_096`, `max_prompt_zones=1_024`,
-     `max_status_records=64`, `max_events=4_096`, `max_keyboard_stack=8`).
+     `max_status_records=256`, `max_events=4_096`,
+     `max_event_bytes=16_777_216`, `max_keyboard_stack=8`).
 3. **Zero-allocation hot path with private `_TerminalSink`**:
    - `Terminal.feed(data, /) -> None` mutates terminal state in place through
      an internal `_TerminalSink` passed to `Parser.feed_to()`. Public
@@ -78,10 +80,11 @@ security gates (`Policy`), resource bounds (`Limits`), outbound wire replies
      `bytearray` drained via `term.drain_replies() -> bytes` (or forwarded via
      `on_pty_write` when attached).
 4. **Closed algebraic `Event` union (`libvt.events`)**:
-   - `type Event = Bell | TitleChanged | WorkingDirectoryChanged |
-     ClipboardWrite | PromptMark | ProgramStatusChanged | RenderHoldChanged |
-     ColorSchemeQueried | InBandResize | SixelGraphic | KittyGraphic |
-     ScreenErased | Passthrough | UnhandledSequence`.
+   - `type Event = Bell | TitleChanged | WindowRenamed |
+     WorkingDirectoryChanged | ClipboardWrite | PromptMark |
+     ProgramStatusChanged | RenderHoldChanged | ColorSchemeQueried |
+     InBandResize | SixelGraphic | KittyGraphic | ScreenErased |
+     Passthrough | UnhandledSequence`.
    - Callers either pass `on_event: Callable[[Event], None]` (push) or set
      `record_events: bool = True` and call `term.drain_events() ->
      tuple[Event, ...]` (pull). When neither is enabled, `feed()` allocates

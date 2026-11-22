@@ -49,17 +49,18 @@ capability query:
        Unicode BiDi overrides.
    - `state=clear` removes `id` and all `id/*` descendants (when `id == ""`,
      clears the entire store). Total active records stay bounded by
-     `Limits.max_status_records` (`64`).
+     `Limits.max_status_records` (`256`).
    - Expose `term.program_status` (most urgent active `ProgramStatus` ordered
      `blocked > error > working > done > idle`, or root record) and
      `term.program_statuses -> dict[str, ProgramStatus]`.
-   - **Consumer-gated `OSC 7501 ; ?` reply**: Reply only when
-     `Policy.allow_program_status_query` is `True` *or* an event consumer
-     (`on_event` or `record_events=True`) is attached (matching `libghostty-vt`
-     `5b0690d`), formatting the capability payload from
+   - **Profile- and policy-gated `OSC 7501 ; ?` reply**: Reply whenever
+     `Policy.allow_program_status_query` is `True` (default `True`) and
+     `Profile.osc_7501_capabilities` is non-empty (independent of `on_event`
+     and `record_events` so pull-mode `term.program_status` inspection never
+     changes wire negotiation), formatting the capability payload from
      `Profile.osc_7501_capabilities` (full `states=...:kinds=...` on
-     `DEFAULT_PROFILE`, bare `?` on `TMUX_PROFILE`) and mirroring the incoming
-     `BEL` (`\x07`) vs `ST` (`\x1b\\`) terminator.
+     `DEFAULT_PROFILE`, bare `?` on `TMUX_PROFILE`, empty on `XTERM_PROFILE`)
+     and mirroring the incoming `BEL` (`\x07`) vs `ST` (`\x1b\\`) terminator.
    - **Lifecycle and `OSC 9;4` fallback**: Map `OSC 9;4;st;prog` into synthetic
      root status until the first native `OSC 7501` arrives (re-enabled on
      `RIS`). On `OSC 133;A` prompt start (ignoring `k=s` secondary continuation
@@ -87,9 +88,10 @@ capability query:
 
 - **Simplified `OSC 7501;value;progress` string split**: Rejected because it is
   wire-incompatible with `tmux`, `Ghostty`, and Rex CLI emitters.
-- **Unconditional `OSC 7501 ; ?` reply when no consumer is listening**:
-  Rejected in favor of `libghostty-vt`'s consumer/policy gate so passive text
-  scrapers do not solicit unused status traffic.
+- **Coupling `OSC 7501 ; ?` replies to `record_events` / `on_event`**:
+  Rejected because attaching an observer must not alter wire capabilities
+  seen by the child process, and pull-mode `term.program_status` callers rely
+  on the built-in `ProgramStatusStore`.
 
 ## Consequences
 
@@ -109,4 +111,4 @@ capability query:
 
 - Untrusted PTY output flooding `OSC 133;A` or `OSC 7501` unique IDs.
   Mitigation: `Limits.max_prompt_zones = 1_024` (`deque` FIFO) and
-  `Limits.max_status_records = 64`.
+  `Limits.max_status_records = 256`.

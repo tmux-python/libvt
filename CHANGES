@@ -46,10 +46,12 @@ escape sequences, and span-coalesced HTML with URI scheme allowlisting.
 {class}`~libvt.status.ProgramStatus` implement the Rex `OSC 7501`
 Program Status specification, including hierarchical task identifiers,
 ancestor `app` inheritance, urgency ranking, base64 `title`/`msg`
-validation, consumer-gated `OSC 7501 ; ?` capability replies, `OSC 9;4`
-fallback, and lifecycle pruning alongside `OSC 133` prompt zones,
-`OSC 7` working directory updates, `OSC 52` clipboard writes, `DA1`/`DA2`,
-`DSR`, `DECRQM`, `DECRQSS`, `XTVERSION`, `XTGETTCAP`, and `?2031`/`?996n`
+validation, profile- and policy-gated `OSC 7501 ; ?` capability replies,
+`OSC 9;4` fallback, and lifecycle pruning alongside `OSC 133` prompt zones,
+`OSC 7` RFC 8089 working directory updates, `OSC 52` clipboard writes,
+`OSC 10`/`11` and `OSC 110`/`111` dynamic colors, `tmux` `ESC k` window
+renames ({class}`~libvt.events.WindowRenamed`), `DA1`/`DA2`, `DSR`,
+`DECRQM`, `DECRQSS`, `XTVERSION`, `XTGETTCAP`, and `?2031`/`?996n`
 color-scheme queries. Configuration splits cleanly across
 {class}`~libvt.config.Profile`, {class}`~libvt.config.Policy`, and
 {class}`~libvt.config.Limits`. See {doc}`topics/protocols-and-input` for
