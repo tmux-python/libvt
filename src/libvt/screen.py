@@ -14,11 +14,13 @@ from libvt._grid import (
     RowLike,
     _CellExt,
     _Row,
+    bump_row_gen,
     raw_width_bits,
     unpack_style,
     unpack_width_role,
 )
 from libvt._ucd import WidthRole
+from libvt.graphics import GraphicsTracker, ImageMeta, ImagePlacement
 from libvt.input import KittyKeyboardStack
 from libvt.style import DEFAULT_STYLE, Hyperlink, Style
 
@@ -431,13 +433,21 @@ class Screen:
     """Mutable 2D character grid with ``FrozenRow`` RLE scrollback and reflow."""
 
     __slots__ = (
+        "_cell_height_px",
         "_cols",
         "_cur_blinking",
         "_cur_col",
         "_cur_row",
         "_cur_shape",
         "_cur_visible",
+        "_evicted_total",
+        "_gfx",
         "_history",
+        "_history_clear_at",
+        "_history_clear_seq",
+        "_max_image_dimension",
+        "_max_images",
+        "_max_placements",
         "_pending_wrap",
         "_rows",
         "_scrolled_total",
@@ -454,6 +464,10 @@ class Screen:
         cols: int = 80,
         scrollback: int = 2_000,
         keyboard_stack_depth: int = 8,
+        cell_height_px: int = 16,
+        max_images: int = 256,
+        max_placements: int = 1_024,
+        max_image_dimension: int = 10_000,
     ) -> None:
         if rows < 1 or cols < 1:
             msg = f"rows and cols must be >= 1, got ({rows}, {cols})"
@@ -464,6 +478,14 @@ class Screen:
             maxlen=max(0, scrollback),
         )
         self._scrolled_total: int = 0
+        self._evicted_total: int = 0
+        self._history_clear_at: int = 0
+        self._history_clear_seq: int = 0
+        self._cell_height_px: int = max(1, cell_height_px)
+        self._max_images: int = max_images
+        self._max_placements: int = max_placements
+        self._max_image_dimension: int = max_image_dimension
+        self._gfx: GraphicsTracker | None = None
         self._cur_row: int = 0
         self._cur_col: int = 0
         self._cur_visible: bool = True
@@ -546,6 +568,39 @@ class Screen:
     def clear_history(self) -> None:
         """Clear all sealed scrollback rows (``ED 3``)."""
         self._history.clear()
+        self._history_clear_at = self._scrolled_total
+        self._history_clear_seq += 1
+        if self._gfx is not None:
+            self._gfx.clear_history(self._scrolled_total)
+
+    def ensure_graphics(self) -> GraphicsTracker:
+        """Return (lazily creating) this screen's :class:`GraphicsTracker`."""
+        if self._gfx is None:
+            self._gfx = GraphicsTracker(
+                max_images=self._max_images,
+                max_placements=self._max_placements,
+                max_image_dimension=self._max_image_dimension,
+            )
+        return self._gfx
+
+    @property
+    def images(self) -> dict[int, ImageMeta]:
+        """Return stored ``SIXEL`` / Kitty :class:`ImageMeta` records."""
+        return self._gfx.images if self._gfx is not None else {}
+
+    @property
+    def placements(self) -> tuple[ImagePlacement, ...]:
+        """Return active + scrollback :class:`ImagePlacement` records."""
+        if self._gfx is None:
+            return ()
+        return self._gfx.snapshot_placements(self._scrolled_total)
+
+    def _append_history(self, frozen: FrozenRow) -> None:
+        maxlen = self._history.maxlen
+        if maxlen is not None and maxlen > 0:
+            if len(self._history) == maxlen:
+                self._evicted_total += 1
+            self._history.append(frozen)
 
     def _clear_row_spacer_head(self, row_obj: _Row) -> bool:
         if not row_obj.has_wide or row_obj.attrs is None:
@@ -570,6 +625,7 @@ class Screen:
                 and row_obj.ext_at(row_obj.used - 1) is None
             ):
                 row_obj.used -= 1
+            bump_row_gen(row_obj)
             return True
         return False
 
@@ -625,8 +681,14 @@ class Screen:
     @t.overload
     def __getitem__(
         self,
-        key: slice | tuple[slice | int, slice | int],
+        key: slice | tuple[int, slice] | tuple[slice, int] | tuple[slice, slice],
     ) -> RegionView: ...
+
+    @t.overload
+    def __getitem__(
+        self,
+        key: tuple[slice | int, slice | int],
+    ) -> Cell | RegionView: ...
 
     def __getitem__(
         self,
@@ -646,6 +708,7 @@ class Screen:
         save_history: bool = True,
         bce_word: int = 0,
         bce_ext: _CellExt | None = None,
+        is_line_op: bool = False,
     ) -> None:
         """Scroll region ``[top..bottom, left..right]`` upward by *count* lines."""
         t_row = self.scroll_region.top if top is None else top
@@ -655,13 +718,18 @@ class Screen:
             return
         shift = min(count, b_row - t_row + 1)
         full_width = left == 0 and r_col == self._cols - 1
+        full_screen = full_width and t_row == 0 and b_row == len(self._rows) - 1
 
         if full_width:
             if t_row > 0:
-                self._rows[t_row - 1].wrapped = False
+                if self._rows[t_row - 1].wrapped:
+                    self._rows[t_row - 1].wrapped = False
+                    bump_row_gen(self._rows[t_row - 1])
                 self._clear_row_spacer_head(self._rows[t_row - 1])
             if b_row < len(self._rows) - 1:
-                self._rows[b_row].wrapped = False
+                if self._rows[b_row].wrapped:
+                    self._rows[b_row].wrapped = False
+                    bump_row_gen(self._rows[b_row])
                 self._clear_row_spacer_head(self._rows[b_row])
             can_save = (
                 save_history
@@ -669,18 +737,63 @@ class Screen:
                 and self._history.maxlen is not None
                 and self._history.maxlen > 0
             )
+            hist_adv = shift if (can_save and not full_screen) else 0
+            if self._gfx is not None and not (full_screen and can_save):
+                self._gfx.on_region_scroll(
+                    top=t_row,
+                    bottom=b_row,
+                    left=left,
+                    right=r_col,
+                    delta_rows=-count,
+                    is_scroll=not is_line_op,
+                    scrolled_total=self._scrolled_total,
+                    cell_height_px=self._cell_height_px,
+                    history_advanced=(count if (can_save and not full_screen) else 0),
+                )
             evicted = self._rows[t_row : t_row + shift]
             if can_save:
                 for row_ev in evicted:
-                    self._history.append(row_ev.freeze())
-            if t_row == 0:
-                self._scrolled_total += shift
+                    self._append_history(row_ev.freeze())
+                extra = count - shift
+                if extra > 0:
+                    maxlen = self._history.maxlen or 0
+                    blank_row = _Row(self._cols)
+                    blank_row.reset_blank(self._cols, bce_word, bce_ext)
+                    blank_frozen = blank_row.freeze()
+                    skip_evict = max(0, extra - maxlen)
+                    if skip_evict > 0:
+                        dropped_existing = min(len(self._history), skip_evict)
+                        for _ in range(dropped_existing):
+                            self._history.popleft()
+                        self._evicted_total += skip_evict
+                    for _ in range(extra - skip_evict):
+                        self._append_history(blank_frozen)
+                self._scrolled_total += count
+                if self._gfx is not None:
+                    self._gfx.reap_evicted_history(
+                        self._scrolled_total - len(self._history),
+                    )
             del self._rows[t_row : t_row + shift]
             for row_ev in evicted:
                 row_ev.reset_blank(self._cols, bce_word, bce_ext)
             self._rows[b_row - shift + 1 : b_row - shift + 1] = evicted
+            if not (full_screen and can_save):
+                stamp_end = len(self._rows) if hist_adv > 0 else (b_row + 1)
+                for idx_s in range(t_row, stamp_end):
+                    bump_row_gen(self._rows[idx_s])
             return
 
+        if self._gfx is not None:
+            self._gfx.on_region_scroll(
+                top=t_row,
+                bottom=b_row,
+                left=left,
+                right=r_col,
+                delta_rows=-count,
+                is_scroll=not is_line_op,
+                scrolled_total=self._scrolled_total,
+                cell_height_px=self._cell_height_px,
+            )
         for dst_r in range(t_row, b_row - shift + 1):
             src_row = self._rows[dst_r + shift]
             dst_row = self._rows[dst_r]
@@ -698,6 +811,7 @@ class Screen:
                 base = word & _WIDTH_CLEAR_MASK
                 dst_row._set_raw(c, src_row.chars[c], base, role, src_row.ext_at(c))
             _sync_partial_scroll_bounds(dst_row, src_row, left, r_col)
+            bump_row_gen(dst_row)
 
         for clr_r in range(b_row - shift + 1, b_row + 1):
             self._rows[clr_r].wrapped = False
@@ -716,6 +830,7 @@ class Screen:
         right: int | None = None,
         bce_word: int = 0,
         bce_ext: _CellExt | None = None,
+        is_line_op: bool = False,
     ) -> None:
         """Scroll region ``[top..bottom, left..right]`` downward by *count* lines."""
         t_row = self.scroll_region.top if top is None else top
@@ -726,9 +841,23 @@ class Screen:
         shift = min(count, b_row - t_row + 1)
         full_width = left == 0 and r_col == self._cols - 1
 
+        if self._gfx is not None:
+            self._gfx.on_region_scroll(
+                top=t_row,
+                bottom=b_row,
+                left=left,
+                right=r_col,
+                delta_rows=count,
+                is_scroll=not is_line_op,
+                scrolled_total=self._scrolled_total,
+                cell_height_px=self._cell_height_px,
+            )
+
         if full_width:
             if t_row > 0:
-                self._rows[t_row - 1].wrapped = False
+                if self._rows[t_row - 1].wrapped:
+                    self._rows[t_row - 1].wrapped = False
+                    bump_row_gen(self._rows[t_row - 1])
                 self._clear_row_spacer_head(self._rows[t_row - 1])
             recycled = self._rows[b_row - shift + 1 : b_row + 1]
             del self._rows[b_row - shift + 1 : b_row + 1]
@@ -736,8 +865,12 @@ class Screen:
                 row_ev.reset_blank(self._cols, bce_word, bce_ext)
             self._rows[t_row:t_row] = recycled
             if b_row < len(self._rows) - 1:
-                self._rows[b_row].wrapped = False
+                if self._rows[b_row].wrapped:
+                    self._rows[b_row].wrapped = False
+                    bump_row_gen(self._rows[b_row])
                 self._clear_row_spacer_head(self._rows[b_row])
+            for idx_s in range(t_row, b_row + 1):
+                bump_row_gen(self._rows[idx_s])
             return
 
         for dst_r in range(b_row, t_row + shift - 1, -1):
@@ -757,6 +890,7 @@ class Screen:
                 base = word & _WIDTH_CLEAR_MASK
                 dst_row._set_raw(c, src_row.chars[c], base, role, src_row.ext_at(c))
             _sync_partial_scroll_bounds(dst_row, src_row, left, r_col)
+            bump_row_gen(dst_row)
 
         for clr_r in range(t_row, t_row + shift):
             self._rows[clr_r].wrapped = False
@@ -769,11 +903,21 @@ class Screen:
         self,
         bce_word: int = 0,
         bce_ext: _CellExt | None = None,
+        *,
+        include_cursor_row: bool = True,
     ) -> None:
-        """Push active lines up to last non-blank row into history (``CSI 22 J``)."""
+        """Push active lines up to last non-blank row into history."""
         last_used = -1
         for idx in range(len(self._rows) - 1, -1, -1):
-            if self._rows[idx].used > 0 or idx == self._cur_row:
+            has_img = self._gfx is not None and self._gfx.has_placement_on_row(
+                idx,
+                self._scrolled_total,
+            )
+            if (
+                self._rows[idx].used > 0
+                or (include_cursor_row and idx == self._cur_row)
+                or has_img
+            ):
                 last_used = idx
                 break
         if (
@@ -782,8 +926,14 @@ class Screen:
             and self._history.maxlen > 0
         ):
             for idx in range(last_used + 1):
-                self._history.append(self._rows[idx].freeze())
+                self._append_history(self._rows[idx].freeze())
             self._scrolled_total += last_used + 1
+            if self._gfx is not None:
+                self._gfx.reap_evicted_history(
+                    self._scrolled_total - len(self._history),
+                )
+        elif self._gfx is not None:
+            self._gfx.clear_active_screen(self._scrolled_total, len(self._rows))
         for r in self._rows:
             r.reset_blank(self._cols, bce_word, bce_ext)
 
@@ -921,14 +1071,20 @@ class Screen:
         hist_cut = min(hist_cut, new_cur_abs)
 
         self._history.clear()
+        self._evicted_total = 0
         if self._history.maxlen is not None and self._history.maxlen > 0:
             for r_h in new_all[:hist_cut]:
-                self._history.append(r_h.freeze())
+                self._append_history(r_h.freeze())
+        self._scrolled_total = len(self._history)
 
         viewport = new_all[hist_cut : hist_cut + rows]
         while len(viewport) < rows:
             viewport.append(_Row(cols))
+        for r_v in viewport:
+            bump_row_gen(r_v)
         self._rows = viewport
+        if self._gfx is not None:
+            self._gfx.reset()
         self._cols = cols
         self._cur_row = max(0, min(rows - 1, new_cur_abs - hist_cut))
         self._cur_col = max(0, min(cols - 1, new_cur_col))
@@ -954,6 +1110,7 @@ class Screen:
                 self._cols = cols
 
             cur_rows = len(self._rows)
+            top_drop_no_hist = 0
             if rows < cur_rows:
                 drop_needed = cur_rows - rows
                 # Keep cursor visible by scrolling excess top rows into history first.
@@ -962,14 +1119,31 @@ class Screen:
                 if top_drop > 0:
                     if self._history.maxlen is not None and self._history.maxlen > 0:
                         for r_ev in self._rows[:top_drop]:
-                            self._history.append(r_ev.freeze())
+                            self._append_history(r_ev.freeze())
                         self._scrolled_total += top_drop
+                        if self._gfx is not None:
+                            self._gfx.reap_evicted_history(
+                                self._scrolled_total - len(self._history),
+                            )
+                    else:
+                        top_drop_no_hist = top_drop
                     del self._rows[:top_drop]
                     self._cur_row -= top_drop
                 if len(self._rows) > rows:
                     del self._rows[rows:]
             elif rows > cur_rows:
                 self._rows.extend(_Row(cols) for _ in range(rows - cur_rows))
+
+            if self._gfx is not None:
+                self._gfx.on_non_reflow_resize(
+                    top_drop_without_history=top_drop_no_hist,
+                    new_rows=rows,
+                    new_cols=cols,
+                    scrolled_total=self._scrolled_total,
+                )
+
+            for r_v in self._rows:
+                bump_row_gen(r_v)
 
             self._cur_row = min(self._cur_row, rows - 1)
             self._cur_col = min(self._cur_col, cols - 1)
@@ -1008,6 +1182,8 @@ class Screen:
         self._tabstops = set(range(8, self._cols, 8))
         self._tabstops_sorted = sorted(self._tabstops)
         self.keyboard_stack.reset()
+        if self._gfx is not None:
+            self._gfx.reset()
 
 
 def _sync_partial_scroll_bounds(
@@ -1055,18 +1231,30 @@ class ScreenSet:
         cols: int = 80,
         scrollback: int = 2_000,
         keyboard_stack_depth: int = 8,
+        cell_height_px: int = 16,
+        max_images: int = 256,
+        max_placements: int = 1_024,
+        max_image_dimension: int = 10_000,
     ) -> None:
         self.primary = Screen(
             rows=rows,
             cols=cols,
             scrollback=scrollback,
             keyboard_stack_depth=keyboard_stack_depth,
+            cell_height_px=cell_height_px,
+            max_images=max_images,
+            max_placements=max_placements,
+            max_image_dimension=max_image_dimension,
         )
         self.alternate = Screen(
             rows=rows,
             cols=cols,
             scrollback=0,
             keyboard_stack_depth=keyboard_stack_depth,
+            cell_height_px=cell_height_px,
+            max_images=max_images,
+            max_placements=max_placements,
+            max_image_dimension=max_image_dimension,
         )
         self.active_is_alt: bool = False
 
