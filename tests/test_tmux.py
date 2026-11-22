@@ -32,6 +32,7 @@ def test_control_mode_unescape_and_metadata_format_parsing() -> None:
     assert "#{bracket_paste_flag}" in TMUX_METADATA_FORMAT
     assert "#{mouse_all_flag}" in TMUX_METADATA_FORMAT
     assert "#{pane_private_modes}" in TMUX_METADATA_FORMAT
+    assert "#{synchronized_output_flag}" in TMUX_METADATA_FORMAT
     raw_fmt = (
         "8\t3\t0\t2\t1\t0\t4294967295\t4294967295\t0\t2\t"
         "0\t0\t1\t0\t1\t0\t0\t1\t1\t1004,2004\t"
@@ -140,7 +141,7 @@ def test_capture_decoder_acs_tabs_joined_wraps_and_prompt_zones() -> None:
 @pytest.mark.integration
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux binary not installed")
 def test_live_tmux_capture_pane_roundtrip() -> None:
-    """Live ``tmux capture-pane -F -e -p -N`` reconstructs ACS, wraps, and modes."""
+    """Live ``tmux capture-pane`` reconstructs ACS, wraps, tabs, and modes."""
     sock = f"libvt-test-{zlib.crc32(b'tmux-capture')}"
     try:
         subprocess.run(
@@ -159,7 +160,7 @@ def test_live_tmux_capture_pane_roundtrip() -> None:
                 "sh",
                 "-c",
                 (
-                    "printf '\\033[?2004h\\033(0lqqk\\033(B\\r\\n"
+                    "printf '\\033[?1000h\\033(0lqqk\\033(B\\r\\n"
                     "1234567890WRAP\\r\\n\\t\\033[42mX\\033[0m'; sleep 30"
                 ),
             ],
@@ -183,7 +184,7 @@ def test_live_tmux_capture_pane_roundtrip() -> None:
             capture_output=True,
             text=True,
         ).stdout.rstrip("\n")
-        cap_raw = subprocess.run(
+        flagged_proc = subprocess.run(
             [
                 "tmux",
                 "-L",
@@ -198,12 +199,48 @@ def test_live_tmux_capture_pane_roundtrip() -> None:
                 "-p",
                 "-N",
             ],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
-        ).stdout
-        live_res = decode_tmux_capture(cap_raw, metadata=meta_raw, flagged=True)
-        assert live_res.terminal.modes.is_set(Mode.BRACKETED_PASTE) is True
+        )
+        if flagged_proc.returncode == 0:
+            live_res = decode_tmux_capture(
+                flagged_proc.stdout,
+                metadata=meta_raw,
+                flagged=True,
+            )
+        else:
+            cap_raw = subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    sock,
+                    "capture-pane",
+                    "-S",
+                    "-",
+                    "-E",
+                    "-",
+                    "-e",
+                    "-p",
+                    "-N",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            joined_raw = subprocess.run(
+                ["tmux", "-L", sock, "capture-pane", "-S", "-", "-E", "-", "-p", "-J"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            live_res = decode_tmux_capture(
+                cap_raw,
+                metadata=meta_raw,
+                flagged=False,
+                joined_capture=joined_raw,
+            )
+        assert live_res.terminal.modes.is_set(Mode.MOUSE_VT200) is True
         assert [r.text for r in live_res.snapshot.history] == ["┌──┐"]
         assert (live_res.terminal[0].text, live_res.terminal[0].wrapped) == (
             "1234567890",

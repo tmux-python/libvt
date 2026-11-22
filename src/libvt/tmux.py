@@ -34,7 +34,7 @@ TMUX_METADATA_FORMAT: str = (
     "#{bracket_paste_flag}\t#{mouse_standard_flag}\t#{mouse_button_flag}\t"
     "#{mouse_all_flag}\t#{mouse_sgr_flag}\t#{pane_private_modes}\t"
     "#{pane_tabs}\t#{history_size}\t#{history_limit}\t"
-    "#{pane_synchronized}\t#{pane_output_generation}\t"
+    "#{synchronized_output_flag}\t#{pane_output_generation}\t"
     "#{pane_current_path}\t#{pane_title}"
 )
 
@@ -223,7 +223,8 @@ class TmuxPaneMetadata:
     history_limit : int
         Pane ``history-limit`` (``#{history_limit}``).
     synchronized : bool
-        ``?2026`` synchronized-output hold state (``#{pane_synchronized}``).
+        ``?2026`` synchronized-output hold state
+        (``#{synchronized_output_flag}``).
     output_generation : int | None
         ``#{pane_output_generation}`` counter on ``tmux >= 3.8``, else ``None``.
     cwd : str
