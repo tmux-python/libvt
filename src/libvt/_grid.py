@@ -30,6 +30,22 @@ from libvt.style import (
     UnderlineStyle,
 )
 
+_GLOBAL_ROW_GEN: int = 0
+
+
+def bump_row_gen(row: _Row) -> int:
+    """Stamp *row* with the next strictly monotonic mutation generation."""
+    global _GLOBAL_ROW_GEN
+    _GLOBAL_ROW_GEN += 1
+    row.content_gen = _GLOBAL_ROW_GEN
+    return _GLOBAL_ROW_GEN
+
+
+def current_row_gen() -> int:
+    """Return the latest global row mutation generation without advancing it."""
+    return _GLOBAL_ROW_GEN
+
+
 _COLOR_MASK = (1 << 25) - 1
 _RGB_FLAG = 1 << 24
 _IDX_BASE = 256
@@ -271,11 +287,12 @@ class FrozenRow:
 
 
 class _Row:
-    """Mutableviewport row with lazy 64-bit ``array('Q')`` promotion."""
+    """Mutable viewport row with lazy 64-bit ``array('Q')`` promotion."""
 
     __slots__ = (
         "attrs",
         "chars",
+        "content_gen",
         "ext",
         "has_wide",
         "text_used",
@@ -293,6 +310,7 @@ class _Row:
         self.used: int = 0
         self.text_used: int = 0
         self.wrapped: bool = False
+        self.content_gen: int = 0
 
     def _ensure_attrs(self) -> array.array[int]:
         if self.attrs is None:
@@ -339,6 +357,7 @@ class _Row:
             self.used = cols if bce_word != 0 else 0
         self.text_used = 0
         self.wrapped = False
+        bump_row_gen(self)
 
     def _set_raw(
         self,
@@ -391,15 +410,17 @@ class _Row:
             if col - 1 >= 0:
                 self.chars[col - 1] = " "
                 self.attrs[col - 1] &= _WIDTH_CLEAR_MASK
-        if healed_pair_end != -1 and self.text_used == healed_pair_end:
-            pair_lo = max(0, healed_pair_end - 2)
-            self.text_used = pair_lo
-            if (
-                self.used == healed_pair_end
-                and self.attr_at(healed_pair_end - 1) == 0
-                and self.ext_at(healed_pair_end - 1) is None
-            ):
-                self.used = pair_lo
+        if healed_pair_end != -1:
+            if self.text_used == healed_pair_end:
+                pair_lo = max(0, healed_pair_end - 2)
+                self.text_used = pair_lo
+                if (
+                    self.used == healed_pair_end
+                    and self.attr_at(healed_pair_end - 1) == 0
+                    and self.ext_at(healed_pair_end - 1) is None
+                ):
+                    self.used = pair_lo
+            bump_row_gen(self)
 
     def write_narrow(
         self,
@@ -413,6 +434,7 @@ class _Row:
         self._set_raw(col, ch, pen_word, WidthRole.NARROW, cell_ext)
         self.used = max(self.used, col + 1)
         self.text_used = max(self.text_used, col + 1)
+        bump_row_gen(self)
 
     def write_spacer_head(
         self,
@@ -425,6 +447,7 @@ class _Row:
         self._set_raw(col, "", bce_word, WidthRole.SPACER_HEAD, bce_ext)
         self.used = max(self.used, col + 1)
         self.text_used = max(self.text_used, col + 1)
+        bump_row_gen(self)
 
     def write_ascii_slice(
         self,
@@ -469,6 +492,7 @@ class _Row:
 
         self.used = max(self.used, end)
         self.text_used = max(self.text_used, end)
+        bump_row_gen(self)
 
     def write_wide(
         self,
@@ -484,6 +508,7 @@ class _Row:
         self._set_raw(col + 1, "", pen_word, WidthRole.SPACER_TAIL, cell_ext)
         self.used = max(self.used, col + 2)
         self.text_used = max(self.text_used, col + 2)
+        bump_row_gen(self)
 
     def append_grapheme(
         self,
@@ -534,6 +559,7 @@ class _Row:
                 self.text_used = target + 1
                 if self.used == target + 2 and pen_word == 0 and cell_ext is None:
                     self.used = target + 1
+        bump_row_gen(self)
 
     def clear_range(
         self,
@@ -570,6 +596,7 @@ class _Row:
             if hi >= self.text_used:
                 while self.text_used > lo and not self.is_protected(self.text_used - 1):
                     self.text_used -= 1
+            bump_row_gen(self)
             return
 
         if lo == 0 and hi == cols:
@@ -603,10 +630,11 @@ class _Row:
             if bce_word != 0:
                 self.used = max(self.used, hi)
             elif hi >= self.used:
-                # Clamp used to lo without erasing explicit spaces printed left of lo!
+                # Clamp used to lo without erasing explicit spaces left of lo.
                 self.used = min(self.used, lo)
         if hi >= self.text_used:
             self.text_used = min(self.text_used, lo)
+        bump_row_gen(self)
 
     def insert_blanks(
         self,
@@ -665,7 +693,7 @@ class _Row:
                 else:
                     self.ext.pop(dst, None)
 
-        # 3. If shifting pushed a WIDE head onto right without its tail, clear right!
+        # Clear right when shifting pushes a WIDE head onto right without its tail.
         if (
             self.has_wide
             and attrs is not None
@@ -682,6 +710,7 @@ class _Row:
             self.used = min(right + 1, max(self.used + shift, col + shift))
         if self.text_used <= right + 1 and self.text_used > col:
             self.text_used = min(right + 1, self.text_used + shift)
+        bump_row_gen(self)
 
     def delete_cells(
         self,
@@ -750,6 +779,7 @@ class _Row:
                 self.used = max(col, self.used - shift)
         if self.text_used <= right + 1 and self.text_used > col:
             self.text_used = max(col, self.text_used - shift)
+        bump_row_gen(self)
 
     def resize(self, cols: int) -> None:
         """Resize row in place to *cols* columns (non-reflow path)."""
@@ -782,6 +812,7 @@ class _Row:
                 attrs = array.array("Q", [self.uniform_attr]) * cur
                 attrs.extend([0] * pad)
                 self.attrs = attrs
+        bump_row_gen(self)
 
     def clone(self) -> _Row:
         """Return an independent copy of this row."""
@@ -794,6 +825,7 @@ class _Row:
         dup.used = self.used
         dup.text_used = self.text_used
         dup.wrapped = self.wrapped
+        dup.content_gen = self.content_gen
         return dup
 
     def freeze(self) -> FrozenRow:

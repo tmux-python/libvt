@@ -8,8 +8,11 @@ import typing as t
 from dataclasses import dataclass
 
 type Charset = t.Literal["B", "0", "A"]
+type SixelErasePolicy = t.Literal["cell_mask", "whole_image"]
 
-_TMUX_VERSION_RE = re.compile(r"^\s*(\d+)\.(\d+)[a-z]?\s*$")
+_TMUX_VERSION_RE = re.compile(
+    r"^\s*(?:tmux\s+)?(?:next-)?(\d+)\.(\d+)(?:[a-z]|-rc\d*)?\s*$",
+)
 
 
 class ColorScheme(enum.IntEnum):
@@ -81,6 +84,26 @@ class Profile:
     default_g1_charset : Charset
         Initial ``G1`` character-set designation on startup and ``RIS``
         (``"B"`` US-ASCII by default).
+    decstr_enabled : bool
+        When ``True`` (default), ``DECSTR`` (``CSI ! p``) performs a soft
+        terminal reset; when ``False`` (``TMUX_PROFILE``), ``CSI ! p`` is
+        ignored, matching ``tmux``'s ``input.c``.
+    ed2_scrolls_primary_to_history : bool
+        When ``True`` (``TMUX_PROFILE``), primary-screen ``CSI 2 J`` (and
+        ``CSI J`` with cursor at ``(0, 0)``) scrolls rows up to the last
+        non-empty or image-bearing row into scrollback before clearing with
+        ``BCE``, matching ``tmux``'s ``scroll-on-clear`` default.
+    cell_width_px : int
+        Nominal cell width in pixels used for ``CSI 14 t``, ``CSI 16 t``, and
+        ``SIXEL`` / Kitty cell-grid geometry (default ``8``).
+    cell_height_px : int
+        Nominal cell height in pixels used for ``CSI 14 t``, ``CSI 16 t``, and
+        ``SIXEL`` / Kitty cell-grid geometry (default ``16``).
+    sixel_erase_policy : SixelErasePolicy
+        How text overwrites and cell erases affect ``SIXEL`` placements:
+        ``"cell_mask"`` (default and ``tmux >= 3.9``) clears individual cells;
+        ``"whole_image"`` (``tmux <= 3.8``) deletes any intersected ``SIXEL``
+        placement.
     """
 
     name: str = "libvt"
@@ -103,17 +126,40 @@ class Profile:
     il_dl_resets_col: bool = True
     rep_wraps: bool = True
     default_g1_charset: Charset = "B"
+    decstr_enabled: bool = True
+    ed2_scrolls_primary_to_history: bool = False
+    cell_width_px: int = 8
+    cell_height_px: int = 16
+    sixel_erase_policy: SixelErasePolicy = "cell_mask"
 
     @classmethod
     def tmux(cls, version: tuple[int, int] | str = "3.8a") -> Profile:
-        """Build a version-specific ``tmux`` compatibility :class:`Profile`."""
+        """Build a version-specific ``tmux`` compatibility :class:`Profile`.
+
+        Parameters
+        ----------
+        version : tuple[int, int] | str
+            ``(major, minor)`` tuple or ``tmux -V`` version string such as
+            ``"3.8a"``, ``"tmux 3.8-rc3"``, or ``"next-3.9"``.
+
+        Returns
+        -------
+        Profile
+            Configured ``tmux`` compatibility profile.
+
+        Raises
+        ------
+        ValueError
+            If *version* cannot be parsed as a ``tmux`` version identifier.
+        """
         if isinstance(version, tuple):
             major, minor = version
         else:
             m = _TMUX_VERSION_RE.match(version)
             if m is None:
                 msg = (
-                    f"invalid tmux version {version!r}; expected e.g. '3.8a' or (3, 8)"
+                    f"invalid tmux version {version!r}; expected e.g. "
+                    "'3.8a', 'next-3.9', or (3, 8)"
                 )
                 raise ValueError(msg)
             major, minor = int(m.group(1)), int(m.group(2))
@@ -128,6 +174,19 @@ class Profile:
             hpr_vpr_enabled=False,
             il_dl_resets_col=False,
             rep_wraps=at_least_3_9,
+            decstr_enabled=False,
+            ed2_scrolls_primary_to_history=True,
+            sixel_erase_policy="cell_mask" if at_least_3_9 else "whole_image",
+        )
+
+    @classmethod
+    def linux_console(cls) -> Profile:
+        """Build a Linux virtual-console compatibility :class:`Profile`."""
+        return cls(
+            name="linux",
+            osc_7501_capabilities="",
+            reflow_on_resize=False,
+            default_g1_charset="0",
         )
 
 
@@ -177,6 +236,9 @@ class Policy:
         Raise :exc:`~libvt.exc.ProtocolError` on unrecognized or overflowing
         escape sequences instead of ignoring or recording
         :class:`~libvt.events.UnhandledSequence` (default ``False``).
+    track_graphics : bool
+        Track sans-I/O ``SIXEL`` and Kitty ``APC G`` image metadata and grid
+        placements (default ``True``).
     """
 
     allow_title_report: bool = False
@@ -190,6 +252,7 @@ class Policy:
     abort_dispatch_osc: bool = False
     osc7_hosts: frozenset[str] | None = None
     strict: bool = False
+    track_graphics: bool = True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -229,6 +292,15 @@ class Limits:
         Maximum entries per screen in the Kitty ``CSI u`` keyboard stack.
     max_recorder_bytes : int
         Maximum raw input bytes retained by :class:`~libvt.terminal.FlightRecorder`.
+    max_images : int
+        Maximum stored Kitty / ``SIXEL`` image metadata entries per screen
+        (default ``256``).
+    max_placements : int
+        Maximum active + scrollback image placements retained per screen
+        (default ``1_024``).
+    max_image_dimension : int
+        Maximum pixel width or height accepted for ``SIXEL`` or Kitty images
+        (default ``10_000``).
     """
 
     max_grapheme_codepoints: int = 32
@@ -244,6 +316,9 @@ class Limits:
     max_event_bytes: int = 16_777_216
     max_keyboard_stack: int = 8
     max_recorder_bytes: int = 4_096
+    max_images: int = 256
+    max_placements: int = 1_024
+    max_image_dimension: int = 10_000
 
 
 DEFAULT_PROFILE = Profile()
@@ -254,6 +329,7 @@ XTERM_PROFILE = Profile(
     ed3_clears_scrollback_on_alt=True,
 )
 TMUX_PROFILE = Profile.tmux("3.8a")
+LINUX_CONSOLE_PROFILE = Profile.linux_console()
 DEFAULT_POLICY = Policy()
 TMUX_CAPTURE_POLICY = Policy(allow_passthrough=True)
 DEFAULT_LIMITS = Limits()
@@ -263,6 +339,7 @@ __all__ = [
     "DEFAULT_OSC7_HOSTS",
     "DEFAULT_POLICY",
     "DEFAULT_PROFILE",
+    "LINUX_CONSOLE_PROFILE",
     "TMUX_CAPTURE_POLICY",
     "TMUX_PROFILE",
     "XTERM_PROFILE",
@@ -271,4 +348,5 @@ __all__ = [
     "Limits",
     "Policy",
     "Profile",
+    "SixelErasePolicy",
 ]

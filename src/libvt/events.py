@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import collections.abc
 import enum
+import types
 import typing as t
 from dataclasses import dataclass
 
@@ -112,16 +114,23 @@ class KittyCommand:
         Zero-based cursor row when the command arrived.
     col : int
         Zero-based cursor column when the command arrived.
-    control : dict[str, str]
-        Key-value control header pairs before ``;``.
+    control : collections.abc.Mapping[str, str]
+        Immutable key-value control header pairs before ``;``.
     payload : bytes
         Encoded payload bytes following ``;``.
     """
 
     row: int
     col: int
-    control: dict[str, str]
+    control: collections.abc.Mapping[str, str]
     payload: bytes
+
+    def __post_init__(self) -> None:
+        """Freeze ``control`` inside a :class:`types.MappingProxyType`."""
+        if not isinstance(self.control, types.MappingProxyType):
+            object.__setattr__(
+                self, "control", types.MappingProxyType(dict(self.control))
+            )
 
 
 @dataclass(frozen=True, slots=True)
