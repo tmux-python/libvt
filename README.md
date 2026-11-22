@@ -31,13 +31,21 @@ $ pip install libvt
 
 ## Quickstart
 
-`libvt` performs no network or filesystem I/O and leaves `asyncio`
-unloaded on `import libvt`:
+`Terminal` is sans-I/O, uses zero-based `(row, col)` coordinates
+everywhere, and leaves `asyncio` and `pytest` unloaded on `import libvt`:
 
 ```python
->>> import libvt
->>> libvt.__title__
-'libvt'
+>>> from libvt import AnsiColor, Terminal
+>>> term = Terminal(rows=24, cols=80)
+>>> term.feed(b"\x1b[1;32mOK\x1b[0m \xe6\x97\xa5\xe6\x9c\xac\r\n> \x1b[6n")
+>>> term.text
+'OK 日本\n> '
+>>> (term[0, 0].text, term[0, 0].style.bold, term[0, 0].style.fg)
+('O', True, <AnsiColor.GREEN: 2>)
+>>> term.committed[0:2, 0:2].lines
+('OK', '> ')
+>>> term.drain_replies()
+b'\x1b[2;3R'
 ```
 
 ## License

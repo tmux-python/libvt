@@ -5,3 +5,40 @@
 <!-- KEEP THIS PLACEHOLDER - DO NOT REMOVE OR MODIFY THIS LINE -->
 _Notes on the upcoming release will go here._
 <!-- END PLACEHOLDER - ADD NEW CHANGELOG ENTRIES BELOW THIS LINE -->
+
+### What's new
+
+#### Streaming VT500 parser and SGR style model (#1)
+
+{class}`~libvt.parser.Parser` decodes ECMA-48 and VT500 byte streams across
+arbitrary chunk boundaries, retaining incomplete UTF-8 sequences and split
+escape sequences while clamping oversized parameter lists and string
+payloads. {func}`~libvt.parser.parse_sgr` decodes semicolon and ITU T.416
+colon subparameters into immutable {class}`~libvt.style.Style`,
+{class}`~libvt.style.AnsiColor`, {class}`~libvt.style.IndexedColor`,
+{class}`~libvt.style.RgbColor`, and {class}`~libvt.style.UnderlineStyle`
+values. See {ref}`architecture` for details.
+
+#### Zero-based screen grid, synchronized frames, and sans-I/O terminal (#1)
+
+{class}`~libvt.terminal.Terminal`, {class}`~libvt.screen.Screen`, and
+{class}`~libvt.terminal.Snapshot` expose zero-based `(row, col)` cursor
+coordinates and 2D indexing returning lazy {class}`~libvt.screen.Cell`,
+{class}`~libvt.screen.RowView`, and {class}`~libvt.screen.RegionView`
+views, backed by primary scrollback and alternate-screen switching.
+{attr}`~libvt.terminal.Terminal.committed` and
+{meth}`~libvt.terminal.Terminal.feed_until` hold mid-frame updates during
+DEC mode `?2026` synchronized output, while {class}`~libvt.terminal.Effects`
+and {meth}`~libvt.terminal.Terminal.drain_replies` handle `OSC 8`
+hyperlinks, `OSC 133` prompt zones, `OSC 7501` program status, `SIXEL` /
+Kitty graphics callbacks, and bounded `DA1` / `DA2` / `DSR` / `DECRQM`
+replies without performing I/O. See {ref}`sync-and-asyncio` for details.
+
+#### Asyncio stream adapter and pytest assertions (#1)
+
+{class}`~libvt.aio.AsyncTerminalStream` drives a
+{class}`~libvt.terminal.Terminal` from `asyncio` streams, coalescing `?2026`
+batches up to `sync_timeout` and flushing query replies back to the writer.
+{mod}`libvt.pytest_plugin` registers `vt_terminal`, `vt_factory`, and
+`vt_parser` fixtures with lazy in-fixture imports, paired with boxed screen
+diffs in {func}`~libvt.testing.assert_screen`.
