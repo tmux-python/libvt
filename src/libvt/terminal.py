@@ -9,6 +9,7 @@ import collections.abc
 import enum
 import html
 import os
+import re
 import typing as t
 import urllib.parse
 from dataclasses import dataclass
@@ -140,6 +141,13 @@ _DEC_SPECIAL_GRAPHICS = str.maketrans(
 _UK_CHARSET = str.maketrans({"#": "£"})
 
 _SAFE_URI_PREFIXES = ("https://", "http://", "mailto:")
+_PRINT_ASCII_RE = re.compile(rb"[\x20-\x7e]+")
+_STR_BODY_UTF8_RE = re.compile(rb"[^\x07\x18\x1a\x1b\x7f]+")
+_STR_BODY_LATIN1_RE = re.compile(rb"[^\x07\x18\x1a\x1b\x7f\x80-\x9f]+")
+# BMP blocks where every codepoint has width 1, GCB_OTHER, and INCB_NONE.
+_SAFE_NARROW_BMP_RE = re.compile(
+    r"[\x20-\x7e\xa0-\xa8\xaa-\xac\xaf-\u02ff\u0391-\u03a1\u03a3-\u03ff\u0400-\u0482\u2500-\u259f]+",
+)
 
 
 class StopOn(enum.IntFlag):
@@ -1315,10 +1323,9 @@ class Terminal:
                 and not self._parser.utf8_pending
                 and not (stop & StopOn.GROUND)
             ):
-                end = idx
-                while end < n and 0x20 <= mv[end] < 0x7F:
-                    end += 1
-                if end > idx:
+                ascii_m = _PRINT_ASCII_RE.match(mv, idx)
+                if ascii_m is not None:
+                    end = ascii_m.end()
                     span = mv[idx:end]
                     if self._recorder is not None:
                         self._recorder.record(span)
@@ -1327,16 +1334,20 @@ class Terminal:
                     self._generation += 1
                     continue
 
-            # Bulk-advance interior payload bytes inside OSC / DCS / APC strings!
+            # Bulk-advance interior payload bytes inside OSC / DCS / APC strings.
             if state in (
                 ParserState.OSC_STRING,
                 ParserState.DCS_PASSTHROUGH,
                 ParserState.SOS_PM_APC_STRING,
             ):
-                end = idx
-                while end < n and mv[end] not in (0x07, 0x18, 0x1A, 0x1B, 0x9C):
-                    end += 1
-                if end > idx:
+                body_re = (
+                    _STR_BODY_LATIN1_RE
+                    if self._encoding == "latin-1"
+                    else _STR_BODY_UTF8_RE
+                )
+                body_m = body_re.match(mv, idx)
+                if body_m is not None:
+                    end = body_m.end()
                     span = mv[idx:end]
                     if self._recorder is not None:
                         self._recorder.record(span)
@@ -1452,8 +1463,14 @@ class Terminal:
         insert_mode = self._modes.is_set(Mode.IRM)
         _, bottom, left, right = self._effective_margins(scr)
 
-        if text.isascii() and not insert_mode and not self._pending_prepend:
-            mode_2027_ascii = self._modes.is_set(Mode.GRAPHEME_CLUSTERING)
+        mode_2027 = self._modes.is_set(Mode.GRAPHEME_CLUSTERING)
+        can_slice = (
+            not insert_mode
+            and not self._pending_prepend
+            and (not mode_2027 or ((self._cluster_state >> 1) & 0x0F) != GCB_PREPEND)
+            and (text.isascii() or _SAFE_NARROW_BMP_RE.fullmatch(text) is not None)
+        )
+        if can_slice:
             pos = 0
             total = len(text)
             while pos < total:
@@ -1501,12 +1518,11 @@ class Terminal:
                 self._last_printed_pos = (scr._cur_row, end_col)
                 self._cluster_state = init_cluster_state(
                     ord(seg[-1]),
-                    mode_2027=mode_2027_ascii,
+                    mode_2027=mode_2027,
                 )
                 self._cluster_len = 1
             return
 
-        mode_2027 = self._modes.is_set(Mode.GRAPHEME_CLUSTERING)
         vs15_narrows = self._profile.vs15_narrows_wide_emoji
         vs16_wide = self._profile.vs16_always_wide
         max_cluster = self._limits.max_grapheme_codepoints

@@ -30,8 +30,15 @@ MAX_INTERMEDIATES = 4
 _PARAM_CLAMP = 65_535
 _MEMO_LIMIT = 256
 _CTRL_RE = re.compile(rb"[\x00-\x1f\x7f]")
+_LATIN1_PRINT_RE = re.compile(rb"[\x20-\x7e\xa0-\xff]+")
 _CSI_FAST_RE = re.compile(rb"([\x3c-\x3f]?)([0-9;:]{0,256})([\x40-\x7e])")
 _C1_CHAR_RE = re.compile(r"[\x80-\x9f]")
+_OSC_STOP_RE = re.compile(rb"[\x07\x18\x1a\x1b]")
+_OSC_STOP_LATIN1_RE = re.compile(rb"[\x07\x18\x1a\x1b\x80-\x9f]")
+_DCS_STOP_RE = re.compile(rb"[\x18\x1a\x1b\x7f]")
+_DCS_STOP_LATIN1_RE = re.compile(rb"[\x18\x1a\x1b\x7f\x80-\x9f]")
+_APC_STOP_RE = re.compile(rb"[\x18\x1a\x1b]")
+_APC_STOP_LATIN1_RE = re.compile(rb"[\x18\x1a\x1b\x80-\x9f]")
 
 type ParserEncoding = t.Literal["utf-8", "latin-1"]
 
@@ -817,10 +824,9 @@ class Parser:
 
             if state == ParserState.GROUND:
                 if latin1:
-                    end = pos
-                    while end < n and (0x20 <= mv[end] <= 0x7E or mv[end] >= 0xA0):
-                        end += 1
-                    if end > pos:
+                    lat_m = _LATIN1_PRINT_RE.match(mv, pos)
+                    if lat_m is not None:
+                        end = lat_m.end()
                         sink.on_print(bytes(mv[pos:end]).decode("latin-1"))
                         pos = end
                         if pos >= n:
@@ -876,22 +882,18 @@ class Parser:
                 continue
 
             if state == ParserState.OSC_STRING:
-                start = pos
-                while pos < n:
-                    b_scan = mv[pos]
-                    if b_scan in (0x07, 0x18, 0x1A, 0x1B) or (
-                        latin1 and 0x80 <= b_scan <= 0x9F
-                    ):
-                        break
-                    pos += 1
-                if pos > start and not self._str_overflow:
-                    chunk_len = pos - start
+                stop_re = _OSC_STOP_LATIN1_RE if latin1 else _OSC_STOP_RE
+                osc_m = stop_re.search(mv, pos)
+                end = osc_m.start() if osc_m is not None else n
+                if end > pos and not self._str_overflow:
+                    chunk_len = end - pos
                     if len(self._str_buf) + chunk_len <= max_osc:
-                        self._str_buf.extend(mv[start:pos])
+                        self._str_buf.extend(mv[pos:end])
                     else:
                         self._str_buf.clear()
                         self._str_overflow = True
                         self._notify_overflow(sink, "osc", max_osc)
+                pos = end
                 if pos >= n:
                     break
                 b = mv[pos]
@@ -913,18 +915,13 @@ class Parser:
                 continue
 
             if state == ParserState.DCS_PASSTHROUGH:
-                start = pos
-                while pos < n:
-                    b_scan = mv[pos]
-                    if b_scan in (0x18, 0x1A, 0x1B, 0x7F) or (
-                        latin1 and 0x80 <= b_scan <= 0x9F
-                    ):
-                        break
-                    pos += 1
-                if pos > start and not self._str_overflow:
-                    chunk_len = pos - start
+                stop_re = _DCS_STOP_LATIN1_RE if latin1 else _DCS_STOP_RE
+                dcs_m = stop_re.search(mv, pos)
+                end = dcs_m.start() if dcs_m is not None else n
+                if end > pos and not self._str_overflow:
+                    chunk_len = end - pos
                     if len(self._str_buf) + chunk_len <= max_dcs:
-                        self._str_buf.extend(mv[start:pos])
+                        self._str_buf.extend(mv[pos:end])
                         if self._tmux_dcs_state == 1 and len(self._str_buf) >= 4:
                             self._tmux_dcs_state = (
                                 2 if self._str_buf[:4] == b"mux;" else -1
@@ -933,6 +930,7 @@ class Parser:
                         self._str_buf.clear()
                         self._str_overflow = True
                         self._notify_overflow(sink, "dcs", max_dcs)
+                pos = end
                 if pos >= n:
                     break
                 b = mv[pos]
@@ -953,28 +951,24 @@ class Parser:
                 continue
 
             if state == ParserState.SOS_PM_APC_STRING:
-                start = pos
-                while pos < n:
-                    b_scan = mv[pos]
-                    if b_scan in (0x18, 0x1A, 0x1B) or (
-                        latin1 and 0x80 <= b_scan <= 0x9F
-                    ):
-                        break
-                    pos += 1
+                stop_re = _APC_STOP_LATIN1_RE if latin1 else _APC_STOP_RE
+                apc_m = stop_re.search(mv, pos)
+                end = apc_m.start() if apc_m is not None else n
                 if (
-                    pos > start
+                    end > pos
                     and self._str_kind in (0x5F, 0x6B)
                     and not self._str_overflow
                 ):
-                    chunk_len = pos - start
+                    chunk_len = end - pos
                     cap = max_apc if self._str_kind == 0x5F else max_osc
                     if len(self._str_buf) + chunk_len <= cap:
-                        self._str_buf.extend(mv[start:pos])
+                        self._str_buf.extend(mv[pos:end])
                     else:
                         self._str_buf.clear()
                         self._str_overflow = True
                         kind_name = "apc" if self._str_kind == 0x5F else "esc"
                         self._notify_overflow(sink, kind_name, cap)
+                pos = end
                 if pos >= n:
                     break
                 b = mv[pos]

@@ -23,14 +23,14 @@ subcommands.
 {class}`~libvt.parser.Parser` decodes incremental UTF-8, colon-delimited
 ITU T.416 SGR subparameters (`4:3`, `38:2::R:G:B`, `58:5:idx`), `G0`–`G3`
 character-set designations (`ESC ( 0` DEC Special Graphics, `SO`/`SI`,
-`SS2`/`SS3`), `CBT`/`CHT`, `DECSCA`/`DECSED`/`DECSEL`, `CSI 22 J`, and
-`DCS tmux;` passthrough framing while isolating UTF-8 `0x9C` and `U+009B`
-bytes from 8-bit `C1` controls (with optional `encoding="latin-1"` 8-bit
-wire mode). SHA-256-pinned Unicode 17.0.0 two-stage tables drive East
-Asian width and DEC `?2027` UAX #29 grapheme clustering across ZWJ
-emoji, Regional Indicator flag pairs, Indic conjuncts, Hangul jamo, and
-`VS15` / `VS16` emoji variation sequences. See {doc}`topics/architecture`
-for details.
+`SS2`/`SS3`), `HPR`/`VPR` (`CSI a` / `CSI e`), `CBT`/`CHT`,
+`DECSCA`/`DECSED`/`DECSEL`, `CSI 3 J` / `CSI 22 J`, and `DCS tmux;`
+passthrough framing while isolating UTF-8 `0x9C` and `U+009B` bytes from
+8-bit `C1` controls (with optional `encoding="latin-1"` 8-bit wire mode).
+SHA-256-pinned Unicode 17.0.0 two-stage tables drive East Asian width and
+DEC `?2027` UAX #29 grapheme clustering across ZWJ emoji, Regional
+Indicator flag pairs, Indic conjuncts, Hangul jamo, and `VS15` / `VS16`
+emoji variation sequences. See {doc}`topics/architecture` for details.
 
 #### Synchronized output stepping, Rex `OSC 7501`, and host queries (#2)
 
@@ -52,8 +52,9 @@ validation, profile- and policy-gated `OSC 7501 ; ?` capability replies,
 `OSC 10`/`11` and `OSC 110`/`111` dynamic colors, `tmux` `ESC k` window
 renames ({class}`~libvt.events.WindowRenamed`), `DA1`/`DA2`, `DSR`,
 `DECRQM`, `DECRQSS`, `XTVERSION`, `XTGETTCAP`, and `?2031`/`?996n`
-color-scheme queries. Configuration splits cleanly across
-{class}`~libvt.config.Profile`, {class}`~libvt.config.Policy`, and
+color-scheme queries. Configuration splits cleanly across {class}`~libvt.config.Profile`
+(including versioned {meth}`~libvt.config.Profile.tmux` phantom-column
+and resize compatibility profiles), {class}`~libvt.config.Policy`, and
 {class}`~libvt.config.Limits`. See {doc}`topics/protocols-and-input` for
 details.
 
@@ -72,8 +73,9 @@ pseudo-terminals (`TIOCSCTTY` and `tty_mode`) without importing `asyncio`
 or `pty` on `import libvt`. The `pytest11` plugin provides
 protocol-typed `vt_terminal`, `vt_factory`, `vt_parser`, `vt_recorder`,
 and `vt_pty` fixtures alongside {func}`~libvt.testing.assert_screen`,
-{func}`~libvt.testing.assert_screen_box`, and
-{class}`~libvt.terminal.FlightRecorder` diagnostics. See
+{func}`~libvt.testing.assert_screen_box`,
+{exc}`~libvt.exc.TerminalTimeoutError` stream diagnostics, and
+{class}`~libvt.terminal.FlightRecorder` ring buffers. See
 {doc}`topics/sync-and-asyncio` for details.
 
 ### Documentation

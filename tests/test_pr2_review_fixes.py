@@ -15,7 +15,7 @@ from libvt.exc import TerminalTimeoutError
 from libvt.modes import Mode
 from libvt.parser import ParserState
 from libvt.style import AnsiColor
-from libvt.terminal import OutputFormat
+from libvt.terminal import OutputFormat, StopOn
 
 
 def test_resize_preserves_pending_wrap_and_wide_glyphs() -> None:
@@ -362,3 +362,41 @@ def test_tmux_phantom_column_il_dl_and_version_factory() -> None:
     tm39 = libvt.Terminal(rows=2, cols=5, profile=Profile.tmux("3.9"))
     tm39.feed(b"1234X\x1b[2b")
     assert tm39.lines == ("1234X", "XX")
+
+
+def test_parser_c_regex_dcs_del_bel_latin1_feed_until_and_narrow_bmp() -> None:
+    """Parser C-regex scans, ``latin-1`` ``feed_until``, and narrow BMP match."""
+    # DCS ignores 0x7F (DEL) while preserving 0x07 (BEL) inside DCS tmux; passthrough.
+    term = libvt.Terminal(
+        rows=2,
+        cols=16,
+        policy=Policy(allow_passthrough=True),
+    )
+    term.feed(b"\x1bPt\x7fmux;\x1b\x1b]2;ok-title\x07\x1b\\")
+    assert term.title == "ok-title"
+
+    # encoding='latin-1' feed_until handles 8-bit C1 0x9B aborting OSC_STRING!
+    lat_t = libvt.Terminal(rows=2, cols=10, encoding="latin-1")
+    step = lat_t.feed_until(
+        b"\x9d2;unterminated\x9b?2026hHI\x9b?2026ltrailing",
+        stop=StopOn.SYNC_END,
+    )
+    assert step.stopped_on == StopOn.SYNC_END
+    assert lat_t[0].text == "HI"
+
+    # Spacing GCB_PREPEND (U+0600) split across feed() before ASCII '1' matches atomic.
+    whole = libvt.Terminal(rows=2, cols=8)
+    whole.feed("\u06001".encode())
+    split = libvt.Terminal(rows=2, cols=8)
+    split.feed("\u0600".encode())
+    split.feed(b"1")
+    assert split[0, 0].text == whole[0, 0].text
+    assert split.cursor == whole.cursor
+
+    # Curated narrow-BMP slice fast path preserves widths, wraps, styles, and REP.
+    bmp = libvt.Terminal(rows=3, cols=8)
+    bmp.feed("\x1b[32mcafé\x1b[2b ─│┌┐".encode())
+    assert bmp[0].text == "cafééé ─"
+    assert bmp[0].wrapped is True
+    assert bmp[1].text == "│┌┐"
+    assert bmp[0, 3].style.fg == AnsiColor.GREEN
