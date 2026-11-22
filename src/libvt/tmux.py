@@ -416,11 +416,12 @@ class _CaptureRowSink:
     def on_execute(self, byte: int) -> None:
         if byte == 0x09:
             cur_col = self._scratch.screen._cur_col
-            nxt = next(
-                (t_col for t_col in self._tabstops if cur_col < t_col < self._cols),
-                self._cols,
+            mod_col = cur_col % self._cols if self._cols > 0 else cur_col
+            nxt_mod = next(
+                (t_col for t_col in self._tabstops if mod_col < t_col < self._cols),
+                max(mod_col, self._cols - 1),
             )
-            span = max(1, min(self._cols - cur_col, nxt - cur_col))
+            span = max(1, nxt_mod - mod_col)
             self._scratch._handle_print(" " * span)
             return
         if byte in (0x0E, 0x0F):
@@ -478,19 +479,66 @@ def _row_trimmed_text_and_cols(row: _Row) -> tuple[str, int]:
     return "".join(row.chars[:t_end]), t_end
 
 
+def _decode_joined_lines(
+    joined_raw: CaptureInput,
+    *,
+    stripped_trailing: int = 0,
+    max_physical_rows: int,
+    cols: int,
+    tabstops: tuple[int, ...],
+    profile: Profile,
+    policy: Policy,
+    limits: Limits,
+) -> list[str]:
+    raw_lines = _split_capture_lines(joined_raw)
+    if (
+        stripped_trailing > 0
+        and isinstance(joined_raw, collections.abc.Sequence)
+        and not isinstance(joined_raw, (str, bytes, bytearray))
+    ):
+        raw_lines.extend([""] * stripped_trailing)
+    if not raw_lines:
+        return []
+    max_span = max(1, min(64, max_physical_rows - len(raw_lines) + 2))
+    wide_cols = max(cols, cols * max_span)
+    scratch = Terminal(
+        rows=1,
+        cols=wide_cols,
+        scrollback=0,
+        profile=profile,
+        policy=policy,
+        limits=limits,
+    )
+    scratch.modes.set_mode(Mode.DECAWM, enabled=False)
+    scratch._g_sets = ["B", "0", "B", "B"]
+    scratch._gl = 0
+    parser = Parser(limits=limits)
+    sink = _CaptureRowSink(scratch, cols, tabstops)
+    out: list[str] = []
+    for ln in raw_lines:
+        row = scratch.screen._rows[0]
+        row.reset_blank(wide_cols)
+        scratch._set_cursor(scratch.screen, 0, 0, pending_wrap=False)
+        parser.reset()
+        parser.feed_to(ln.encode("utf-8", errors="surrogateescape"), sink)
+        txt, _ = _row_trimmed_text_and_cols(row)
+        out.append(txt)
+    return out
+
+
 def _infer_wraps_from_joined(
     plain_rows: list[str],
     row_used_cols: list[int],
-    joined_raw: CaptureInput,
+    joined_lines: list[str],
     cols: int,
-) -> list[bool] | None:
-    joined_lines = _split_capture_lines(joined_raw)
+) -> tuple[list[bool], list[bool]] | None:
     n = len(plain_rows)
     if len(joined_lines) == n:
-        return [False] * n
+        return [False] * n, [False] * n
     if len(joined_lines) > n:
         return None
     wraps = [False] * n
+    spacer_heads = [False] * n
     r_idx = 0
     for j_line in joined_lines:
         if r_idx >= n or not j_line.startswith(plain_rows[r_idx]):
@@ -499,24 +547,23 @@ def _infer_wraps_from_joined(
         while r_idx + 1 < n and pos < len(j_line):
             pad = max(0, cols - row_used_cols[r_idx])
             nxt = plain_rows[r_idx + 1]
-            if (
-                pad > 0
-                and j_line.startswith(" " * pad, pos)
-                and j_line.startswith(nxt, pos + pad)
-            ):
-                wraps[r_idx] = True
-                pos += pad + len(nxt)
-                r_idx += 1
-            elif j_line.startswith(nxt, pos):
-                wraps[r_idx] = True
-                pos += len(nxt)
-                r_idx += 1
-            else:
+            matched_k = -1
+            for k in range(pad, -1, -1):
+                if (k == 0 or j_line.startswith(" " * k, pos)) and j_line.startswith(
+                    nxt, pos + k
+                ):
+                    matched_k = k
+                    break
+            if matched_k < 0:
                 break
+            wraps[r_idx] = True
+            spacer_heads[r_idx] = (pad - matched_k) == 1
+            pos += matched_k + len(nxt)
+            r_idx += 1
         if pos != len(j_line):
             return None
         r_idx += 1
-    return wraps if r_idx == n else None
+    return (wraps, spacer_heads) if r_idx == n else None
 
 
 def _trim_unwrapped_row(row: _Row) -> None:
@@ -540,6 +587,7 @@ def _populate_screen_from_lines(
     tabstops: tuple[int, ...],
     flagged: bool,
     joined_capture: CaptureInput | None,
+    stripped_trailing: int = 0,
     profile: Profile,
     policy: Policy,
     limits: Limits,
@@ -581,6 +629,7 @@ def _populate_screen_from_lines(
         decoded_rows.append(scratch_row.clone())
 
     row_wraps: list[bool]
+    inferred_spacers: list[bool] | None = None
     exact_wraps = flagged
     if flagged:
         row_wraps = [bool(fl & TmuxLineFlags.WRAPPED) for fl in flags_list]
@@ -588,12 +637,22 @@ def _populate_screen_from_lines(
         trimmed_pairs = [_row_trimmed_text_and_cols(r) for r in decoded_rows]
         plain_texts = [pair[0] for pair in trimmed_pairs]
         used_cols = [pair[1] for pair in trimmed_pairs]
+        decoded_joined = _decode_joined_lines(
+            joined_capture,
+            stripped_trailing=stripped_trailing,
+            max_physical_rows=len(decoded_rows),
+            cols=cols,
+            tabstops=tabstops,
+            profile=profile,
+            policy=policy,
+            limits=limits,
+        )
         inferred = _infer_wraps_from_joined(
-            plain_texts, used_cols, joined_capture, cols
+            plain_texts, used_cols, decoded_joined, cols
         )
         if inferred is not None:
             exact_wraps = True
-            row_wraps = inferred
+            row_wraps, inferred_spacers = inferred
         else:
             row_wraps = [False] * len(decoded_rows)
     else:
@@ -607,10 +666,22 @@ def _populate_screen_from_lines(
     for i in range(len(decoded_rows) - 1):
         cur_r = decoded_rows[i]
         nxt_r = decoded_rows[i + 1]
-        if cur_r.wrapped and raw_width_bits(nxt_r.attr_at(0)) == int(WidthRole.WIDE):
-            _, trimmed_cols = _row_trimmed_text_and_cols(cur_r)
-            if trimmed_cols == cols - 1:
-                cur_r.write_spacer_head(cols - 1, 0, None)
+        if (
+            cols > 0
+            and cur_r.wrapped
+            and raw_width_bits(nxt_r.attr_at(0)) == int(WidthRole.WIDE)
+        ):
+            if inferred_spacers is not None:
+                is_spacer = inferred_spacers[i]
+            else:
+                _, trimmed_cols = _row_trimmed_text_and_cols(cur_r)
+                is_spacer = trimmed_cols == cols - 1
+            if is_spacer:
+                cur_r.write_spacer_head(
+                    cols - 1,
+                    cur_r.attr_at(cols - 1),
+                    cur_r.ext_at(cols - 1),
+                )
                 cur_r.wrapped = True
 
     total = len(decoded_rows)
@@ -704,7 +775,7 @@ def decode_tmux_capture(
     flagged : bool
         ``True`` when *captured* includes ``capture-pane -F`` line prefixes.
     joined_capture : CaptureInput | None
-        Optional ``capture-pane -S - -E - -p -J`` output used to infer soft
+        Optional ``capture-pane -S - -E - -e -p -J`` output used to infer soft
         wraps on ``tmux < 3.8`` when ``flagged=False``.
     saved_primary_capture : CaptureInput | None
         Optional ``capture-pane -a -q -S - -E - -e -p -N [-F]`` output restoring
@@ -769,6 +840,17 @@ def decode_tmux_capture(
     term._tabstops_from_list(term.screens.alternate, tabstops)
 
     raw_lines = _split_capture_lines(captured)
+    stripped_trailing = 0
+    if (
+        not meta.alternate_on
+        and metadata is not None
+        and not flagged
+        and meta.history_size > 0
+        and len(raw_lines) > meta.history_size
+        and len(raw_lines) < meta.history_size + eff_rows
+    ):
+        stripped_trailing = meta.history_size + eff_rows - len(raw_lines)
+        raw_lines.extend([""] * stripped_trailing)
     if meta.alternate_on:
         if saved_primary_capture is not None:
             prim_lines = _split_capture_lines(saved_primary_capture)
@@ -831,6 +913,7 @@ def decode_tmux_capture(
             tabstops=tabstops,
             flagged=flagged,
             joined_capture=joined_capture,
+            stripped_trailing=stripped_trailing,
             profile=profile,
             policy=policy,
             limits=limits,

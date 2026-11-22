@@ -59,25 +59,51 @@ def test_control_mode_unescape_and_metadata_format_parsing() -> None:
 
 def test_capture_decoder_acs_tabs_joined_wraps_and_prompt_zones() -> None:
     """``decode_tmux_capture`` reconstructs ACS, tabs, ``-J`` wraps, and zones."""
-    cjk_meta = TmuxPaneMetadata(cols=4, rows=5, history_size=2)
+    cjk_meta = TmuxPaneMetadata(cols=4, rows=6, history_size=2)
     cjk_term = libvt.Terminal.from_tmux_capture(
-        ["H0", "H1", "ABCD", "EFGH", "IJ", "abc ", "中文"],
+        [
+            "\x0elqqk\x0f",
+            "\x1b[5:3mH1\x1b[0m",
+            "ABCD",
+            "EFGH",
+            "ab  ",
+            "中文",
+            "abc ",
+            "中文",
+        ],
         metadata=cjk_meta,
-        scrollback=1,
-        joined_capture=["H0", "H1", "ABCDEFGHIJ", "abc中文"],
+        scrollback=2,
+        joined_capture=[
+            "\x0elqqk\x0f",
+            "\x1b[5:3mH1\x1b[0m",
+            "ABCDEFGH",
+            "ab 中文",
+            "abc 中文",
+        ],
     )
-    assert [r.text for r in cjk_term.history] == ["H1"]
-    assert (cjk_term[0].wrapped, cjk_term[1].wrapped, cjk_term[3].wrapped) == (
+    assert [r.text for r in cjk_term.history] == ["┌──┐", "H1"]
+    assert cjk_term.history[1][0].style.overline is True
+    assert cjk_term.history[1][0].style.blink is False
+    assert (cjk_term[0].wrapped, cjk_term[2].wrapped, cjk_term[4].wrapped) == (
         True,
         True,
         True,
     )
-    cjk_term.resize(rows=5, cols=10)
-    assert cjk_term.lines[:3] == ("H1", "ABCDEFGHIJ", "abc中文")
+    cjk_term.resize(rows=6, cols=10)
+    assert cjk_term.lines == ("┌──┐", "H1", "ABCDEFGH", "ab 中文", "abc 中文", "")
+
+    stripped_res = decode_tmux_capture(
+        ["H0", "\tX"],
+        metadata=TmuxPaneMetadata(cols=4, rows=3, history_size=1),
+        joined_capture=["H0", "\tX"],
+    )
+    assert stripped_res.completeness.exact_wraps is True
+    assert [r.text for r in stripped_res.snapshot.history] == ["H0"]
+    assert stripped_res.snapshot.lines == ("   X", "", "")
 
     pz_snap = libvt.Snapshot.from_tmux_capture(
         ["P H0", "P H1", "- V0", "O V1", "- V2", "- V3", "- V4"],
-        metadata=cjk_meta,
+        metadata=TmuxPaneMetadata(cols=4, rows=5, history_size=2),
         scrollback=1,
         flagged=True,
     )
@@ -184,6 +210,50 @@ def test_live_tmux_capture_pane_roundtrip() -> None:
             capture_output=True,
             text=True,
         ).stdout.rstrip("\n")
+        cap_raw = subprocess.run(
+            [
+                "tmux",
+                "-L",
+                sock,
+                "capture-pane",
+                "-S",
+                "-",
+                "-E",
+                "-",
+                "-e",
+                "-p",
+                "-N",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        joined_raw = subprocess.run(
+            [
+                "tmux",
+                "-L",
+                sock,
+                "capture-pane",
+                "-S",
+                "-",
+                "-E",
+                "-",
+                "-e",
+                "-p",
+                "-J",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        candidates = [
+            decode_tmux_capture(
+                cap_raw,
+                metadata=meta_raw,
+                flagged=False,
+                joined_capture=joined_raw,
+            ),
+        ]
         flagged_proc = subprocess.run(
             [
                 "tmux",
@@ -204,53 +274,26 @@ def test_live_tmux_capture_pane_roundtrip() -> None:
             text=True,
         )
         if flagged_proc.returncode == 0:
-            live_res = decode_tmux_capture(
-                flagged_proc.stdout,
-                metadata=meta_raw,
-                flagged=True,
+            candidates.append(
+                decode_tmux_capture(
+                    flagged_proc.stdout,
+                    metadata=meta_raw,
+                    flagged=True,
+                ),
             )
-        else:
-            cap_raw = subprocess.run(
-                [
-                    "tmux",
-                    "-L",
-                    sock,
-                    "capture-pane",
-                    "-S",
-                    "-",
-                    "-E",
-                    "-",
-                    "-e",
-                    "-p",
-                    "-N",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            joined_raw = subprocess.run(
-                ["tmux", "-L", sock, "capture-pane", "-S", "-", "-E", "-", "-p", "-J"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            live_res = decode_tmux_capture(
-                cap_raw,
-                metadata=meta_raw,
-                flagged=False,
-                joined_capture=joined_raw,
+        for live_res in candidates:
+            assert live_res.completeness.exact_wraps is True
+            assert live_res.terminal.modes.is_set(Mode.MOUSE_VT200) is True
+            assert [r.text for r in live_res.snapshot.history] == ["┌──┐"]
+            assert (live_res.terminal[0].text, live_res.terminal[0].wrapped) == (
+                "1234567890",
+                True,
             )
-        assert live_res.terminal.modes.is_set(Mode.MOUSE_VT200) is True
-        assert [r.text for r in live_res.snapshot.history] == ["┌──┐"]
-        assert (live_res.terminal[0].text, live_res.terminal[0].wrapped) == (
-            "1234567890",
-            True,
-        )
-        assert (live_res.terminal[1].text, live_res.terminal[2].text) == (
-            "WRAP",
-            "        X",
-        )
-        assert live_res.terminal[2, 8].style.bg == AnsiColor.GREEN
+            assert (live_res.terminal[1].text, live_res.terminal[2].text) == (
+                "WRAP",
+                "        X",
+            )
+            assert live_res.terminal[2, 8].style.bg == AnsiColor.GREEN
     finally:
         subprocess.run(
             ["tmux", "-L", sock, "kill-server"],

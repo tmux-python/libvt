@@ -479,7 +479,11 @@ def parse_sgr(
             sub_ul = grp[1] if len(grp) >= 2 else 1
             underline = _UL_MAP.get(sub_ul, UnderlineStyle.SINGLE)
         elif code in (5, 6):
-            blink = True
+            if code == 5 and len(grp) == 2 and grp[1] == 3:
+                # Work around tmux grid_string_cells_code encoding SGR 53 as 5:3m.
+                overline = True
+            else:
+                blink = True
         elif code == 7:
             reverse = True
         elif code == 8:

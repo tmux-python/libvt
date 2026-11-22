@@ -331,7 +331,7 @@ XTERM_PROFILE = Profile(
 TMUX_PROFILE = Profile.tmux("3.8a")
 LINUX_CONSOLE_PROFILE = Profile.linux_console()
 DEFAULT_POLICY = Policy()
-TMUX_CAPTURE_POLICY = Policy(allow_passthrough=True)
+TMUX_CAPTURE_POLICY = Policy(allow_passthrough=False)
 DEFAULT_LIMITS = Limits()
 
 __all__ = [
