@@ -299,7 +299,9 @@ async def test_formatter_vt_bce_roundtrip_html_palette_and_timeout_diagnostics()
     err = exc_info.value
     assert err.parser_state == ParserState.OSC_STRING
     assert b"\x1b]0;stuck" in err.recent_bytes
-    assert "Flight Recorder:" in str(err)
+    assert "\n" not in str(err)
+    assert "Flight Recorder:" in err.format_diagnostics()
+    assert any("Flight Recorder:" in note for note in err.__notes__)
 
 
 def test_tmux_phantom_column_il_dl_and_version_factory() -> None:

@@ -117,6 +117,7 @@ def _make_timeout_error(
     header: str,
     *,
     eof: bool,
+    attach_note: bool = True,
 ) -> TerminalTimeoutError:
     from libvt.testing import format_flight_recorder, format_screen_box
 
@@ -124,13 +125,14 @@ def _make_timeout_error(
     recent = rec.tail(256) if rec is not None else b""
     box = format_screen_box(snap, rows=min(snap.rows, 12), cols=min(snap.cols, 80))
     diag = format_flight_recorder(terminal)
-    full_msg = f"{header}\n{box}\n{diag}"
     return TerminalTimeoutError(
-        full_msg,
+        header,
         parser_state=terminal.parser_state,
         screen_text=snap.text,
         recent_bytes=recent,
         eof=eof,
+        diagnostics=f"{box}\n{diag}",
+        attach_note=attach_note,
     )
 
 
@@ -267,8 +269,33 @@ class AsyncTerminalStream:
         predicate: collections.abc.Callable[[Snapshot], bool] | str,
         *,
         timeout: float = 2.0,
+        attach_note: bool = True,
     ) -> Snapshot:
-        """Wait until *predicate* matches the committed :class:`Snapshot`."""
+        """Wait until *predicate* matches the committed :class:`Snapshot`.
+
+        Parameters
+        ----------
+        predicate : collections.abc.Callable[[Snapshot], bool] | str
+            Callable tested against each committed snapshot, or a substring
+            searched inside ``snapshot.text``.
+        timeout : float
+            Maximum wait duration in seconds before raising
+            :exc:`~libvt.exc.TerminalTimeoutError`.
+        attach_note : bool
+            When ``True`` (default), attach multi-line screen and flight
+            recorder diagnostics via PEP 678 ``__notes__``.
+
+        Returns
+        -------
+        Snapshot
+            First matching :class:`~libvt.terminal.Snapshot`.
+
+        Raises
+        ------
+        TerminalTimeoutError
+            If the stream reaches EOF before matching (``eof=True``) or
+            *timeout* expires (``eof=False``).
+        """
         check = (
             (lambda snap: predicate in snap.text)
             if isinstance(predicate, str)
@@ -276,14 +303,13 @@ class AsyncTerminalStream:
         )
         deadline = time.monotonic() + timeout
         while True:
-            if (
-                self._task is not None
-                and self._task.done()
-                and not self._task.cancelled()
-            ):
-                task_exc = self._task.exception()
-                if task_exc is not None:
-                    raise task_exc
+            if self._task is not None and self._task.done():
+                if self._task.cancelled():
+                    self._task = None
+                else:
+                    task_exc = self._task.exception()
+                    if task_exc is not None:
+                        raise task_exc
             now = time.monotonic()
             if self.terminal.synchronized:
                 self._update_sync_timer(now)
@@ -296,6 +322,7 @@ class AsyncTerminalStream:
                     snap,
                     "stream reached EOF before predicate matched",
                     eof=True,
+                    attach_note=attach_note,
                 )
             remaining = deadline - now
             if remaining <= 0:
@@ -307,13 +334,18 @@ class AsyncTerminalStream:
                     live,
                     f"timed out after {timeout:.2f}s waiting for terminal state",
                     eof=False,
+                    attach_note=attach_note,
                 )
             self._frame_event.clear()
-            wait_slice = (
-                min(remaining, self.sync_timeout)
-                if self.terminal.synchronized
-                else remaining
-            )
+            if self.terminal.synchronized:
+                sync_rem = (
+                    self.sync_timeout
+                    if self._sync_started_at is None
+                    else max(0.0, self._sync_started_at + self.sync_timeout - now)
+                )
+                wait_slice = min(remaining, sync_rem)
+            else:
+                wait_slice = remaining
             if self._task is None:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self.pump_once(), timeout=wait_slice)
@@ -448,8 +480,33 @@ class PtySession:
         predicate: collections.abc.Callable[[Snapshot], bool] | str,
         *,
         timeout: float = 2.0,
+        attach_note: bool = True,
     ) -> Snapshot:
-        """Wait until *predicate* matches the committed :class:`Snapshot`."""
+        """Wait until *predicate* matches the committed :class:`Snapshot`.
+
+        Parameters
+        ----------
+        predicate : collections.abc.Callable[[Snapshot], bool] | str
+            Callable tested against each committed snapshot, or a substring
+            searched inside ``snapshot.text``.
+        timeout : float
+            Maximum wait duration in seconds before raising
+            :exc:`~libvt.exc.TerminalTimeoutError`.
+        attach_note : bool
+            When ``True`` (default), attach multi-line screen and flight
+            recorder diagnostics via PEP 678 ``__notes__``.
+
+        Returns
+        -------
+        Snapshot
+            First matching :class:`~libvt.terminal.Snapshot`.
+
+        Raises
+        ------
+        TerminalTimeoutError
+            If the PTY reaches EOF before matching (``eof=True``) or *timeout*
+            expires (``eof=False``).
+        """
         check = (
             (lambda snap: predicate in snap.text)
             if isinstance(predicate, str)
@@ -475,6 +532,7 @@ class PtySession:
                     snap,
                     "PTY reached EOF before predicate matched",
                     eof=True,
+                    attach_note=attach_note,
                 )
             remaining = deadline - now
             if remaining <= 0:
@@ -486,13 +544,18 @@ class PtySession:
                     live,
                     f"timed out after {timeout:.2f}s waiting for PTY state",
                     eof=False,
+                    attach_note=attach_note,
                 )
             self._frame_event.clear()
-            wait_slice = (
-                min(remaining, self.sync_timeout)
-                if self.terminal.synchronized
-                else remaining
-            )
+            if self.terminal.synchronized:
+                sync_rem = (
+                    self.sync_timeout
+                    if self._sync_started_at is None
+                    else max(0.0, self._sync_started_at + self.sync_timeout - now)
+                )
+                wait_slice = min(remaining, sync_rem)
+            else:
+                wait_slice = remaining
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._frame_event.wait(), timeout=wait_slice)
 
@@ -546,7 +609,50 @@ async def open_pty(
     limits: Limits = DEFAULT_LIMITS,
     sync_timeout: float = 1.0,
 ) -> collections.abc.AsyncGenerator[PtySession]:
-    """Spawn *argv* with a controlling POSIX PTY driven by :class:`Terminal`."""
+    """Spawn *argv* with a controlling POSIX PTY driven by :class:`Terminal`.
+
+    Parameters
+    ----------
+    argv : collections.abc.Sequence[str]
+        Command and arguments executed via ``os.execvp``.
+    rows : int
+        Initial PTY height in rows.
+    cols : int
+        Initial PTY width in columns.
+    scrollback : int
+        Primary-screen scrollback line capacity.
+    env : collections.abc.Mapping[str, str] | None
+        Environment variables passed to the child process (defaults to
+        ``os.environ`` with ``TERM=xterm-256color``).
+    cwd : str | os.PathLike[str] | None
+        Working directory for the child process.
+    tty_mode : TtyMode
+        Initial slave terminal mode (``"cooked"``, ``"cbreak"``, or ``"raw"``).
+    python_executable : str | os.PathLike[str] | None
+        Python interpreter used for the ``TIOCSCTTY`` pre-exec trampoline.
+    profile : Profile
+        Terminal compatibility profile.
+    policy : Policy
+        Host security and query policy.
+    limits : Limits
+        Parser and state resource ceilings.
+    sync_timeout : float
+        Watchdog timeout in seconds before expiring stalled ``?2026`` frames.
+
+    Yields
+    ------
+    PtySession
+        Active session connected to the child process and master PTY fd.
+
+    Raises
+    ------
+    NotImplementedError
+        On platforms lacking POSIX ``pty.openpty()`` (Windows).
+    ValueError
+        If *argv* is empty or *tty_mode* is invalid.
+    OSError
+        If PTY allocation or ``execvp`` fails.
+    """
     if sys.platform == "win32":
         msg = "open_pty requires POSIX pty.openpty()"
         raise NotImplementedError(msg)
