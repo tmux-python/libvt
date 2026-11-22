@@ -19,9 +19,10 @@ what was asked for.
 | `src/libvt/parser.py`, `modes.py`, `style.py`, `config.py` | VT500 byte parser, CSI subparameters, modes, SGR styles, and `Profile` / `Policy` / `Limits` |
 | `src/libvt/_ucd.py`, `_grid.py`, `screen.py`, `terminal.py` | Unicode 17 width/clustering tables, packed viewport & RLE scrollback rows, `Screen` / `ScreenSet`, `Terminal`, `Snapshot`, and `Formatter` |
 | `src/libvt/status.py`, `events.py`, `input.py`, `codec.py` | Rex `OSC 7501` program status store, closed `Event` union, mode-aware input encoders, and cold-path VT sequence explainer |
+| `src/libvt/graphics.py`, `tmux.py` | Zero-dependency `SIXEL` / Kitty `APC G` placement tracker and `tmux capture-pane` / `-CC` decoders |
 | `src/libvt/aio.py`, `__main__.py` | `AsyncTerminalStream`, POSIX `open_pty()`, and `python -m libvt` CLI (`explain`, `render`, `strip`) |
 | `src/libvt/testing.py`, `pytest_plugin.py`, `exc.py` | Boxed `assert_screen`, `FlightRecorder` diagnostics, `vt_*` pytest fixtures, and exceptions |
-| `tests/` | Unit, property fuzz, PTY, CLI, and fixture tests |
+| `tests/` | Functional, property-fuzz, PTY, CLI, and fixture tests organized by module under test |
 | `docs/` | Sphinx/MyST site: `topics/` (concepts), `api/` (autodoc), `project/` (contributing, releasing, ADRs `0001`–`0010`) |
 | `scripts/` | Unicode table generator (`generate_ucd.py`) and VT throughput benchmarks (`bench_vt.py`, `benchmark.py`) |
 | `README.md` | Doctested quickstart — every `>>> ` block is a real test |
