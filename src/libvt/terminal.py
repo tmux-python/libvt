@@ -1948,6 +1948,20 @@ class Terminal:
         *,
         selective: bool,
     ) -> None:
+        if mode == 3 and not selective:
+            self._before_mutate()
+            if (
+                not self._screens.active_is_alt
+                or self._profile.ed3_clears_scrollback_on_alt
+            ):
+                self._screens.primary.clear_history()
+            else:
+                scr.clear_history()
+            return
+
+        if mode not in (0, 1, 2) and not (mode == 22 and not selective):
+            return
+
         self._before_mutate()
         bce_w, bce_e = self._bce_pair()
         cause = EraseCause.DECSED if selective else EraseCause.ED
@@ -1985,11 +1999,9 @@ class Terminal:
             if c_row > 0:
                 self._notify_erase(Rect(0, 0, c_row, scr.cols), cause)
             self._notify_erase(Rect(c_row, 0, 1, c_col + 1), cause)
-        elif mode in (2, 3):
+        elif mode == 2:
             for r in range(scr.rows):
                 scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e, selective=selective)
-            if mode == 3 and not selective:
-                scr.clear_history()
             self._notify_erase(Rect(0, 0, scr.rows, scr.cols), cause)
         elif mode == 22 and not selective:
             if not self._screens.active_is_alt:
@@ -2007,6 +2019,8 @@ class Terminal:
         *,
         selective: bool,
     ) -> None:
+        if mode not in (0, 1, 2):
+            return
         self._before_mutate()
         bce_w, bce_e = self._bce_pair()
         cause = EraseCause.DECSEL if selective else EraseCause.EL

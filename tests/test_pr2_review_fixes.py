@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import libvt
-from libvt.config import XTERM_PROFILE
+from libvt.config import DEFAULT_PROFILE, TMUX_PROFILE, XTERM_PROFILE
+from libvt.events import ScreenErased
 from libvt.modes import Mode
 
 
@@ -117,3 +118,40 @@ def test_sync_2026_chunk_and_observer_invariance_and_cursor_hold() -> None:
     assert (done2.cursor.row, done2.cursor.col) == (1, 2)
     assert done2.cursor.visible is False
     assert done2.title == "Next"
+
+
+def test_ed3_preserves_viewport_and_pending_wrap_and_profile_alt() -> None:
+    """``CSI 3 J`` clears history without wiping viewport cells or ``pending_wrap``."""
+    term = libvt.Terminal(rows=2, cols=4, scrollback=10, record_events=True)
+    term.feed(b"old\r\nnew\r\nABCD")
+    assert [r.text for r in term.history] == ["old"]
+    assert term.lines == ("new", "ABCD")
+    assert term.cursor.pending_wrap is True
+    term.drain_events()
+
+    term.feed(b"\x1b[3J")
+    assert term.history == ()
+    assert term.lines == ("new", "ABCD")
+    assert term.cursor.pending_wrap is True
+    assert [e for e in term.drain_events() if isinstance(e, ScreenErased)] == []
+
+    # DECSED 3 and out-of-range ED 99 are complete no-ops.
+    term.feed(b"\x1b[?3J\x1b[99J")
+    assert term.lines == ("new", "ABCD")
+    assert term.cursor.pending_wrap is True
+
+    term.feed(b"E")
+    assert term.lines == ("ABCD", "E")
+    assert [r.text for r in term.history] == ["new"]
+
+    # Alternate-screen ED 3 respects profile.ed3_clears_scrollback_on_alt.
+    def_term = libvt.Terminal(rows=2, cols=6, scrollback=10, profile=DEFAULT_PROFILE)
+    def_term.feed(b"hist1\r\nhist2\r\nvis\x1b[?1049hALT\x1b[3J")
+    assert def_term[0].text == "ALT"
+    assert [r.text for r in def_term.history] == ["hist1"]
+
+    for prof in (XTERM_PROFILE, TMUX_PROFILE):
+        p_term = libvt.Terminal(rows=2, cols=6, scrollback=10, profile=prof)
+        p_term.feed(b"hist1\r\nhist2\r\nvis\x1b[?1049hALT\x1b[3J")
+        assert p_term[0].text == "ALT"
+        assert p_term.history == ()

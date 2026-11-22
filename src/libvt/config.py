@@ -56,6 +56,10 @@ class Profile:
         Default reflow behavior for :meth:`~libvt.terminal.Terminal.resize`
         when ``reflow=None`` (``True`` on ``DEFAULT_PROFILE`` and
         ``TMUX_PROFILE``, ``False`` on ``XTERM_PROFILE``).
+    ed3_clears_scrollback_on_alt : bool
+        When ``True`` (``XTERM_PROFILE`` and ``TMUX_PROFILE``), ``CSI 3 J``
+        executed while the alternate screen is active still clears primary
+        scrollback history.
     """
 
     name: str = "libvt"
@@ -73,6 +77,7 @@ class Profile:
     vs16_always_wide: bool = False
     tmux_window_rename: bool = False
     reflow_on_resize: bool = True
+    ed3_clears_scrollback_on_alt: bool = False
 
 
 DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
@@ -195,6 +200,7 @@ XTERM_PROFILE = Profile(
     name="xterm",
     osc_7501_capabilities="",
     reflow_on_resize=False,
+    ed3_clears_scrollback_on_alt=True,
 )
 TMUX_PROFILE = Profile(
     name="tmux",
@@ -202,6 +208,7 @@ TMUX_PROFILE = Profile(
     pending_wrap_phantom_col=True,
     vs15_narrows_wide_emoji=False,
     tmux_window_rename=True,
+    ed3_clears_scrollback_on_alt=True,
 )
 DEFAULT_POLICY = Policy()
 TMUX_CAPTURE_POLICY = Policy(allow_passthrough=True)
