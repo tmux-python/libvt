@@ -68,10 +68,11 @@ capability query:
      `blocked`, and `idle` entries while retaining `done` and `error`; survive
      `DECSTR` soft reset and clear all records on `RIS`.
 2. **Monotonic `OSC 133` prompt zones and host queries (`libvt.terminal`)**:
-   - Store `PromptZone(kind: PromptKind, row: int, abs_row: int, col: int,
+   - Store `PromptZone(kind: PromptKind, abs_row: int, col: int,
      exit_code: int | None)` in a `collections.deque` bounded by
-     `Limits.max_prompt_zones` (`1,024`), updating viewport `row` via
-     `abs_row - scr.scrolled_total` so scrolling never desyncs prompt zones.
+     `Limits.max_prompt_zones` (`1,024`), resolving rows on demand via
+     `Snapshot.at_abs(abs_row)` and `Snapshot.viewport_row(abs_row)` so
+     scrolling never invalidates stored prompt coordinates.
    - Support `OSC 7` and `OSC 9;9` (`term.cwd_uri` for any URI, `term.cwd`
      filtered by `Policy.osc7_hosts` without host syscalls, plus
      `WorkingDirectoryChanged`), `OSC 52` write (`ClipboardWrite` when

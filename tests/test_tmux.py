@@ -107,10 +107,17 @@ def test_capture_decoder_acs_tabs_joined_wraps_and_prompt_zones() -> None:
         scrollback=1,
         flagged=True,
     )
-    assert [(z.row, z.kind.value) for z in pz_snap.prompt_zones] == [
-        (-1, "A"),
-        (1, "C"),
+    assert [
+        (z.abs_row, pz_snap.viewport_row(z.abs_row), z.kind.value)
+        for z in pz_snap.prompt_zones
+    ] == [
+        (1, None, "A"),
+        (3, 1, "C"),
     ]
+    assert pz_snap.at_abs(pz_snap.prompt_zones[0].abs_row).text == "H1"
+    assert pz_snap.at_abs(pz_snap.prompt_zones[1].abs_row).text == "V1"
+    with pytest.raises(IndexError):
+        pz_snap.at_abs(0)
 
     meta = TmuxPaneMetadata(
         cols=8,

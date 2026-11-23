@@ -497,7 +497,8 @@ class Snapshot:
     active_is_alt : bool
         ``True`` when the alternate screen buffer is active.
     prompt_zones : tuple[PromptZone, ...]
-        Recorded ``OSC 133`` semantic prompt zones adjusted to this viewport.
+        Recorded primary-screen ``OSC 133`` semantic prompt zones (empty when
+        :attr:`active_is_alt` is ``True``).
     program_status : ProgramStatus | None
         Highest-urgency active ``OSC 7501`` / ``OSC 9;4`` status record.
     program_statuses : collections.abc.Mapping[str, ProgramStatus]
@@ -512,9 +513,11 @@ class Snapshot:
 
     __slots__ = (
         "_cols",
+        "_evicted_total",
         "_frozen",
         "_history",
         "_rows",
+        "_scrolled_total",
         "active_is_alt",
         "cursor",
         "cwd",
@@ -547,11 +550,24 @@ class Snapshot:
         generation: int,
         images: collections.abc.Mapping[int, ImageMeta] | None = None,
         placements: tuple[ImagePlacement, ...] = (),
+        scrolled_total: int | None = None,
+        evicted_total: int | None = None,
     ) -> None:
         object.__setattr__(self, "_frozen", False)
         self._rows = rows
         self._history = history
         self._cols = cols
+        eff_scrolled = (
+            (0 if active_is_alt else len(history))
+            if scrolled_total is None
+            else scrolled_total
+        )
+        self._scrolled_total = eff_scrolled
+        self._evicted_total = (
+            (0 if active_is_alt else max(0, eff_scrolled - len(history)))
+            if evicted_total is None
+            else evicted_total
+        )
         self.cursor = cursor
         self.title = title
         self.cwd = cwd
@@ -623,6 +639,78 @@ class Snapshot:
         return self._cols
 
     @property
+    def scrolled_total(self) -> int:
+        """Return monotonic count of rows scrolled off the active screen's top."""
+        return self._scrolled_total
+
+    @property
+    def evicted_total(self) -> int:
+        """Return count of scrollback rows evicted from the active screen."""
+        return self._evicted_total
+
+    def viewport_row(self, abs_row: int) -> int | None:
+        """Return zero-based viewport row for *abs_row*, or ``None``.
+
+        Parameters
+        ----------
+        abs_row : int
+            Monotonic absolute row coordinate (e.g.
+            :attr:`~libvt.events.PromptZone.abs_row` or
+            :attr:`~libvt.graphics.ImagePlacement.abs_row`).
+
+        Returns
+        -------
+        int | None
+            ``0 <= row < rows`` when *abs_row* is visible in this snapshot's
+            active viewport, else ``None``.
+        """
+        if isinstance(abs_row, bool) or not isinstance(abs_row, int):
+            msg = f"abs_row must be int, got {type(abs_row).__name__}"
+            raise TypeError(msg)
+        rel = abs_row - self._scrolled_total
+        if 0 <= rel < len(self._rows):
+            return rel
+        return None
+
+    def at_abs(self, abs_row: int) -> RowView:
+        """Return :class:`~libvt.screen.RowView` at *abs_row* in history or viewport.
+
+        Parameters
+        ----------
+        abs_row : int
+            Monotonic absolute row coordinate.
+
+        Returns
+        -------
+        RowView
+            Immutable view of the row from scrollback or the active viewport.
+
+        Raises
+        ------
+        IndexError
+            When *abs_row* has been evicted from history or is out of range.
+        """
+        if isinstance(abs_row, bool) or not isinstance(abs_row, int):
+            msg = f"abs_row must be int, got {type(abs_row).__name__}"
+            raise TypeError(msg)
+        if self.active_is_alt:
+            if 0 <= abs_row < len(self._rows):
+                return RowView(self._rows[abs_row])
+            msg = f"abs_row {abs_row} out of range for alternate screen"
+            raise IndexError(msg)
+        first_abs = self._scrolled_total - len(self._history)
+        if abs_row < first_abs:
+            msg = f"abs_row {abs_row} was evicted (earliest retained is {first_abs})"
+            raise IndexError(msg)
+        if abs_row < self._scrolled_total:
+            return RowView(self._history[abs_row - first_abs])
+        rel = abs_row - self._scrolled_total
+        if rel < len(self._rows):
+            return RowView(self._rows[rel])
+        msg = f"abs_row {abs_row} out of range"
+        raise IndexError(msg)
+
+    @property
     def history(self) -> tuple[RowView, ...]:
         """Return immutable :class:`RowView` sequence over scrollback rows."""
         return tuple(RowView(fr) for fr in self._history)
@@ -681,6 +769,8 @@ class Snapshot:
         return {
             "rows": self.rows,
             "cols": self.cols,
+            "scrolled_total": self.scrolled_total,
+            "evicted_total": self.evicted_total,
             "lines": list(self.lines),
             "history_lines": [fr.text for fr in self._history],
             "cursor": {
@@ -719,7 +809,8 @@ class Snapshot:
                     "protocol": p.protocol.value,
                     "image_id": p.image_id,
                     "placement_id": p.placement_id,
-                    "row": p.row,
+                    "abs_row": p.abs_row,
+                    "viewport_row": self.viewport_row(p.abs_row),
                     "col": p.col,
                     "rows": p.rows,
                     "cols": p.cols,
@@ -1324,18 +1415,8 @@ class Terminal:
 
     @property
     def prompt_zones(self) -> tuple[PromptZone, ...]:
-        """Return recorded ``OSC 133`` prompt zones adjusted to current viewport."""
-        scrolled = self._screens.primary.scrolled_total
-        return tuple(
-            PromptZone(
-                kind=z.kind,
-                row=z.abs_row - scrolled,
-                col=z.col,
-                exit_code=z.exit_code,
-                abs_row=z.abs_row,
-            )
-            for z in self._prompt_zones
-        )
+        """Return recorded primary-screen ``OSC 133`` semantic prompt zones."""
+        return tuple(self._prompt_zones)
 
     @property
     def program_status(self) -> ProgramStatus | None:
@@ -1394,6 +1475,7 @@ class Terminal:
         modes = self._modes.enabled_modes()
         if exclude_modes:
             modes = modes - exclude_modes
+        active_alt = self._screens.active_is_alt
         return Snapshot(
             rows=tuple(r.clone() for r in scr._rows),
             history=tuple(self._screens.primary._history),
@@ -1403,13 +1485,15 @@ class Terminal:
             cwd=self._cwd,
             cwd_uri=self._cwd_uri,
             modes=modes,
-            active_is_alt=self._screens.active_is_alt,
-            prompt_zones=self.prompt_zones,
+            active_is_alt=active_alt,
+            prompt_zones=() if active_alt else tuple(self._prompt_zones),
             program_status=self._status_store.most_urgent,
             program_statuses=self._status_store.records,
             generation=self._generation,
             images=scr.images,
             placements=scr.placements,
+            scrolled_total=scr._scrolled_total,
+            evicted_total=scr._evicted_total,
         )
 
     def _live_sync_token(
@@ -1542,26 +1626,37 @@ class Terminal:
 
         hist_cleared = cur_tok.history_clear_seq != token.history_clear_seq
         hist_len = len(cur_snap._history)
+        zero_hist_cap = self._screens.primary._history.maxlen == 0 and hist_len == 0
         if hist_cleared:
-            post_clear = max(0, cur_tok.scrolled_total - cur_tok.history_clear_at)
-            if post_clear > hist_len:
-                return _full(ResyncReason.HISTORY_EVICTED)
-            new_hist = (
-                tuple(RowView(fr) for fr in cur_snap._history[hist_len - post_clear :])
-                if post_clear > 0
-                else ()
-            )
-            evicted_cnt = 0
+            if zero_hist_cap:
+                new_hist = ()
+                evicted_cnt = 0
+            else:
+                post_clear = max(0, cur_tok.scrolled_total - cur_tok.history_clear_at)
+                if post_clear > hist_len:
+                    return _full(ResyncReason.HISTORY_EVICTED)
+                new_hist = (
+                    tuple(
+                        RowView(fr) for fr in cur_snap._history[hist_len - post_clear :]
+                    )
+                    if post_clear > 0
+                    else ()
+                )
+                evicted_cnt = 0
         else:
             added = max(0, cur_tok.scrolled_total - token.scrolled_total)
-            if added > hist_len:
-                return _full(ResyncReason.HISTORY_EVICTED)
-            new_hist = (
-                tuple(RowView(fr) for fr in cur_snap._history[hist_len - added :])
-                if added > 0
-                else ()
-            )
-            evicted_cnt = max(0, cur_tok.evicted_total - token.evicted_total)
+            if zero_hist_cap:
+                new_hist = ()
+                evicted_cnt = 0
+            else:
+                if added > hist_len:
+                    return _full(ResyncReason.HISTORY_EVICTED)
+                new_hist = (
+                    tuple(RowView(fr) for fr in cur_snap._history[hist_len - added :])
+                    if added > 0
+                    else ()
+                )
+                evicted_cnt = max(0, cur_tok.evicted_total - token.evicted_total)
 
         v_scroll = (
             0
@@ -1999,10 +2094,9 @@ class Terminal:
                 updated.append(
                     PromptZone(
                         kind=z.kind,
-                        row=z.row,
+                        abs_row=z.abs_row + count,
                         col=z.col,
                         exit_code=z.exit_code,
-                        abs_row=z.abs_row + count,
                     ),
                 )
                 changed = True
@@ -3812,23 +3906,24 @@ class Terminal:
                     and parts[1].lstrip("-").isdigit()
                 ):
                     exit_code = int(parts[1])
-                abs_r = self._screens.primary.scrolled_total + scr._cur_row
-                zone = PromptZone(
-                    kind=kind,
-                    row=scr._cur_row,
-                    col=scr._cur_col,
-                    exit_code=exit_code,
-                    abs_row=abs_r,
-                )
-                self._prompt_zones.append(zone)
-                self._aux_revision += 1
-                self._step_event |= StopOn.PROMPT_MARK
-                self._emit_event(PromptMark(zone=zone))
+                if not self._screens.active_is_alt:
+                    abs_r = self._screens.primary.scrolled_total + scr._cur_row
+                    zone = PromptZone(
+                        kind=kind,
+                        abs_row=abs_r,
+                        col=scr._cur_col,
+                        exit_code=exit_code,
+                    )
+                    self._prompt_zones.append(zone)
+                    self._aux_revision += 1
+                    self._step_event |= StopOn.PROMPT_MARK
+                    self._emit_event(PromptMark(zone=zone))
                 if (
                     kind == PromptKind.PROMPT_START
                     and not is_continuation
                     and self._status_store.on_prompt_start()
                 ):
+                    self._aux_revision += 1
                     self._emit_event(
                         ProgramStatusChanged(status=self._status_store.most_urgent),
                     )
@@ -3972,12 +4067,21 @@ class Terminal:
                 )
                 if prepared is not None:
                     w_px, h_px, s_rows, s_cols = prepared
+                    pre_scrolled = scr._scrolled_total
+                    top, bottom, left, right = self._effective_margins(scr)
+                    in_margins = top <= orig_row <= bottom and left <= orig_col <= right
                     if decsdm:
                         post_r = anchor_r
                         eff_rows = max(1, min(s_rows, scr.rows - anchor_r))
+                        min_sixel_abs = 0
                     else:
                         post_r = self._advance_rows(scr, s_rows, final_col=0)
                         eff_rows = min(s_rows, max(1, scr.rows - post_r))
+                        min_sixel_abs = (
+                            scr._scrolled_total + (top if in_margins else 0)
+                            if scr._scrolled_total == pre_scrolled
+                            else scr._scrolled_total - len(scr._history)
+                        )
                     gfx.commit_sixel(
                         payload_len=len(data),
                         width_px=w_px,
@@ -3987,6 +4091,7 @@ class Terminal:
                         rows=eff_rows,
                         cols=s_cols,
                         scrolled_total=scr._scrolled_total,
+                        min_abs=min_sixel_abs,
                     )
             if self._record_events or self._on_event is not None:
                 self._emit_event(
@@ -4026,6 +4131,8 @@ class Terminal:
                         control[k] = v
                 if self._policy.track_graphics:
                     self._before_mutate()
+                    top, bottom, left, right = self._effective_margins(scr)
+                    in_margins = top <= orig_row <= bottom and left <= orig_col <= right
 
                     def _advance_kitty(p_rows: int, p_cols: int) -> int:
                         target_x = orig_col + p_cols
@@ -4045,6 +4152,7 @@ class Terminal:
                         scrolled_total=scr._scrolled_total,
                         cell_width_px=self._profile.cell_width_px,
                         cell_height_px=self._profile.cell_height_px,
+                        min_row=(top if in_margins else 0),
                         advance_cursor=_advance_kitty,
                     )
                     if reply is not None:

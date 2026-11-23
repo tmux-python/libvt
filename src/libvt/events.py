@@ -30,22 +30,19 @@ class PromptZone:
     ----------
     kind : PromptKind
         Marker kind (``A``, ``B``, ``C``, or ``D``).
-    row : int
-        Zero-based viewport row (negative once scrolled into ``history``).
+    abs_row : int
+        Monotonic row index from the top of primary scroll history so scrolling
+        never invalidates stored coordinates.
     col : int
         Zero-based column index when the marker arrived.
     exit_code : int | None
         Parsed exit status on ``D`` markers when supplied, else ``None``.
-    abs_row : int
-        Monotonic row index from the top of primary scroll history so scrolling
-        never invalidates stored coordinates.
     """
 
     kind: PromptKind
-    row: int
+    abs_row: int
     col: int
     exit_code: int | None = None
-    abs_row: int = 0
 
 
 class EraseCause(enum.StrEnum):

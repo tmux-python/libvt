@@ -445,6 +445,7 @@ class Screen:
         "_history",
         "_history_clear_at",
         "_history_clear_seq",
+        "_is_alt",
         "_max_image_dimension",
         "_max_images",
         "_max_placements",
@@ -468,6 +469,7 @@ class Screen:
         max_images: int = 256,
         max_placements: int = 1_024,
         max_image_dimension: int = 10_000,
+        is_alt: bool = False,
     ) -> None:
         if rows < 1 or cols < 1:
             msg = f"rows and cols must be >= 1, got ({rows}, {cols})"
@@ -481,6 +483,7 @@ class Screen:
         self._evicted_total: int = 0
         self._history_clear_at: int = 0
         self._history_clear_seq: int = 0
+        self._is_alt: bool = is_alt
         self._cell_height_px: int = max(1, cell_height_px)
         self._max_images: int = max_images
         self._max_placements: int = max_placements
@@ -567,6 +570,7 @@ class Screen:
 
     def clear_history(self) -> None:
         """Clear all sealed scrollback rows (``ED 3``)."""
+        self._evicted_total += len(self._history)
         self._history.clear()
         self._history_clear_at = self._scrolled_total
         self._history_clear_seq += 1
@@ -593,7 +597,7 @@ class Screen:
         """Return active + scrollback :class:`ImagePlacement` records."""
         if self._gfx is None:
             return ()
-        return self._gfx.snapshot_placements(self._scrolled_total)
+        return self._gfx.snapshot_placements()
 
     def _append_history(self, frozen: FrozenRow) -> None:
         maxlen = self._history.maxlen
@@ -731,14 +735,10 @@ class Screen:
                     self._rows[b_row].wrapped = False
                     bump_row_gen(self._rows[b_row])
                 self._clear_row_spacer_head(self._rows[b_row])
-            can_save = (
-                save_history
-                and t_row == 0
-                and self._history.maxlen is not None
-                and self._history.maxlen > 0
-            )
-            hist_adv = shift if (can_save and not full_screen) else 0
-            if self._gfx is not None and not (full_screen and can_save):
+            advances_abs = save_history and t_row == 0 and not self._is_alt
+            has_hist_cap = self._history.maxlen is not None and self._history.maxlen > 0
+            hist_adv = shift if (advances_abs and not full_screen) else 0
+            if self._gfx is not None and not (full_screen and advances_abs):
                 self._gfx.on_region_scroll(
                     top=t_row,
                     bottom=b_row,
@@ -748,26 +748,29 @@ class Screen:
                     is_scroll=not is_line_op,
                     scrolled_total=self._scrolled_total,
                     cell_height_px=self._cell_height_px,
-                    history_advanced=(count if (can_save and not full_screen) else 0),
+                    history_advanced=(
+                        count if (advances_abs and not full_screen) else 0
+                    ),
                 )
             evicted = self._rows[t_row : t_row + shift]
-            if can_save:
-                for row_ev in evicted:
-                    self._append_history(row_ev.freeze())
-                extra = count - shift
-                if extra > 0:
-                    maxlen = self._history.maxlen or 0
-                    blank_row = _Row(self._cols)
-                    blank_row.reset_blank(self._cols, bce_word, bce_ext)
-                    blank_frozen = blank_row.freeze()
-                    skip_evict = max(0, extra - maxlen)
-                    if skip_evict > 0:
-                        dropped_existing = min(len(self._history), skip_evict)
-                        for _ in range(dropped_existing):
-                            self._history.popleft()
-                        self._evicted_total += skip_evict
-                    for _ in range(extra - skip_evict):
-                        self._append_history(blank_frozen)
+            if advances_abs:
+                if has_hist_cap:
+                    for row_ev in evicted:
+                        self._append_history(row_ev.freeze())
+                    extra = count - shift
+                    if extra > 0:
+                        maxlen = self._history.maxlen or 0
+                        blank_row = _Row(self._cols)
+                        blank_row.reset_blank(self._cols, bce_word, bce_ext)
+                        blank_frozen = blank_row.freeze()
+                        skip_evict = max(0, extra - maxlen)
+                        if skip_evict > 0:
+                            self._evicted_total += len(self._history) + skip_evict
+                            self._history.clear()
+                        for _ in range(extra - skip_evict):
+                            self._append_history(blank_frozen)
+                else:
+                    self._evicted_total += count
                 self._scrolled_total += count
                 if self._gfx is not None:
                     self._gfx.reap_evicted_history(
@@ -777,7 +780,7 @@ class Screen:
             for row_ev in evicted:
                 row_ev.reset_blank(self._cols, bce_word, bce_ext)
             self._rows[b_row - shift + 1 : b_row - shift + 1] = evicted
-            if not (full_screen and can_save):
+            if not (full_screen and advances_abs):
                 stamp_end = len(self._rows) if hist_adv > 0 else (b_row + 1)
                 for idx_s in range(t_row, stamp_end):
                     bump_row_gen(self._rows[idx_s])
@@ -920,13 +923,12 @@ class Screen:
             ):
                 last_used = idx
                 break
-        if (
-            last_used >= 0
-            and self._history.maxlen is not None
-            and self._history.maxlen > 0
-        ):
-            for idx in range(last_used + 1):
-                self._append_history(self._rows[idx].freeze())
+        if last_used >= 0 and not self._is_alt:
+            if self._history.maxlen is not None and self._history.maxlen > 0:
+                for idx in range(last_used + 1):
+                    self._append_history(self._rows[idx].freeze())
+            else:
+                self._evicted_total += last_used + 1
             self._scrolled_total += last_used + 1
             if self._gfx is not None:
                 self._gfx.reap_evicted_history(
@@ -1070,12 +1072,20 @@ class Screen:
         hist_cut = max(0, len(new_all) - rows)
         hist_cut = min(hist_cut, new_cur_abs)
 
+        prev_scrolled = self._scrolled_total
+        prev_evicted = self._evicted_total
         self._history.clear()
         self._evicted_total = 0
         if self._history.maxlen is not None and self._history.maxlen > 0:
             for r_h in new_all[:hist_cut]:
                 self._append_history(r_h.freeze())
-        self._scrolled_total = len(self._history)
+        hist_len = len(self._history)
+        new_evicted = max(
+            prev_evicted + (hist_cut - hist_len),
+            prev_scrolled - hist_len,
+        )
+        self._evicted_total = new_evicted
+        self._scrolled_total = new_evicted + hist_len
 
         viewport = new_all[hist_cut : hist_cut + rows]
         while len(viewport) < rows:
@@ -1117,9 +1127,15 @@ class Screen:
                 top_excess = max(0, self._cur_row - (rows - 1))
                 top_drop = min(drop_needed, top_excess)
                 if top_drop > 0:
-                    if self._history.maxlen is not None and self._history.maxlen > 0:
-                        for r_ev in self._rows[:top_drop]:
-                            self._append_history(r_ev.freeze())
+                    if not self._is_alt:
+                        if (
+                            self._history.maxlen is not None
+                            and self._history.maxlen > 0
+                        ):
+                            for r_ev in self._rows[:top_drop]:
+                                self._append_history(r_ev.freeze())
+                        else:
+                            self._evicted_total += top_drop
                         self._scrolled_total += top_drop
                         if self._gfx is not None:
                             self._gfx.reap_evicted_history(
@@ -1255,6 +1271,7 @@ class ScreenSet:
             max_images=max_images,
             max_placements=max_placements,
             max_image_dimension=max_image_dimension,
+            is_alt=True,
         )
         self.active_is_alt: bool = False
 

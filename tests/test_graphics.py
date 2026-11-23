@@ -36,7 +36,8 @@ def test_kitty_chunked_upload_validation_and_relative_placements() -> None:
     assert b"\x1b_Gi=7,p=1;OK\x1b\\" in term.drain_replies()
     assert len(term.placements) == 1
     kp = term.placements[0]
-    assert (kp.protocol, kp.row, kp.col, kp.rows, kp.cols, kp.layer) == (
+    assert not hasattr(kp, "row")
+    assert (kp.protocol, kp.abs_row, kp.col, kp.rows, kp.cols, kp.layer) == (
         GraphicsProtocol.KITTY,
         1,
         2,
@@ -44,6 +45,7 @@ def test_kitty_chunked_upload_validation_and_relative_placements() -> None:
         2,
         ZLayer.BELOW_TEXT,
     )
+    assert term.snapshot().viewport_row(kp.abs_row) == 1
     assert (term.cursor.row, term.cursor.col) == (2, 4)
 
     # U=0 overlay survives text overwrite; d=y with missing y=0 is a safe no-op.
@@ -83,7 +85,8 @@ def test_kitty_chunked_upload_validation_and_relative_placements() -> None:
     term.drain_replies()
     child = [p for p in term.placements if p.image_id == 20 and p.placement_id == 4]
     assert len(child) == 1
-    assert (child[0].row, child[0].col) == (2, 3)
+    assert (child[0].abs_row, child[0].col) == (2, 3)
+    assert term.snapshot().viewport_row(child[0].abs_row) == 2
     term.feed(b"\x1b_Ga=d,d=i,i=20,p=3\x1b\\")
     assert not any(
         p.image_id == 20 and p.placement_id in (3, 4) for p in term.placements
@@ -95,7 +98,53 @@ def test_scroll_before_place_sixel_erase_policies_and_event_immutability() -> No
     alt_t = libvt.Terminal(rows=4, cols=8)
     raw_2row = base64.b64encode(b"\xaa" * (16 * 32 * 3))
     alt_t.feed(b"\x1b[?1049h\x1b[4;2H\x1b_Ga=T,f=24,s=16,v=32;" + raw_2row + b"\x1b\\")
-    assert (alt_t.placements[0].row, alt_t.placements[0].rows) == (2, 2)
+    alt_snap = alt_t.snapshot()
+    assert (alt_snap.placements[0].abs_row, alt_snap.placements[0].rows) == (2, 2)
+    assert alt_snap.viewport_row(alt_snap.placements[0].abs_row) == 2
+    assert alt_snap.to_dict()["scrolled_total"] == 0
+    assert alt_snap.to_dict()["placements"][0]["abs_row"] == 2
+    assert alt_snap.to_dict()["placements"][0]["viewport_row"] == 2
+    with pytest.raises(IndexError):
+        alt_snap.at_abs(-1)
+    with pytest.raises(IndexError):
+        alt_snap.at_abs(4)
+
+    # Tall Kitty image on alt screen crops top rows at abs_row == 0, never < 0.
+    tall_raw = base64.b64encode(b"\xff" * (8 * 80 * 3))
+    alt_tall = libvt.Terminal(rows=4, cols=10)
+    alt_tall.feed(
+        b"\x1b[?1049h\x1b[3;1H\x1b_Ga=T,f=24,s=8,v=80;" + tall_raw + b"\x1b\\"
+    )
+    tall_snap = alt_tall.snapshot()
+    assert (tall_snap.placements[0].abs_row, tall_snap.placements[0].rows) == (0, 4)
+    assert tall_snap.viewport_row(tall_snap.placements[0].abs_row) == 0
+    assert tall_snap.at_abs(tall_snap.placements[0].abs_row).text == tall_snap[0].text
+
+    # Alt-screen non-reflow resize dropping top rows crops straddling placement to 0.
+    alt_rz = libvt.Terminal(rows=4, cols=10)
+    alt_rz.feed(
+        b"\x1b[?1049h\x1b[2;1H\x1b_Ga=T,f=24,s=16,v=32;" + raw_2row + b"\x1b\\\x1b[4;1H"
+    )
+    alt_rz.resize(rows=2, cols=10)
+    rz_snap = alt_rz.snapshot()
+    assert (rz_snap.placements[0].abs_row, rz_snap.placements[0].rows) == (0, 1)
+    assert rz_snap.viewport_row(rz_snap.placements[0].abs_row) == 0
+
+    # Tall SIXEL spans scrollback + viewport on primary, and crops at 0 on alt.
+    sixel_8r = b'\x1bP0;1;0q"1;1;16;128#0!16~\x1b\\'
+    prim_sixel = libvt.Terminal(rows=4, cols=10, scrollback=10)
+    prim_sixel.feed(b"\x1b[4;1H" + sixel_8r)
+    ps_snap = prim_sixel.snapshot()
+    assert (ps_snap.placements[0].abs_row, ps_snap.placements[0].rows) == (3, 8)
+    assert ps_snap.viewport_row(ps_snap.placements[0].abs_row) is None
+    assert ps_snap.placements[0].occupies_abs(ps_snap.scrolled_total + 0, 0) is True
+
+    sixel_5r = b'\x1bP0;1;0q"1;1;16;80#0!16~\x1b\\'
+    alt_sixel = libvt.Terminal(rows=4, cols=10)
+    alt_sixel.feed(b"\x1b[?1049h\x1b[3;1H" + sixel_5r)
+    as_snap = alt_sixel.snapshot()
+    assert (as_snap.placements[0].abs_row, as_snap.placements[0].rows) == (0, 3)
+    assert as_snap.viewport_row(as_snap.placements[0].abs_row) == 0
 
     sixel_seq = b'\x1bP0;1;0q"1;1;16;32#0!16~-#0!16~-#0!16~-#0!16~-#0!16~\x1b\\'
     vt_sixel = libvt.Terminal(rows=6, cols=10, profile=Profile.tmux("next-3.9"))
@@ -103,9 +152,13 @@ def test_scroll_before_place_sixel_erase_policies_and_event_immutability() -> No
     assert (vt_sixel.placements[0].rows, vt_sixel.cursor.row) == (2, 2)
     vt_sixel.feed(b"\x1b[1;1HX")
     assert (
-        vt_sixel.placements[0].occupies_cell(0, 0),
-        vt_sixel.placements[0].occupies_cell(0, 1),
+        vt_sixel.placements[0].occupies_abs(0, 0),
+        vt_sixel.placements[0].occupies_abs(0, 1),
     ) == (False, True)
+    with pytest.raises(TypeError):
+        vt_sixel.placements[0].occupies_abs(True, 0)
+    with pytest.raises(TypeError):
+        vt_sixel.placements[0].occupies_abs(0, False)
 
     tm38_sixel = libvt.Terminal(rows=6, cols=10, profile=Profile.tmux("3.8a"))
     tm38_sixel.feed(sixel_seq + b"\x1b[1;1HX")

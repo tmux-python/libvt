@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 
+import pytest
+
 import libvt
 from libvt.config import Policy, Profile
 from libvt.events import (
@@ -95,6 +97,79 @@ def test_osc_133_osc_7_osc_52_queries_and_tmux_passthrough() -> None:
     zones = term.prompt_zones
     assert [z.abs_row for z in zones] == sorted(z.abs_row for z in zones)
     assert zones[-1].exit_code == 0
+    assert not hasattr(zones[0], "row")
+
+    snap = term.snapshot()
+    assert snap.viewport_row(zones[0].abs_row) is None
+    assert snap.at_abs(zones[0].abs_row).text == "$ c0"
+    last_vr = snap.viewport_row(zones[-1].abs_row)
+    assert last_vr is not None
+    assert snap.at_abs(zones[-1].abs_row).text == snap[last_vr].text
+
+    evict_term = libvt.Terminal(rows=2, cols=12, scrollback=1)
+    evict_term.feed(b"\x1b]133;A\x07p0\r\np1\r\np2\r\np3")
+    evict_snap = evict_term.snapshot()
+    assert (evict_snap.scrolled_total, evict_snap.evicted_total) == (2, 1)
+    evicted_zone = evict_snap.prompt_zones[0]
+    assert evict_snap.viewport_row(evicted_zone.abs_row) is None
+    with pytest.raises(IndexError):
+        evict_snap.at_abs(evicted_zone.abs_row)
+
+    zero_sb = libvt.Terminal(rows=2, cols=12, scrollback=0)
+    zero_tok = zero_sb.sync_token()
+    zero_sb.feed(b"\x1b[3J\x1b]133;A\x07cmd\r\nline1\r\nline2")
+    zero_delta = zero_sb.changes_since(zero_tok)
+    assert zero_delta.full_resync is False
+    zero_snap = zero_sb.snapshot()
+    assert (zero_snap.scrolled_total, zero_snap.evicted_total) == (1, 1)
+    assert zero_snap.viewport_row(zero_snap.prompt_zones[0].abs_row) is None
+    with pytest.raises(IndexError):
+        zero_snap.at_abs(zero_snap.prompt_zones[0].abs_row)
+    assert zero_snap.at_abs(1).text == "line1"
+    assert zero_snap.at_abs(2).text == "line2"
+    zero_sb.resize(rows=2, cols=14, reflow=True)
+    zero_reflow = zero_sb.snapshot()
+    assert (zero_reflow.scrolled_total, zero_reflow.evicted_total) == (1, 1)
+    assert zero_reflow.at_abs(1).text == "line1"
+
+    ed3_term = libvt.Terminal(rows=2, cols=12, scrollback=10)
+    ed3_term.feed(b"\x1b]133;A\x07old\r\nv0\r\nv1\x1b[3J")
+    ed3_snap = ed3_term.snapshot()
+    assert (ed3_snap.scrolled_total, ed3_snap.evicted_total) == (1, 1)
+    assert ed3_snap.viewport_row(ed3_snap.prompt_zones[0].abs_row) is None
+    with pytest.raises(IndexError):
+        ed3_snap.at_abs(ed3_snap.prompt_zones[0].abs_row)
+    assert ed3_snap.at_abs(1).text == "v0"
+    with pytest.raises(TypeError):
+        ed3_snap.at_abs(True)
+    with pytest.raises(TypeError):
+        ed3_snap.viewport_row(False)
+
+    # Alt-screen OSC 133;A pruning ProgramStatusStore bumps _aux_revision for sync.
+    alt_st = libvt.Terminal(rows=3, cols=16)
+    alt_st.feed(b"\x1b[?1049h\x1b]7501;state=working:id=job\x07")
+    st_tok = alt_st.sync_token()
+    alt_st.feed(b"\x1b]133;A\x07")
+    assert alt_st.committed.program_status is None
+    assert alt_st.changes_since(st_tok).metadata_changed is True
+
+    # Multi-row scroll > rows + scrollback preserves scrolled == evicted + len(history).
+    bulk_sb = libvt.Terminal(rows=2, cols=8, scrollback=3)
+    bulk_sb.feed(b'r0\r\nr1\x1bP0;1;0q"1;1;8;160#0!8~\x1b\\')
+    bulk_snap = bulk_sb.snapshot()
+    assert (
+        bulk_snap.scrolled_total,
+        bulk_snap.evicted_total,
+        len(bulk_snap.history),
+    ) == (10, 7, 3)
+
+    # Reflow overflowing scrollback preserves scrolled == evicted + len(history).
+    narrow_sb = libvt.Terminal(rows=2, cols=10, scrollback=2)
+    narrow_sb.feed(b"0123456789\r\nabcdefghij")
+    narrow_sb.resize(rows=2, cols=2, reflow=True)
+    narrow_snap = narrow_sb.snapshot()
+    assert (narrow_snap.scrolled_total, narrow_snap.evicted_total) == (8, 6)
+    assert narrow_snap.at_abs(6).text == "cd"
 
     term.feed(b"\x1b]7;file://localhost/tmp/my%20dir\x07")
     assert (term.cwd, term.cwd_uri) == ("/tmp/my dir", "file://localhost/tmp/my%20dir")

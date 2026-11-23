@@ -88,16 +88,14 @@ class ImagePlacement:
         Referenced :attr:`ImageMeta.image_id`.
     placement_id : int
         Kitty ``p=`` placement identifier (``0`` when default/unnumbered).
-    row : int
-        Zero-based viewport row (negative when scrolled into history).
+    abs_row : int
+        Monotonic absolute grid row anchor.
     col : int
         Zero-based starting column.
     rows : int
         Height in terminal cells.
     cols : int
         Width in terminal cells.
-    abs_row : int
-        Absolute grid row anchor (``scrolled_total + row``).
     z_index : int
         Signed 32-bit z-index (``0`` default).
     virtual : bool
@@ -127,11 +125,10 @@ class ImagePlacement:
     protocol: GraphicsProtocol
     image_id: int
     placement_id: int
-    row: int
+    abs_row: int
     col: int
     rows: int
     cols: int
-    abs_row: int
     z_index: int = 0
     virtual: bool = False
     parent_image_id: int = 0
@@ -155,18 +152,45 @@ class ImagePlacement:
             return ZLayer.BELOW_TEXT
         return ZLayer.ABOVE_TEXT
 
-    def occupies_cell(self, row: int, col: int) -> bool:
-        """Return ``True`` when viewport cell ``(row, col)`` is covered."""
+    def occupies_abs(self, abs_row: int, col: int) -> bool:
+        """Return ``True`` when absolute grid cell ``(abs_row, col)`` is covered.
+
+        Parameters
+        ----------
+        abs_row : int
+            Monotonic absolute row coordinate (for a viewport row ``0 <= r < rows``,
+            pass ``snap.scrolled_total + r``).
+        col : int
+            Zero-based column coordinate.
+
+        Returns
+        -------
+        bool
+            ``True`` when this non-virtual placement covers ``(abs_row, col)``
+            and its cell mask bit (if any) remains set; ``False`` for virtual
+            placements or uncovered cells.
+
+        Raises
+        ------
+        TypeError
+            When *abs_row* or *col* is not an :class:`int` (or is a :class:`bool`).
+        """
+        if isinstance(abs_row, bool) or not isinstance(abs_row, int):
+            msg = f"abs_row must be int, got {type(abs_row).__name__}"
+            raise TypeError(msg)
+        if isinstance(col, bool) or not isinstance(col, int):
+            msg = f"col must be int, got {type(col).__name__}"
+            raise TypeError(msg)
         if self.virtual:
             return False
         if not (
-            self.row <= row < self.row + self.rows
+            self.abs_row <= abs_row < self.abs_row + self.rows
             and self.col <= col < self.col + self.cols
         ):
             return False
         if self.visible_mask is None:
             return True
-        bit = (row - self.row) * self.cols + (col - self.col)
+        bit = (abs_row - self.abs_row) * self.cols + (col - self.col)
         return bool((self.visible_mask >> bit) & 1)
 
 
@@ -299,16 +323,15 @@ class _MutablePlacement:
     cell_offset_y: int = 0
     visible_mask: int | None = None
 
-    def freeze(self, scrolled_total: int) -> ImagePlacement:
+    def freeze(self) -> ImagePlacement:
         return ImagePlacement(
             protocol=self.protocol,
             image_id=self.image_id,
             placement_id=self.placement_id,
-            row=self.abs_row - scrolled_total,
+            abs_row=self.abs_row,
             col=self.col,
             rows=self.rows,
             cols=self.cols,
-            abs_row=self.abs_row,
             z_index=self.z_index,
             virtual=self.virtual,
             parent_image_id=self.parent_image_id,
@@ -476,11 +499,11 @@ class GraphicsTracker:
         """Return shallow copy of stored :class:`ImageMeta` entries."""
         return dict(self._images)
 
-    def snapshot_placements(self, scrolled_total: int) -> tuple[ImagePlacement, ...]:
-        """Freeze placements relative to *scrolled_total*."""
+    def snapshot_placements(self) -> tuple[ImagePlacement, ...]:
+        """Freeze stored placements into immutable :class:`ImagePlacement` records."""
         if not self._placements:
             return ()
-        return tuple(p.freeze(scrolled_total) for p in self._placements)
+        return tuple(p.freeze() for p in self._placements)
 
     def has_placement_on_row(self, row: int, scrolled_total: int) -> bool:
         """Return ``True`` when any non-virtual placement covers viewport *row*."""
@@ -600,7 +623,30 @@ class GraphicsTracker:
                 kept.append(p)
                 continue
             if top_drop_without_history > 0:
-                p.abs_row -= top_drop_without_history
+                new_abs = p.abs_row - top_drop_without_history
+                if new_abs < scrolled_total:
+                    clip_top = scrolled_total - new_abs
+                    if clip_top >= p.rows:
+                        changed = True
+                        continue
+                    keep_rows = p.rows - clip_top
+                    if p.source_height > 0:
+                        crop_px = (p.source_height * clip_top) // p.rows
+                        p.source_y += crop_px
+                        p.source_height = max(1, p.source_height - crop_px)
+                    if (
+                        p.visible_mask is not None
+                        and keep_rows * p.cols <= _MAX_MASK_CELLS
+                    ):
+                        shifted = p.visible_mask >> (clip_top * p.cols)
+                        p.visible_mask = shifted & ((1 << (keep_rows * p.cols)) - 1)
+                        if p.visible_mask == 0:
+                            changed = True
+                            continue
+                    p.rows = keep_rows
+                    p.abs_row = scrolled_total
+                else:
+                    p.abs_row = new_abs
                 changed = True
             if p.abs_row + p.rows <= scrolled_total or p.abs_row >= max_abs:
                 changed = True
@@ -851,16 +897,23 @@ class GraphicsTracker:
         rows: int,
         cols: int,
         scrolled_total: int,
+        min_abs: int = 0,
     ) -> None:
         """Record a scanned ``SIXEL`` image and placement at post-scroll *row*."""
-        eff_row = row
+        abs_r = scrolled_total + row
         eff_rows = rows
-        if eff_row < 0 and scrolled_total == 0:
-            clip = -eff_row
+        eff_h_px = height_px
+        eff_src_y = 0
+        if abs_r < min_abs:
+            clip = min_abs - abs_r
             if clip >= eff_rows:
                 return
+            if eff_h_px > 0 and eff_rows > 0:
+                crop_px = (eff_h_px * clip) // eff_rows
+                eff_src_y = crop_px
+                eff_h_px = max(1, eff_h_px - crop_px)
             eff_rows -= clip
-            eff_row = 0
+            abs_r = min_abs
         img_id = self._next_auto_id
         self._next_auto_id += 1
         meta = ImageMeta(
@@ -877,12 +930,13 @@ class GraphicsTracker:
                 protocol=GraphicsProtocol.SIXEL,
                 image_id=img_id,
                 placement_id=0,
-                abs_row=scrolled_total + eff_row,
+                abs_row=max(0, abs_r),
                 col=col,
                 rows=eff_rows,
                 cols=cols,
+                source_y=eff_src_y,
                 source_width=width_px,
-                source_height=height_px,
+                source_height=eff_h_px,
             ),
         )
 
@@ -979,6 +1033,7 @@ class GraphicsTracker:
         scrolled_total: int = 0,
         cell_width_px: int = 8,
         cell_height_px: int = 16,
+        min_row: int = 0,
         advance_cursor: collections.abc.Callable[[int, int], int] | None = None,
     ) -> bytes | None:
         """Process one Kitty ``APC G`` packet and return optional reply bytes.
@@ -1006,6 +1061,9 @@ class GraphicsTracker:
             Nominal cell width in pixels.
         cell_height_px : int
             Nominal cell height in pixels.
+        min_row : int
+            Minimum viewport row ceiling when cursor scrolling does not advance
+            scrollback (``0`` default, or active ``DECSTBM`` top margin).
         advance_cursor : collections.abc.Callable[[int, int], int] | None
             Callback invoked with ``(rows, cols)`` prior to committing a
             cursor-moving ``C=0`` placement, returning the post-scroll anchor
@@ -1078,6 +1136,7 @@ class GraphicsTracker:
                     scrolled_total=cur_scrolled,
                     cell_width_px=cell_width_px,
                     cell_height_px=cell_height_px,
+                    min_row=min_row,
                     advance_cursor=advance_cursor,
                 )
 
@@ -1139,6 +1198,7 @@ class GraphicsTracker:
                 scrolled_total=cur_scrolled,
                 cell_width_px=cell_width_px,
                 cell_height_px=cell_height_px,
+                min_row=min_row,
                 advance_cursor=advance_cursor,
             )
 
@@ -1152,6 +1212,7 @@ class GraphicsTracker:
                 scrolled_total=cur_scrolled,
                 cell_width_px=cell_width_px,
                 cell_height_px=cell_height_px,
+                min_row=min_row,
                 advance_cursor=advance_cursor,
             )
 
@@ -1168,6 +1229,7 @@ class GraphicsTracker:
         scrolled_total: int,
         cell_width_px: int,
         cell_height_px: int,
+        min_row: int = 0,
         advance_cursor: collections.abc.Callable[[int, int], int] | None,
     ) -> bytes | None:
         ctrl = up.control
@@ -1243,6 +1305,7 @@ class GraphicsTracker:
                 scrolled_total=scrolled_total,
                 cell_width_px=cell_width_px,
                 cell_height_px=cell_height_px,
+                min_row=min_row,
                 advance_cursor=advance_cursor,
                 target_meta=meta,
                 reply_image_id=reply_id,
@@ -1310,6 +1373,7 @@ class GraphicsTracker:
         scrolled_total: int,
         cell_width_px: int,
         cell_height_px: int,
+        min_row: int = 0,
         advance_cursor: collections.abc.Callable[[int, int], int] | None,
         target_meta: ImageMeta | None = None,
         reply_image_id: int | None = None,
@@ -1390,11 +1454,22 @@ class GraphicsTracker:
             not virtual and parent_id == 0 and _parse_int(control, "C", 0) == 0
         )
 
+        eff_reply_id = (
+            reply_image_id
+            if target_meta is not None
+            else (
+                meta.image_id
+                if (_parse_int(control, "i", 0) > 0 or _parse_int(control, "I", 0) > 0)
+                else None
+            )
+        )
+
         if parent_pl is not None:
             abs_r = parent_pl.abs_row + _parse_int(control, "V", 0)
             col_pos = max(
                 0, min(screen_cols - 1, parent_pl.col + _parse_int(control, "H", 0))
             )
+            min_abs = 0
         else:
             anchor_r = cursor_row
             if move_cursor and advance_cursor is not None:
@@ -1406,13 +1481,29 @@ class GraphicsTracker:
             )
             abs_r = post_scrolled + anchor_r
             col_pos = cursor_col
+            min_abs = (
+                (post_scrolled + min_row) if post_scrolled == scrolled_total else 0
+            )
+
+        if not virtual and abs_r < min_abs:
+            clip_top = min_abs - abs_r
+            if clip_top >= rows:
+                return _kitty_reply(
+                    control, "OK", is_error=False, reply_image_id=eff_reply_id
+                )
+            if src_h > 0 and rows > 0:
+                crop_px = (src_h * clip_top) // rows
+                src_y += crop_px
+                src_h = max(1, src_h - crop_px)
+            rows -= clip_top
+            abs_r = min_abs
 
         self._append_placement(
             _MutablePlacement(
                 protocol=GraphicsProtocol.KITTY,
                 image_id=meta.image_id,
                 placement_id=pid,
-                abs_row=abs_r,
+                abs_row=max(0, abs_r),
                 col=col_pos,
                 rows=rows,
                 cols=cols,
@@ -1427,15 +1518,6 @@ class GraphicsTracker:
                 cell_offset_x=off_x,
                 cell_offset_y=off_y,
             ),
-        )
-        eff_reply_id = (
-            reply_image_id
-            if target_meta is not None
-            else (
-                meta.image_id
-                if (_parse_int(control, "i", 0) > 0 or _parse_int(control, "I", 0) > 0)
-                else None
-            )
         )
         return _kitty_reply(control, "OK", is_error=False, reply_image_id=eff_reply_id)
 

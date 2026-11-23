@@ -706,24 +706,20 @@ def _populate_screen_from_lines(
     zones: list[PromptZone] = []
     for idx in range(dropped_hist, len(flags_list)):
         fl = flags_list[idx]
-        abs_r = idx
-        rel_r = idx - hist_count
         if fl & TmuxLineFlags.START_PROMPT:
             zones.append(
                 PromptZone(
                     kind=PromptKind.PROMPT_START,
-                    row=rel_r,
+                    abs_row=idx,
                     col=0,
-                    abs_row=abs_r,
                 ),
             )
         if fl & TmuxLineFlags.START_OUTPUT:
             zones.append(
                 PromptZone(
                     kind=PromptKind.COMMAND_EXECUTED,
-                    row=rel_r,
+                    abs_row=idx,
                     col=0,
-                    abs_row=abs_r,
                 ),
             )
 
