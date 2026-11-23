@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import array
 import collections.abc
+import hashlib
 import pathlib
+import sys
 import time
 import typing as t
 import unicodedata
@@ -15,12 +18,18 @@ from libvt import _ucd
 from libvt._ucd import (
     EXT_PICT_BIT,
     SAFE_NARROW_BMP_RE,
+    WidthRole,
     char_width,
     display_width,
     segment_graphemes,
     ucd_lookup,
 )
 from libvt.config import DEFAULT_PROFILE, TMUX_PROFILE, Profile
+from libvt.style import AnsiColor, Hyperlink, RgbColor, UnderlineStyle
+
+EXPECTED_EXPANDED_UCD_SHA256 = (
+    "a6a2bbf94b9ebb25bb22b06a46a605b468b0a398bd9ee64e60dbc717c2484cb3"
+)
 
 
 class DisplayWidthCase(t.NamedTuple):
@@ -178,3 +187,180 @@ def test_combining_mark_cap_and_cluster_anchor_invalidation() -> None:
     term.reset()
     term.feed(b"ab\x1b[1;1H" + "\u0301".encode())
     assert (term[0, 0].text, term[0, 1].text) == ("a", "b")
+
+
+def _expanded_stage_sha256(
+    stage1: collections.abc.Sequence[int],
+    stage2: array.array[int],
+) -> str:
+    s2 = stage2
+    if sys.byteorder != "little":
+        s2 = array.array("H", s2)
+        s2.byteswap()
+    s2_bytes = memoryview(s2).cast("B")
+    hasher = hashlib.sha256()
+    for block_id in stage1:
+        off = block_id * 512
+        hasher.update(s2_bytes[off : off + 512])
+    return hasher.hexdigest()
+
+
+def test_expanded_ucd_4352_block_sha256_parity() -> None:
+    """All 4,352 expanded ``_STAGE1`` blocks match the pinned UCD 17.0.0 digest."""
+    assert len(_ucd._STAGE1) == 4352
+    digest = _expanded_stage_sha256(_ucd._STAGE1, _ucd._STAGE2)
+    assert _ucd.EXPANDED_UCD_SHA256 == EXPECTED_EXPANDED_UCD_SHA256
+    assert digest == EXPECTED_EXPANDED_UCD_SHA256
+
+    mutated_stage1 = array.array("H", _ucd._STAGE1)
+    mutated_stage1[0] = (
+        mutated_stage1[1] if mutated_stage1[0] != mutated_stage1[1] else 1
+    )
+    assert (
+        _expanded_stage_sha256(mutated_stage1, _ucd._STAGE2)
+        != EXPECTED_EXPANDED_UCD_SHA256
+    )
+
+
+def test_append_grapheme_spacer_tail_inherits_base_pen_and_decsca() -> None:
+    """Widening a base cell copies SGR, hyperlink, and ``DECSCA`` to ``SPACER_TAIL``."""
+    term = libvt.Terminal(rows=2, cols=8)
+    term.feed(
+        b"\x1b[31;44;4:3;53;58:2::0:255:0m"
+        b'\x1b[1"q'
+        b"\x1b]8;id=h1;https://example.com\x07"
+        + "❤".encode()
+        + b'\x1b[0m\x1b[0"q\x1b]8;;\x07'
+        + "\ufe0f".encode()
+        + b"Z"
+    )
+    snap = term.snapshot()
+    head = snap[0, 0]
+    tail = snap[0, 1]
+    expected_link = Hyperlink(uri="https://example.com", id="h1")
+
+    assert (head.text, head.width, head.width_role, head.protected) == (
+        "❤\ufe0f",
+        2,
+        WidthRole.WIDE,
+        True,
+    )
+    assert (tail.text, tail.width, tail.width_role, tail.protected) == (
+        "",
+        0,
+        WidthRole.SPACER_TAIL,
+        True,
+    )
+    assert head.style.fg == AnsiColor.RED
+    assert head.style.bg == AnsiColor.BLUE
+    assert head.style.underline == UnderlineStyle.CURLY
+    assert head.style.overline is True
+    assert head.style.underline_color == RgbColor(0, 255, 0)
+    assert tail.style == head.style
+    assert head.hyperlink == expected_link
+    assert tail.hyperlink == expected_link
+
+    runs = snap[0].runs
+    assert len(runs) == 2
+    assert (runs[0].start_col, runs[0].end_col, runs[0].text) == (0, 2, "❤\ufe0f")
+    assert runs[0].hyperlink == expected_link
+    assert (runs[1].start_col, runs[1].end_col, runs[1].text) == (2, 3, "Z")
+
+    term.feed(b"\x1b[?2K")
+    after_decsel = term.snapshot()
+    assert after_decsel[0, 0].text == "❤\ufe0f"
+    assert after_decsel[0, 0].width_role == WidthRole.WIDE
+    assert after_decsel[0, 1].width_role == WidthRole.SPACER_TAIL
+    assert after_decsel[0, 2].text == " "
+
+    term.reset()
+    term.feed(b'\x1b[0"q' + "❤".encode() + b'\x1b[1"q' + "\ufe0f".encode())
+    term.feed(b"\x1b[?2K")
+    assert term.lines[0] == ""
+
+    term.reset()
+    term.feed(
+        b'\x1b[31;44;7;4m\x1b[1"q\x1b]8;;https://example.com\x07' + "⌚\ufe0e".encode()
+    )
+    narrowed = term.snapshot()
+    assert (
+        narrowed[0, 0].text,
+        narrowed[0, 0].width,
+        narrowed[0, 0].width_role,
+        narrowed[0, 0].protected,
+    ) == ("⌚\ufe0e", 1, WidthRole.NARROW, True)
+    vacated = narrowed[0, 1]
+    assert (vacated.text, vacated.width_role, vacated.protected) == (
+        " ",
+        WidthRole.NARROW,
+        False,
+    )
+    assert vacated.style.fg is None
+    assert vacated.style.bg == AnsiColor.BLUE
+    assert vacated.style.reverse is False
+    assert vacated.style.underline == UnderlineStyle.NONE
+    assert vacated.hyperlink is None
+    term.feed(b'\x1b[0m\x1b[0"q\x1b]8;;\x07\x1b[?2K')
+    assert term[0, 0].text == "⌚\ufe0e"
+
+    wrap_term = libvt.Terminal(rows=2, cols=4)
+    wrap_term.feed(
+        b"ABC"
+        b"\x1b[31;44;4:3;53;58:2::0:255:0m"
+        b'\x1b[1"q'
+        b"\x1b]8;id=w1;https://example.com\x07"
+        b"1"
+        b'\x1b[0m\x1b[0"q\x1b]8;;\x07' + "\ufe0f\u20e3".encode() + b"Z"
+    )
+    wrap_link = Hyperlink(uri="https://example.com", id="w1")
+    wrap_snap = wrap_term.snapshot()
+    assert wrap_snap[0].wrapped is True
+    assert (wrap_snap[0, 3].width_role, wrap_snap[0, 3].protected) == (
+        WidthRole.SPACER_HEAD,
+        False,
+    )
+    assert (
+        wrap_snap[1, 0].text,
+        wrap_snap[1, 0].width_role,
+        wrap_snap[1, 0].protected,
+    ) == ("1\ufe0f\u20e3", WidthRole.WIDE, True)
+    assert (
+        wrap_snap[1, 1].text,
+        wrap_snap[1, 1].width_role,
+        wrap_snap[1, 1].protected,
+    ) == ("", WidthRole.SPACER_TAIL, True)
+    assert wrap_snap[1, 1].style == wrap_snap[1, 0].style
+    assert wrap_snap[1, 0].hyperlink == wrap_link
+    assert wrap_snap[1, 1].hyperlink == wrap_link
+
+    wrap_term.feed(b"\r\n\n")
+    hist_row = wrap_term.history[1]
+    assert (hist_row[0].text, hist_row[0].width_role, hist_row[0].protected) == (
+        "1\ufe0f\u20e3",
+        WidthRole.WIDE,
+        True,
+    )
+    assert (hist_row[1].text, hist_row[1].width_role, hist_row[1].protected) == (
+        "",
+        WidthRole.SPACER_TAIL,
+        True,
+    )
+    assert hist_row[1].style == hist_row[0].style
+    assert hist_row[1].hyperlink == wrap_link
+    assert (hist_row.runs[0].start_col, hist_row.runs[0].end_col) == (0, 2)
+
+    wrap_term.resize(rows=4, cols=6)
+    reflow_snap = wrap_term.snapshot()
+    assert reflow_snap[0].text == "ABC1\ufe0f\u20e3Z"
+    assert (reflow_snap[0, 3].width_role, reflow_snap[0, 3].protected) == (
+        WidthRole.WIDE,
+        True,
+    )
+    assert (reflow_snap[0, 4].width_role, reflow_snap[0, 4].protected) == (
+        WidthRole.SPACER_TAIL,
+        True,
+    )
+    assert reflow_snap[0, 4].style == reflow_snap[0, 3].style
+    assert reflow_snap[0, 4].hyperlink == wrap_link
+    wrap_term.feed(b"\x1b[1;1H\x1b[?2K")
+    assert wrap_term.lines[0] == "   1\ufe0f\u20e3"

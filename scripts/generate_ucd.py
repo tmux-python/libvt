@@ -293,6 +293,12 @@ def build_safe_narrow_bmp_pattern(stage1: bytes, stage2: bytes) -> str:
 
 def render_module(stage1: bytes, stage2: bytes) -> str:
     """Format ``src/libvt/_ucd.py`` source text."""
+    expanded_hasher = hashlib.sha256()
+    for i in range(0, len(stage1), 2):
+        b_idx = int.from_bytes(stage1[i : i + 2], "little")
+        expanded_hasher.update(stage2[b_idx * 512 : (b_idx + 1) * 512])
+    expanded_sha256 = expanded_hasher.hexdigest()
+
     blob = len(stage1).to_bytes(4, "little") + stage1 + stage2
     compressed = base64.b85encode(zlib.compress(blob, level=9)).decode("ascii")
     lines = [compressed[i : i + 76] for i in range(0, len(compressed), 76)]
@@ -374,6 +380,7 @@ CLUSTER_NONE = 0
 _ACTIVE_BIT = 1
 
 UNICODE_VERSION = "{UNICODE_VERSION}"
+EXPANDED_UCD_SHA256 = "{expanded_sha256}"
 
 SAFE_NARROW_BMP_RE: t.Final[re.Pattern[str]] = re.compile(
 {bmp_pat_literal}
@@ -553,9 +560,7 @@ def step_cluster(
                 next_incb = 0
 
             next_vs = 1 if (entry & EMOJI_VS_BASE_BIT) else 0
-            next_sp = (
-                1 if (has_spacing or w >= 1 or gcb == GCB_SPACING_MARK) else 0
-            )
+            next_sp = 1 if (has_spacing or w >= 1 or gcb == GCB_SPACING_MARK) else 0
             next_multi = 0 if (not has_spacing and w >= 1) else 1
             return (
                 True,
@@ -669,6 +674,7 @@ def sanitize_terminal_text(text: str) -> str:
 __all__ = [
     "BIDI_SPOOF_BIT",
     "CLUSTER_NONE",
+    "EXPANDED_UCD_SHA256",
     "SAFE_NARROW_BMP_RE",
     "UNICODE_VERSION",
     "WidthRole",

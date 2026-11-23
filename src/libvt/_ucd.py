@@ -64,6 +64,7 @@ CLUSTER_NONE = 0
 _ACTIVE_BIT = 1
 
 UNICODE_VERSION = "17.0.0"
+EXPANDED_UCD_SHA256 = "a6a2bbf94b9ebb25bb22b06a46a605b468b0a398bd9ee64e60dbc717c2484cb3"
 
 SAFE_NARROW_BMP_RE: t.Final[re.Pattern[str]] = re.compile(
     r"[ -~\xa0-\xa8\xaa-\xac\xaf-\u02ff\u0370-\u0482\u048a-\u0590\u05be\u05c0"
@@ -445,6 +446,7 @@ def sanitize_terminal_text(text: str) -> str:
 __all__ = [
     "BIDI_SPOOF_BIT",
     "CLUSTER_NONE",
+    "EXPANDED_UCD_SHA256",
     "SAFE_NARROW_BMP_RE",
     "UNICODE_VERSION",
     "WidthRole",

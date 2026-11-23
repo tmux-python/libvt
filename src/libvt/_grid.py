@@ -65,6 +65,8 @@ _WIDTH_MASK = 0b11
 _WIDTH_CLEAR_MASK = ~(_WIDTH_MASK << _WIDTH_SHIFT) & ((1 << 64) - 1)
 _OVERLINE_BIT = 1 << 62
 _HAS_EXT_BIT = 1 << 63
+_PEN_BASE_MASK = _WIDTH_CLEAR_MASK & ~_HAS_EXT_BIT
+_PEN_BG_MASK = _COLOR_MASK << _BG_SHIFT
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,8 +518,7 @@ class _Row:
         ch: str,
         *,
         width_override: int,
-        pen_word: int,
-        cell_ext: _CellExt | None,
+        bce_word: int = 0,
     ) -> None:
         """Append zero-width or cluster-extending *ch* onto cell *col*."""
         cols = len(self.chars)
@@ -538,13 +539,13 @@ class _Row:
             and cur_role == int(WidthRole.NARROW)
             and target + 1 < cols
         ):
+            base_pen = self.attr_at(target) & _PEN_BASE_MASK
+            base_ext = self.ext_at(target)
             self._heal_wide_boundary(target + 1)
-            attrs = self._ensure_attrs()
-            attrs[target] = (attrs[target] & _WIDTH_CLEAR_MASK) | (
-                int(WidthRole.WIDE) << _WIDTH_SHIFT
+            self._set_raw(
+                target, self.chars[target], base_pen, WidthRole.WIDE, base_ext
             )
-            self.has_wide = True
-            self._set_raw(target + 1, "", pen_word, WidthRole.SPACER_TAIL, cell_ext)
+            self._set_raw(target + 1, "", base_pen, WidthRole.SPACER_TAIL, base_ext)
             self.used = max(self.used, target + 2)
             self.text_used = max(self.text_used, target + 2)
         elif (
@@ -554,10 +555,10 @@ class _Row:
         ):
             attrs = self._ensure_attrs()
             attrs[target] &= _WIDTH_CLEAR_MASK
-            self._set_raw(target + 1, " ", pen_word, WidthRole.NARROW, cell_ext)
+            self._set_raw(target + 1, " ", bce_word, WidthRole.NARROW, None)
             if self.text_used == target + 2:
                 self.text_used = target + 1
-                if self.used == target + 2 and pen_word == 0 and cell_ext is None:
+                if self.used == target + 2 and bce_word == 0:
                     self.used = target + 1
         bump_row_gen(self)
 

@@ -16,7 +16,8 @@ import urllib.parse
 from dataclasses import dataclass
 
 from libvt._grid import (
-    _WIDTH_CLEAR_MASK,
+    _PEN_BASE_MASK,
+    _PEN_BG_MASK,
     FrozenRow,
     _CellExt,
     _Row,
@@ -2344,7 +2345,7 @@ class Terminal:
                         ):
                             prev_cluster_len = self._cluster_len
                             combined = row_obj.chars[pc] + ch
-                            base_pen = row_obj.attr_at(pc) & _WIDTH_CLEAR_MASK
+                            base_pen = row_obj.attr_at(pc) & _PEN_BASE_MASK
                             base_ext = row_obj.ext_at(pc)
                             bce_w, bce_e = self._bce_pair()
                             full_row_wrap = eff_left == 0 and eff_right == scr.cols - 1
@@ -2446,12 +2447,14 @@ class Terminal:
                                     scrolled_total=scr._scrolled_total,
                                     policy=sixel_pol,
                                 )
+                        vacated_bce = (
+                            (self._pen_word & _PEN_BG_MASK) if w_override == 1 else 0
+                        )
                         row_obj.append_grapheme(
                             pc,
                             ch,
                             width_override=w_override,
-                            pen_word=self._pen_word,
-                            cell_ext=self._cell_ext,
+                            bce_word=vacated_bce,
                         )
                         if pc == 0 and w_override == 1:
                             scr.heal_wrapped_spacer_head(pr)
