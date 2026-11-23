@@ -120,7 +120,7 @@ def _build_synthetic_ansi_frame() -> bytes:
 
 def _measure(
     name: str,
-    fn: t.Callable[[], None],
+    fn: t.Callable[[], object],
     *,
     bytes_per_op: int,
     warmup: int,
