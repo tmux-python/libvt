@@ -78,14 +78,15 @@ and `vt_pty` fixtures alongside {func}`~libvt.testing.assert_screen`,
 {class}`~libvt.terminal.FlightRecorder` ring buffers. See
 {doc}`topics/sync-and-asyncio` for details.
 
-#### Incremental sync deltas, `tmux` capture reconstruction, and graphics (#13–#19)
+#### Incremental sync deltas, `tmux` capture reconstruction, and graphics (#13–#20)
 
 {meth}`~libvt.terminal.Terminal.sync_token` and
 {meth}`~libvt.terminal.Terminal.changes_since` emit non-destructive
 multi-consumer {class}`~libvt.terminal.ScreenDelta` updates across both
 `"committed"` (`?2026`-held) and `"working"` views, paired with
-{meth}`~libvt.terminal.ScreenDelta.apply_lines` and
-{meth}`~libvt.terminal.ScreenDelta.apply_rows`.
+{meth}`~libvt.terminal.ScreenDelta.apply_lines`,
+{meth}`~libvt.terminal.ScreenDelta.apply_rows`, and `O(1)` copy-on-write
+{attr}`~libvt.terminal.Snapshot.history` sequence views.
 
 {func}`~libvt.tmux.decode_tmux_capture`,
 {class}`~libvt.tmux.TmuxPaneMetadata`, and

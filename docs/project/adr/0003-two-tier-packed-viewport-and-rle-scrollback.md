@@ -81,8 +81,11 @@ cold run-length-encoded (`RLE`) scrollback lines:
    - `RowView` wraps either a live `_Row` or a `FrozenRow`, exposing `.text`,
      `.wrapped`, `row[col] -> Cell` (returning `BLANK_CELL` when default), and
      `.runs -> tuple[RowRun, ...]` for `O(runs)` styled span rendering.
-   - Both `Screen.history` and `Snapshot.history` return `tuple[RowView, ...]`
-     without leaking mutable `deque` or private `_Row` internals.
+   - Primary scrollback stores `FrozenRow` records in `256`-row copy-on-write
+     tuple blocks (`_FrozenHistory` / `_HistoryView`), so `Screen.history`,
+     `Terminal.history`, and `Snapshot.history` satisfy
+     `collections.abc.Sequence[RowView]` with `O(1)` snapshot capture and
+     `O(1)` random row indexing without leaking mutable storage.
 
 ## Alternatives considered
 

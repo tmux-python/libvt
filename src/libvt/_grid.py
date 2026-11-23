@@ -16,6 +16,10 @@ Bit layout of each 64-bit unsigned attribute word (``0`` == blank default cell):
 from __future__ import annotations
 
 import array
+import bisect
+import collections.abc
+import operator
+import typing as t
 from dataclasses import dataclass
 
 from libvt._ucd import WidthRole
@@ -30,6 +34,11 @@ from libvt.style import (
     UnderlineStyle,
 )
 
+_ITEM0 = operator.itemgetter(0)
+_HISTORY_BLOCK_SHIFT = 8
+_HISTORY_BLOCK_SIZE = 1 << _HISTORY_BLOCK_SHIFT
+_HISTORY_BLOCK_MASK = _HISTORY_BLOCK_SIZE - 1
+
 _GLOBAL_ROW_GEN: int = 0
 
 
@@ -38,6 +47,7 @@ def bump_row_gen(row: _Row) -> int:
     global _GLOBAL_ROW_GEN
     _GLOBAL_ROW_GEN += 1
     row.content_gen = _GLOBAL_ROW_GEN
+    row._frozen = None
     return _GLOBAL_ROW_GEN
 
 
@@ -222,11 +232,10 @@ class FrozenRow:
     @property
     def used(self) -> int:
         """Return count of written columns in this sealed row."""
-        if self.cells is not None:
-            return len(self.cells)
+        text_cols = len(self.cells) if self.cells is not None else len(self.text)
         run_end = self.runs[-1][0] if self.runs else 0
         ext_end = (self.exts[-1][0] + 1) if self.exts else 0
-        return max(len(self.text), run_end, ext_end)
+        return max(text_cols, run_end, ext_end)
 
     def rstrip_text(self) -> str:
         """Return right-trimmed row text."""
@@ -234,24 +243,34 @@ class FrozenRow:
 
     def char_at(self, col: int) -> str:
         """Return cell string at *col*."""
+        if col < 0 or col >= self.cols:
+            return " "
         if self.cells is not None:
             return self.cells[col] if col < len(self.cells) else " "
         return self.text[col] if col < len(self.text) else " "
 
     def attr_at(self, col: int) -> int:
         """Return packed 64-bit attribute word at *col*."""
-        for end_col, word in self.runs:
-            if col < end_col:
-                return word
-        return 0
+        runs = self.runs
+        if not runs or col < 0:
+            return 0
+        if len(runs) == 1:
+            end_col, word = runs[0]
+            return word if col < end_col else 0
+        idx = bisect.bisect_right(runs, col, key=_ITEM0)
+        return runs[idx][1] if idx < len(runs) else 0
 
     def ext_at(self, col: int) -> _CellExt | None:
         """Return sparse :class:`_CellExt` at *col*, if any."""
-        for ext_col, ce in self.exts:
-            if ext_col == col:
-                return ce
-            if ext_col > col:
-                break
+        exts = self.exts
+        if not exts or col < 0:
+            return None
+        if len(exts) == 1:
+            ext_col, ce = exts[0]
+            return ce if ext_col == col else None
+        idx = bisect.bisect_right(exts, col, key=_ITEM0) - 1
+        if idx >= 0 and exts[idx][0] == col:
+            return exts[idx][1]
         return None
 
     def thaw(self, target_cols: int | None = None) -> _Row:
@@ -292,6 +311,8 @@ class _Row:
     """Mutable viewport row with lazy 64-bit ``array('Q')`` promotion."""
 
     __slots__ = (
+        "_frozen",
+        "_wrapped",
         "attrs",
         "chars",
         "content_gen",
@@ -300,7 +321,6 @@ class _Row:
         "text_used",
         "uniform_attr",
         "used",
-        "wrapped",
     )
 
     def __init__(self, cols: int) -> None:
@@ -311,8 +331,20 @@ class _Row:
         self.ext: dict[int, _CellExt] | None = None
         self.used: int = 0
         self.text_used: int = 0
-        self.wrapped: bool = False
+        self._wrapped: bool = False
         self.content_gen: int = 0
+        self._frozen: FrozenRow | None = None
+
+    @property
+    def wrapped(self) -> bool:
+        """Return ``True`` when this row soft-wrapped onto the next line."""
+        return self._wrapped
+
+    @wrapped.setter
+    def wrapped(self, value: bool) -> None:
+        if self._wrapped != value:
+            self._wrapped = value
+            self._frozen = None
 
     def _ensure_attrs(self) -> array.array[int]:
         if self.attrs is None:
@@ -358,7 +390,7 @@ class _Row:
                 self.ext.clear()
             self.used = cols if bce_word != 0 else 0
         self.text_used = 0
-        self.wrapped = False
+        self._wrapped = False
         bump_row_gen(self)
 
     def _set_raw(
@@ -825,20 +857,23 @@ class _Row:
         dup.ext = self.ext.copy() if self.ext else None
         dup.used = self.used
         dup.text_used = self.text_used
-        dup.wrapped = self.wrapped
+        dup._wrapped = self._wrapped
         dup.content_gen = self.content_gen
+        dup._frozen = self._frozen
         return dup
 
     def freeze(self) -> FrozenRow:
         """Seal this row into a compact run-length-encoded :class:`FrozenRow`."""
+        if self._frozen is not None:
+            return self._frozen
         cols = len(self.chars)
         t_used = self.text_used
         text = "".join(self.chars[:t_used])
         cells: tuple[str, ...] | None = None
-        if len(text) != t_used:
+        if len(text) != t_used or "" in self.chars[:t_used]:
             cells = tuple(self.chars[:t_used])
 
-        u = min(cols, self.used)
+        u = min(cols, max(self.used, t_used))
         runs: tuple[tuple[int, int], ...]
         if u == 0:
             runs = ()
@@ -857,18 +892,184 @@ class _Row:
             runs = tuple(run_list)
 
         exts = tuple(sorted(self.ext.items())) if self.ext else ()
-        return FrozenRow(
+        fr = FrozenRow(
             text=text,
             cols=cols,
             runs=runs,
             exts=exts,
             cells=cells,
-            wrapped=self.wrapped,
+            wrapped=self._wrapped,
         )
+        self._frozen = fr
+        return fr
 
     def rstrip_text(self) -> str:
         """Return row text up to ``text_used`` written columns."""
         return "".join(self.chars[: self.text_used])
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenHistory(collections.abc.Sequence[FrozenRow]):
+    """Immutable 256-row copy-on-write block snapshot of sealed scrollback."""
+
+    blocks: tuple[tuple[FrozenRow, ...], ...] = ()
+    tail: tuple[FrozenRow, ...] = ()
+    head_offset: int = 0
+    length: int = 0
+
+    @classmethod
+    def from_sequence(
+        cls,
+        rows: collections.abc.Sequence[FrozenRow],
+    ) -> _FrozenHistory:
+        """Pack an arbitrary :class:`FrozenRow` sequence into 256-row blocks."""
+        if isinstance(rows, _FrozenHistory):
+            return rows
+        n = len(rows)
+        if n == 0:
+            return _EMPTY_FROZEN_HISTORY
+        full_blocks = n >> _HISTORY_BLOCK_SHIFT
+        blocks = tuple(
+            tuple(rows[i << _HISTORY_BLOCK_SHIFT : (i + 1) << _HISTORY_BLOCK_SHIFT])
+            for i in range(full_blocks)
+        )
+        tail = tuple(rows[full_blocks << _HISTORY_BLOCK_SHIFT :])
+        return cls(blocks=blocks, tail=tail, head_offset=0, length=n)
+
+    def __len__(self) -> int:
+        return self.length
+
+    def at(self, index: int) -> FrozenRow:
+        """Return :class:`FrozenRow` at normalized ``0 <= index < length``."""
+        raw = self.head_offset + index
+        b_idx = raw >> _HISTORY_BLOCK_SHIFT
+        off = raw & _HISTORY_BLOCK_MASK
+        if b_idx < len(self.blocks):
+            return self.blocks[b_idx][off]
+        return self.tail[off]
+
+    @t.overload
+    def __getitem__(self, index: int) -> FrozenRow: ...
+
+    @t.overload
+    def __getitem__(self, index: slice) -> tuple[FrozenRow, ...]: ...
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> FrozenRow | tuple[FrozenRow, ...]:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.length)
+            return tuple(self.at(i) for i in range(start, stop, step))
+        if isinstance(index, bool) or not isinstance(index, int):
+            msg = f"history indices must be int or slice, got {type(index).__name__}"
+            raise TypeError(msg)
+        norm = index + self.length if index < 0 else index
+        if norm < 0 or norm >= self.length:
+            msg = f"history index {index} out of range for size {self.length}"
+            raise IndexError(msg)
+        return self.at(norm)
+
+    def __iter__(self) -> collections.abc.Iterator[FrozenRow]:
+        if self.length == 0:
+            return
+        if not self.blocks:
+            yield from self.tail[self.head_offset : self.head_offset + self.length]
+            return
+        yield from self.blocks[0][self.head_offset :]
+        for blk in self.blocks[1:]:
+            yield from blk
+        yield from self.tail
+
+
+_EMPTY_FROZEN_HISTORY = _FrozenHistory()
+
+
+class _HistoryBuffer:
+    """Bounded 256-row block scrollback buffer with ``O(1)`` CoW snapshots."""
+
+    __slots__ = ("_blocks", "_head_offset", "_len", "_maxlen", "_snapshot", "_tail")
+
+    def __init__(self, *, maxlen: int) -> None:
+        self._maxlen: int = max(0, maxlen)
+        self._blocks: list[tuple[FrozenRow, ...]] = []
+        self._tail: list[FrozenRow] = []
+        self._head_offset: int = 0
+        self._len: int = 0
+        self._snapshot: _FrozenHistory | None = _EMPTY_FROZEN_HISTORY
+
+    @property
+    def maxlen(self) -> int:
+        """Return scrollback line capacity (``0`` when disabled)."""
+        return self._maxlen
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __bool__(self) -> bool:
+        return self._len > 0
+
+    def __getitem__(self, index: int) -> FrozenRow:
+        if isinstance(index, bool) or not isinstance(index, int):
+            msg = f"history index must be int, got {type(index).__name__}"
+            raise TypeError(msg)
+        norm = index + self._len if index < 0 else index
+        if norm < 0 or norm >= self._len:
+            msg = f"history index {index} out of range for size {self._len}"
+            raise IndexError(msg)
+        raw = self._head_offset + norm
+        b_idx = raw >> _HISTORY_BLOCK_SHIFT
+        off = raw & _HISTORY_BLOCK_MASK
+        if b_idx < len(self._blocks):
+            return self._blocks[b_idx][off]
+        return self._tail[off]
+
+    def __iter__(self) -> collections.abc.Iterator[FrozenRow]:
+        return iter(self.freeze())
+
+    def clear(self) -> None:
+        """Discard all stored scrollback blocks."""
+        if self._len == 0:
+            return
+        self._blocks.clear()
+        self._tail = []
+        self._head_offset = 0
+        self._len = 0
+        self._snapshot = _EMPTY_FROZEN_HISTORY
+
+    def append(self, row: FrozenRow) -> bool:
+        """Append *row*, returning ``True`` when the oldest row was evicted."""
+        if self._maxlen <= 0:
+            return False
+        self._snapshot = None
+        self._tail.append(row)
+        if len(self._tail) == _HISTORY_BLOCK_SIZE:
+            self._blocks.append(tuple(self._tail))
+            self._tail = []
+        if self._len == self._maxlen:
+            self._head_offset += 1
+            if self._head_offset == _HISTORY_BLOCK_SIZE:
+                del self._blocks[0]
+                self._head_offset = 0
+            return True
+        self._len += 1
+        return False
+
+    def freeze(self) -> _FrozenHistory:
+        """Capture an ``O(1)`` CoW :class:`_FrozenHistory` snapshot."""
+        if self._snapshot is not None:
+            return self._snapshot
+        if self._len == 0:
+            self._snapshot = _EMPTY_FROZEN_HISTORY
+            return _EMPTY_FROZEN_HISTORY
+        snap = _FrozenHistory(
+            blocks=tuple(self._blocks),
+            tail=tuple(self._tail),
+            head_offset=self._head_offset,
+            length=self._len,
+        )
+        self._snapshot = snap
+        return snap
 
 
 type RowLike = _Row | FrozenRow

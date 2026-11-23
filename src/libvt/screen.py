@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-import collections
+import bisect
 import collections.abc
 import enum
+import operator
+import sys
 import typing as t
 from dataclasses import dataclass
 
 from libvt._grid import (
+    _EMPTY_FROZEN_HISTORY,
     _WIDTH_CLEAR_MASK,
     FrozenRow,
     RowLike,
     _CellExt,
+    _FrozenHistory,
+    _HistoryBuffer,
     _Row,
     bump_row_gen,
     raw_width_bits,
@@ -23,6 +28,8 @@ from libvt._ucd import WidthRole
 from libvt.graphics import GraphicsTracker, ImageMeta, ImagePlacement
 from libvt.input import KittyKeyboardStack
 from libvt.style import DEFAULT_STYLE, Hyperlink, Style
+
+_ITEM0 = operator.itemgetter(0)
 
 
 class CursorShape(enum.StrEnum):
@@ -192,6 +199,146 @@ def _slice_indices(s: slice, length: int) -> range:
     return range(start, stop)
 
 
+def _frozen_row_runs(
+    row: FrozenRow,
+    start_c: int,
+    limit: int,
+) -> tuple[RowRun, ...]:
+    """Coalesce ``(style, hyperlink)`` spans on *row* in ``O(runs + exts)``."""
+    if not row.runs and not row.exts and row.cells is None:
+        t_len = len(row.text)
+        if limit <= t_len:
+            txt = row.text[start_c:limit]
+        elif start_c >= t_len:
+            txt = " " * (limit - start_c)
+        else:
+            txt = row.text[start_c:t_len] + (" " * (limit - t_len))
+        return (
+            RowRun(
+                start_col=start_c,
+                end_col=limit,
+                text=txt,
+                style=DEFAULT_STYLE,
+                hyperlink=None,
+            ),
+        )
+
+    out: list[RowRun] = []
+    runs = row.runs
+    exts = row.exts
+    r_len = len(runs)
+    e_len = len(exts)
+    r_idx = bisect.bisect_right(runs, start_c, key=_ITEM0) if r_len else 0
+    e_idx = bisect.bisect_left(exts, start_c, key=_ITEM0) if e_len else 0
+
+    has_cur = False
+    run_start = start_c
+    cur_style = DEFAULT_STYLE
+    cur_link: Hyperlink | None = None
+    buf: list[str] = []
+    pos = start_c
+
+    while pos < limit:
+        if r_idx < r_len:
+            raw_r_end, word = runs[r_idx]
+            r_end = min(limit, raw_r_end)
+        else:
+            raw_r_end = limit + 1
+            word = 0
+            r_end = limit
+
+        while e_idx < e_len and exts[e_idx][0] < pos:
+            e_idx += 1
+        if e_idx >= e_len:
+            ext: _CellExt | None = None
+            e_end = limit
+        elif exts[e_idx][0] > pos:
+            ext = None
+            e_end = min(limit, exts[e_idx][0])
+        else:
+            ext = exts[e_idx][1]
+            scan_c = pos + 1
+            scan_i = e_idx + 1
+            while (
+                scan_c < r_end
+                and scan_i < e_len
+                and exts[scan_i][0] == scan_c
+                and exts[scan_i][1] == ext
+            ):
+                scan_c += 1
+                scan_i += 1
+            e_end = scan_c
+            e_idx = scan_i
+
+        seg_end = min(r_end, e_end)
+        if seg_end == raw_r_end:
+            r_idx += 1
+
+        role_bits = raw_width_bits(word)
+        if role_bits in (int(WidthRole.SPACER_TAIL), int(WidthRole.SPACER_HEAD)):
+            if not has_cur:
+                cur_style = unpack_style(word, ext)
+                cur_link = ext.hyperlink if ext is not None else None
+                run_start = pos
+                has_cur = True
+            pos = seg_end
+            continue
+
+        if row.cells is not None:
+            c_len = len(row.cells)
+            if seg_end <= c_len:
+                seg_txt = "".join(row.cells[pos:seg_end])
+            elif pos >= c_len:
+                seg_txt = " " * (seg_end - pos)
+            else:
+                seg_txt = "".join(row.cells[pos:c_len]) + (" " * (seg_end - c_len))
+        else:
+            t_len = len(row.text)
+            if seg_end <= t_len:
+                seg_txt = row.text[pos:seg_end]
+            elif pos >= t_len:
+                seg_txt = " " * (seg_end - pos)
+            else:
+                seg_txt = row.text[pos:t_len] + (" " * (seg_end - t_len))
+
+        st = unpack_style(word, ext)
+        lnk = ext.hyperlink if ext is not None else None
+        if not has_cur:
+            run_start = pos
+            cur_style = st
+            cur_link = lnk
+            buf = [seg_txt]
+            has_cur = True
+        elif st != cur_style or lnk != cur_link:
+            out.append(
+                RowRun(
+                    start_col=run_start,
+                    end_col=pos,
+                    text="".join(buf),
+                    style=cur_style,
+                    hyperlink=cur_link,
+                ),
+            )
+            run_start = pos
+            cur_style = st
+            cur_link = lnk
+            buf = [seg_txt]
+        else:
+            buf.append(seg_txt)
+        pos = seg_end
+
+    out.append(
+        RowRun(
+            start_col=run_start,
+            end_col=limit,
+            text="".join(buf),
+            style=cur_style,
+            hyperlink=cur_link,
+        ),
+    )
+    return tuple(out)
+
+
 class RowView(collections.abc.Sequence[Cell]):
     """Read-only sequence view over one live viewport or scrollback row."""
 
@@ -232,7 +379,11 @@ class RowView(collections.abc.Sequence[Cell]):
         total_cols = len(row.chars) if isinstance(row, _Row) else row.cols
         if self._col_range.start == 0 and self._col_range.stop == total_cols:
             return row.rstrip_text()
-        row_t_used = row.text_used if isinstance(row, _Row) else row.used
+        row_t_used = (
+            row.text_used
+            if isinstance(row, _Row)
+            else (len(row.cells) if row.cells is not None else len(row.text))
+        )
         limit = min(self._col_range.stop, row_t_used)
         if limit <= self._col_range.start:
             return ""
@@ -250,6 +401,8 @@ class RowView(collections.abc.Sequence[Cell]):
         start_c = self._col_range.start
         if limit <= start_c:
             return ()
+        if isinstance(row, FrozenRow):
+            return _frozen_row_runs(row, start_c, limit)
         out: list[RowRun] = []
         run_start = start_c
         first_ext = row.ext_at(start_c)
@@ -318,6 +471,164 @@ class RowView(collections.abc.Sequence[Cell]):
             )
         norm = _normalize_index(index, len(self._col_range), axis="col")
         return _materialize_cell(row, self._col_range.start + norm)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare two :class:`RowView` instances by wrapped state and cells."""
+        if self is other:
+            return True
+        if not isinstance(other, RowView):
+            return NotImplemented
+        if len(self._col_range) != len(other._col_range):
+            return False
+        r1 = self._current_row()
+        r2 = other._current_row()
+        if r1 is r2 and self._col_range == other._col_range:
+            return True
+        c1 = len(r1.chars) if isinstance(r1, _Row) else r1.cols
+        c2 = len(r2.chars) if isinstance(r2, _Row) else r2.cols
+        if (
+            self._col_range.start == 0
+            and self._col_range.stop == c1
+            and other._col_range.start == 0
+            and other._col_range.stop == c2
+        ):
+            f1 = r1.freeze() if isinstance(r1, _Row) else r1
+            f2 = r2.freeze() if isinstance(r2, _Row) else r2
+            return f1 == f2
+        if r1.wrapped != r2.wrapped:
+            return False
+        return all(a == b for a, b in zip(self, other, strict=True))
+
+
+def _row_view_to_full_frozen(value: object) -> FrozenRow | None:
+    if not isinstance(value, RowView):
+        return None
+    r = value._current_row()
+    cols = len(r.chars) if isinstance(r, _Row) else r.cols
+    if value._col_range.start == 0 and value._col_range.stop == cols:
+        return r.freeze() if isinstance(r, _Row) else r
+    return None
+
+
+class _HistoryView(collections.abc.Sequence[RowView]):
+    """Lazy ``O(1)`` immutable sequence view over scrollback :class:`RowView` lines."""
+
+    __slots__ = ("_data", "_range")
+
+    def __init__(
+        self,
+        data: _FrozenHistory | None = None,
+        index_range: range | None = None,
+    ) -> None:
+        eff = _EMPTY_FROZEN_HISTORY if data is None else data
+        self._data = eff
+        self._range = range(len(eff)) if index_range is None else index_range
+
+    def __len__(self) -> int:
+        """Return number of scrollback rows in this view."""
+        return len(self._range)
+
+    def __bool__(self) -> bool:
+        """Return ``True`` when at least one scrollback row is present."""
+        return bool(self._range)
+
+    @t.overload
+    def __getitem__(self, index: int) -> RowView: ...
+
+    @t.overload
+    def __getitem__(self, index: slice) -> _HistoryView: ...
+
+    def __getitem__(self, index: int | slice) -> RowView | _HistoryView:
+        """Index one :class:`RowView` in ``O(1)`` or slice a sub-view."""
+        if isinstance(index, slice):
+            return _HistoryView(self._data, self._range[index])
+        if isinstance(index, bool) or not isinstance(index, int):
+            msg = f"history indices must be int or slice, got {type(index).__name__}"
+            raise TypeError(msg)
+        return RowView(self._data.at(self._range[index]))
+
+    def __contains__(self, value: object) -> bool:
+        """Return ``True`` when *value* matches a scrollback :class:`RowView`."""
+        if not isinstance(value, RowView):
+            return False
+        target_fr = _row_view_to_full_frozen(value)
+        if target_fr is not None:
+            r = self._range
+            if r.start == 0 and r.stop == len(self._data) and r.step == 1:
+                return any(fr == target_fr for fr in self._data)
+            at = self._data.at
+            return any(at(idx) == target_fr for idx in r)
+        return any(item == value for item in self)
+
+    def count(self, value: object) -> int:
+        """Return count of scrollback rows equal to *value*."""
+        if not isinstance(value, RowView):
+            return 0
+        target_fr = _row_view_to_full_frozen(value)
+        if target_fr is not None:
+            at = self._data.at
+            return sum(1 for idx in self._range if at(idx) == target_fr)
+        return sum(1 for item in self if item == value)
+
+    def index(
+        self,
+        value: object,
+        start: int = 0,
+        stop: int = sys.maxsize,
+    ) -> int:
+        """Return first zero-based index of *value* in ``[start, stop)``."""
+        if isinstance(value, RowView):
+            sub_indices = range(len(self._range))[start:stop]
+            target_fr = _row_view_to_full_frozen(value)
+            at = self._data.at
+            if target_fr is not None:
+                for pos in sub_indices:
+                    if at(self._range[pos]) == target_fr:
+                        return pos
+            else:
+                for pos in sub_indices:
+                    if RowView(at(self._range[pos])) == value:
+                        return pos
+        msg = "RowView is not in history"
+        raise ValueError(msg)
+
+    def __iter__(self) -> collections.abc.Iterator[RowView]:
+        """Yield :class:`RowView` items across this view."""
+        r = self._range
+        if not r:
+            return
+        if r.start == 0 and r.stop == len(self._data) and r.step == 1:
+            for fr in self._data:
+                yield RowView(fr)
+            return
+        at = self._data.at
+        for idx in r:
+            yield RowView(at(idx))
+
+    def __reversed__(self) -> collections.abc.Iterator[RowView]:
+        """Yield :class:`RowView` items in reverse order."""
+        at = self._data.at
+        for idx in reversed(self._range):
+            yield RowView(at(idx))
+
+    def __eq__(self, other: object) -> bool:
+        """Compare two :class:`_HistoryView` instances by underlying frozen rows."""
+        if self is other:
+            return True
+        if not isinstance(other, _HistoryView):
+            return NotImplemented
+        if len(self._range) != len(other._range):
+            return False
+        if self._data is other._data and self._range == other._range:
+            return True
+        return all(
+            self._data.at(i) == other._data.at(j)
+            for i, j in zip(self._range, other._range, strict=True)
+        )
+
+    def __repr__(self) -> str:
+        """Return concise summary representation."""
+        return f"HistoryView(len={len(self._range)})"
 
 
 class RegionView(collections.abc.Sequence[RowView]):
@@ -476,9 +787,7 @@ class Screen:
             raise ValueError(msg)
         self._cols = cols
         self._rows: list[_Row] = [_Row(cols) for _ in range(rows)]
-        self._history: collections.deque[FrozenRow] = collections.deque(
-            maxlen=max(0, scrollback),
-        )
+        self._history: _HistoryBuffer = _HistoryBuffer(maxlen=max(0, scrollback))
         self._scrolled_total: int = 0
         self._evicted_total: int = 0
         self._history_clear_at: int = 0
@@ -542,9 +851,9 @@ class Screen:
         self._pending_wrap = value.pending_wrap
 
     @property
-    def history(self) -> tuple[RowView, ...]:
-        """Return immutable :class:`RowView` sequence over sealed scrollback rows."""
-        return tuple(RowView(fr) for fr in self._history)
+    def history(self) -> collections.abc.Sequence[RowView]:
+        """Return ``O(1)`` immutable :class:`RowView` sequence over scrollback."""
+        return _HistoryView(self._history.freeze())
 
     @property
     def tabstops(self) -> tuple[int, ...]:
@@ -600,11 +909,8 @@ class Screen:
         return self._gfx.snapshot_placements()
 
     def _append_history(self, frozen: FrozenRow) -> None:
-        maxlen = self._history.maxlen
-        if maxlen is not None and maxlen > 0:
-            if len(self._history) == maxlen:
-                self._evicted_total += 1
-            self._history.append(frozen)
+        if self._history.append(frozen):
+            self._evicted_total += 1
 
     def _clear_row_spacer_head(self, row_obj: _Row) -> bool:
         if not row_obj.has_wide or row_obj.attrs is None:
@@ -1209,19 +1515,6 @@ def _sync_partial_scroll_bounds(
     r_col: int,
 ) -> None:
     limit = r_col + 1
-    if dst_row.used <= limit:
-        cand_u = (
-            min(src_row.used, limit) if src_row.used > left else min(dst_row.used, left)
-        )
-        floor_u = min(dst_row.used, left)
-        while (
-            cand_u > floor_u
-            and dst_row.chars[cand_u - 1] == " "
-            and dst_row.attr_at(cand_u - 1) == 0
-            and dst_row.ext_at(cand_u - 1) is None
-        ):
-            cand_u -= 1
-        dst_row.used = cand_u
     if dst_row.text_used <= limit:
         cand_t = (
             min(src_row.text_used, limit)
@@ -1233,6 +1526,20 @@ def _sync_partial_scroll_bounds(
             while cand_t > floor_t and dst_row.chars[cand_t - 1] == " ":
                 cand_t -= 1
         dst_row.text_used = cand_t
+    if dst_row.used <= limit:
+        cand_u = (
+            min(src_row.used, limit) if src_row.used > left else min(dst_row.used, left)
+        )
+        floor_u = max(min(dst_row.used, left), dst_row.text_used)
+        if src_row.used > limit:
+            while (
+                cand_u > floor_u
+                and dst_row.chars[cand_u - 1] == " "
+                and dst_row.attr_at(cand_u - 1) == 0
+                and dst_row.ext_at(cand_u - 1) is None
+            ):
+                cand_u -= 1
+        dst_row.used = max(cand_u, dst_row.text_used)
 
 
 class ScreenSet:

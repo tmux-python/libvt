@@ -16,10 +16,12 @@ import urllib.parse
 from dataclasses import dataclass
 
 from libvt._grid import (
+    _EMPTY_FROZEN_HISTORY,
     _PEN_BASE_MASK,
     _PEN_BG_MASK,
     FrozenRow,
     _CellExt,
+    _FrozenHistory,
     _Row,
     bump_row_gen,
     current_row_gen,
@@ -95,6 +97,7 @@ from libvt.screen import (
     Screen,
     ScreenSet,
     ScrollRegion,
+    _HistoryView,
     format_rows_text,
     slice_grid,
 )
@@ -256,7 +259,7 @@ class ScreenDelta:
     dirty_rows : tuple[int, ...]
         Sorted zero-based viewport row indices modified after shifting the
         previous viewport upward by :attr:`viewport_scroll_up`.
-    new_history : tuple[RowView, ...]
+    new_history : collections.abc.Sequence[RowView]
         Newly sealed scrollback rows appended since *from_token*, ordered
         oldest to newest.
     history_evicted : int
@@ -282,7 +285,7 @@ class ScreenDelta:
     resync_reason: ResyncReason
     viewport_scroll_up: int
     dirty_rows: tuple[int, ...]
-    new_history: tuple[RowView, ...]
+    new_history: collections.abc.Sequence[RowView]
     history_evicted: int
     history_cleared: bool
     cursor_changed: bool
@@ -536,7 +539,9 @@ class Snapshot:
         self,
         *,
         rows: tuple[_Row, ...],
-        history: tuple[FrozenRow, ...],
+        history: _FrozenHistory | collections.abc.Sequence[FrozenRow] = (
+            _EMPTY_FROZEN_HISTORY
+        ),
         cols: int,
         cursor: Cursor,
         title: str,
@@ -555,16 +560,17 @@ class Snapshot:
     ) -> None:
         object.__setattr__(self, "_frozen", False)
         self._rows = rows
-        self._history = history
+        hist_obj = _FrozenHistory.from_sequence(history)
+        self._history: _FrozenHistory = hist_obj
         self._cols = cols
         eff_scrolled = (
-            (0 if active_is_alt else len(history))
+            (0 if active_is_alt else len(hist_obj))
             if scrolled_total is None
             else scrolled_total
         )
         self._scrolled_total = eff_scrolled
         self._evicted_total = (
-            (0 if active_is_alt else max(0, eff_scrolled - len(history)))
+            (0 if active_is_alt else max(0, eff_scrolled - len(hist_obj)))
             if evicted_total is None
             else evicted_total
         )
@@ -703,7 +709,7 @@ class Snapshot:
             msg = f"abs_row {abs_row} was evicted (earliest retained is {first_abs})"
             raise IndexError(msg)
         if abs_row < self._scrolled_total:
-            return RowView(self._history[abs_row - first_abs])
+            return RowView(self._history.at(abs_row - first_abs))
         rel = abs_row - self._scrolled_total
         if rel < len(self._rows):
             return RowView(self._rows[rel])
@@ -711,9 +717,9 @@ class Snapshot:
         raise IndexError(msg)
 
     @property
-    def history(self) -> tuple[RowView, ...]:
-        """Return immutable :class:`RowView` sequence over scrollback rows."""
-        return tuple(RowView(fr) for fr in self._history)
+    def history(self) -> collections.abc.Sequence[RowView]:
+        """Return ``O(1)`` immutable :class:`RowView` sequence over scrollback rows."""
+        return _HistoryView(self._history)
 
     @property
     def lines(self) -> tuple[str, ...]:
@@ -1364,7 +1370,7 @@ class Terminal:
         return self._screens
 
     @property
-    def history(self) -> tuple[RowView, ...]:
+    def history(self) -> collections.abc.Sequence[RowView]:
         """Return sealed scrollback :class:`~libvt.screen.RowView` lines."""
         return self._screens.primary.history
 
@@ -1478,7 +1484,7 @@ class Terminal:
         active_alt = self._screens.active_is_alt
         return Snapshot(
             rows=tuple(r.clone() for r in scr._rows),
-            history=tuple(self._screens.primary._history),
+            history=self._screens.primary._history.freeze(),
             cols=scr.cols,
             cursor=scr.cursor,
             title=self._title,
@@ -1627,6 +1633,7 @@ class Terminal:
         hist_cleared = cur_tok.history_clear_seq != token.history_clear_seq
         hist_len = len(cur_snap._history)
         zero_hist_cap = self._screens.primary._history.maxlen == 0 and hist_len == 0
+        new_hist: collections.abc.Sequence[RowView]
         if hist_cleared:
             if zero_hist_cap:
                 new_hist = ()
@@ -1636,11 +1643,7 @@ class Terminal:
                 if post_clear > hist_len:
                     return _full(ResyncReason.HISTORY_EVICTED)
                 new_hist = (
-                    tuple(
-                        RowView(fr) for fr in cur_snap._history[hist_len - post_clear :]
-                    )
-                    if post_clear > 0
-                    else ()
+                    cur_snap.history[hist_len - post_clear :] if post_clear > 0 else ()
                 )
                 evicted_cnt = 0
         else:
@@ -1651,11 +1654,7 @@ class Terminal:
             else:
                 if added > hist_len:
                     return _full(ResyncReason.HISTORY_EVICTED)
-                new_hist = (
-                    tuple(RowView(fr) for fr in cur_snap._history[hist_len - added :])
-                    if added > 0
-                    else ()
-                )
+                new_hist = cur_snap.history[hist_len - added :] if added > 0 else ()
                 evicted_cnt = max(0, cur_tok.evicted_total - token.evicted_total)
 
         v_scroll = (

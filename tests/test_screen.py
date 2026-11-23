@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import collections.abc
 import random
+import time
 import typing as t
 
 import pytest
@@ -12,6 +14,7 @@ from libvt._ucd import WidthRole
 from libvt.config import DEFAULT_PROFILE, XTERM_PROFILE, Profile
 from libvt.events import InBandResize
 from libvt.modes import Mode
+from libvt.style import AnsiColor
 
 
 def _assert_grid_invariants(term: libvt.Terminal) -> None:
@@ -240,6 +243,99 @@ def test_row_wide_healing_decslrm_scroll_and_rle_history() -> None:
     assert fr_t._screens.primary._history[0].used == 1
     assert top_view.text == "B"
     assert len(fr_t.history[0].runs) >= 1
+
+
+def test_frozen_row_combining_wide_bce_and_256_block_cow_history() -> None:
+    """``_Row.freeze()`` retains wide+combining+BCE cells and ``O(1)`` CoW history."""
+    term = libvt.Terminal(rows=2, cols=8, scrollback=10)
+    term.feed("e\u0301中\x1b[44m\x1b[K\r\n❤\ufe0f🇯🇵👋🏻Z\r\nv0\r\nv1".encode())
+    snap = term.snapshot()
+    assert isinstance(snap.history, collections.abc.Sequence)
+    assert isinstance(term.history, collections.abc.Sequence)
+    assert not isinstance(snap.history, tuple)
+
+    h0 = snap.history[0]
+    assert h0.text == "e\u0301中"
+    assert (h0[0].text, h0[1].text, h0[1].width_role, h0[2].width_role) == (
+        "e\u0301",
+        "中",
+        WidthRole.WIDE,
+        WidthRole.SPACER_TAIL,
+    )
+    assert [r.text for r in h0.runs] == ["e\u0301中", "     "]
+    assert h0.runs[1].style.bg == AnsiColor.BLUE
+    assert (h0.runs[1].start_col, h0.runs[1].end_col) == (3, 8)
+
+    h1 = snap.history[1]
+    assert (h1[0].text, h1[2].text, h1[4].text, h1[6].text) == (
+        "❤\ufe0f",
+        "🇯🇵",
+        "👋🏻",
+        "Z",
+    )
+
+    bce_term = libvt.Terminal(rows=2, cols=8, scrollback=10)
+    bce_term.feed("中\x1b[44m\x1b[K\r\n\n\n".encode())
+    bce_runs = bce_term.snapshot().history[0].runs
+    assert [(r.start_col, r.end_col, r.text, r.style.bg) for r in bce_runs] == [
+        (0, 2, "中", None),
+        (2, 8, "      ", AnsiColor.BLUE),
+    ]
+
+    ech_el = libvt.Terminal(rows=2, cols=10, scrollback=4)
+    ech_el.feed(b"\x1b[41mAB\x1b[K\x1b[0m\x1b[3G\x1b[5X\x1b[8G\x1b[K\r\n\n\n")
+    assert ech_el.snapshot().history[0]._row.used == 2
+    assert [r.text for r in ech_el.snapshot().history[0].runs] == ["AB"]
+
+    declrmm_sp = libvt.Terminal(rows=3, cols=6, scrollback=10)
+    declrmm_sp.feed(
+        b"\r\nA  \x1b[?69h\x1b[1;4s\x1b[1;1H\x1b[S\x1b[?69l\x1b[3;1H\r\n\r\n\r\n"
+    )
+    assert declrmm_sp.history[0].text == "A  "
+    assert [r.text for r in declrmm_sp.history[0].runs] == ["A  "]
+    declrmm_sp.resize(rows=3, cols=8)
+    assert declrmm_sp.history[0].text == "A  "
+
+    deep = libvt.Terminal(rows=2, cols=16, scrollback=50_000)
+    deep.feed(b"".join(f"line-{i:05d}\r\n".encode() for i in range(50_002)))
+    assert len(deep.history) == 50_000
+    assert (deep.history[0].text, deep.history[-1].text) == (
+        "line-00001",
+        "line-50000",
+    )
+    assert deep.history[0] == deep.history[0]
+    assert deep.history[255] in deep.history
+    assert deep.history.index(deep.history[257]) == 257
+    assert deep.history.count(deep.history[257]) == 1
+    assert [r.text for r in deep.history[254:258]] == [
+        "line-00255",
+        "line-00256",
+        "line-00257",
+        "line-00258",
+    ]
+    assert [r.text for r in deep.history[-3:][::-1]] == [
+        "line-50000",
+        "line-49999",
+        "line-49998",
+    ]
+    assert next(reversed(deep.history)).text == "line-50000"
+
+    snap_a = deep.snapshot()
+    tok = deep.sync_token()
+    t0 = time.perf_counter()
+    for step in range(50):
+        deep.feed(f"tail-{step:02d}\r\n".encode())
+        s_deep = deep.snapshot()
+        delta = deep.changes_since(tok)
+        tok = delta.token
+        assert delta.full_resync is False
+        assert len(delta.new_history) == 1
+        assert s_deep.history[-1].text == (
+            "line-50001" if step == 0 else f"tail-{step - 1:02d}"
+        )
+    assert time.perf_counter() - t0 < 0.05
+    snap_b = deep.snapshot()
+    assert snap_a._history.blocks[1] is snap_b._history.blocks[1]
 
 
 def test_seeded_grid_and_reflow_invariants() -> None:

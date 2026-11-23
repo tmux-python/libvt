@@ -115,7 +115,7 @@ def test_csi_motions_selective_erase_ed3_ed2_and_decstr() -> None:
     ed3_t.feed(b"old\r\nnew\r\nABCD")
     ed3_t.drain_events()
     ed3_t.feed(b"\x1b[3J\x1b[?3J\x1b[99J")
-    assert (ed3_t.history, ed3_t.lines, ed3_t.cursor.pending_wrap) == (
+    assert (tuple(ed3_t.history), ed3_t.lines, ed3_t.cursor.pending_wrap) == (
         (),
         ("new", "ABCD"),
         True,

@@ -576,6 +576,7 @@ def _trim_unwrapped_row(row: _Row) -> None:
         and row.ext_at(row.used - 1) is None
     ):
         row.used -= 1
+    row._frozen = None
 
 
 def _populate_screen_from_lines(
