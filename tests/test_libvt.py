@@ -18,7 +18,7 @@ def test_package_metadata() -> None:
     assert libvt.__title__ == "libvt"
     assert libvt.__package_name__ == "libvt"
     assert libvt.__license__ == "MIT"
-    assert libvt.__version__.startswith("0.1.")
+    assert libvt.__version__.startswith("0.0.")
 
 
 def test_import_libvt_leaves_optional_subsystems_unloaded() -> None:

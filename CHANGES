@@ -1,10 +1,16 @@
 # Changelog
 
-## libvt 0.1.x (Yet to be released)
+## libvt 0.0.1a1 (Yet to be released)
 
 <!-- KEEP THIS PLACEHOLDER - DO NOT REMOVE OR MODIFY THIS LINE -->
 _Notes on the upcoming release will go here._
 <!-- END PLACEHOLDER - ADD NEW CHANGELOG ENTRIES BELOW THIS LINE -->
+
+## libvt 0.0.1a0 (2026-11-22)
+
+Initial pre-alpha release of `libvt`: a pure-Python, zero-dependency virtual
+terminal emulator, streaming VT500 byte parser, mode-aware input encoder,
+`asyncio` POSIX PTY adapter, and `pytest` plugin.
 
 ### What's new
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 __title__ = "libvt"
 __package_name__ = "libvt"
-__version__ = "0.1.0a0"
+__version__ = "0.0.1a0"
 __description__ = (
     "Pure-Python, zero-dependency, typed virtual terminal emulator"
     " and streaming VT parser."
