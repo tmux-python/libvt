@@ -337,6 +337,38 @@ def test_frozen_row_combining_wide_bce_and_256_block_cow_history() -> None:
     snap_b = deep.snapshot()
     assert snap_a._history.blocks[1] is snap_b._history.blocks[1]
 
+    unwrapped_fr = deep._screens.primary._history[10]
+    t_rz = time.perf_counter()
+    deep.resize(rows=2, cols=20)
+    assert time.perf_counter() - t_rz < 0.1
+    assert deep._screens.primary._history[10].text == unwrapped_fr.text
+    assert deep._screens.primary._history[10].runs is unwrapped_fr.runs
+
+    snap_rz = deep.snapshot()
+    first_abs = snap_rz.evicted_total
+    assert len(snap_rz.at_abs(first_abs)) == 20
+    assert snap_rz.at_abs(first_abs) == snap_rz.history[0]
+    assert snap_rz.at_abs(first_abs) in snap_rz.history
+    assert snap_rz.history != snap_b.history
+
+    t_20 = libvt.Terminal(rows=2, cols=20, scrollback=10)
+    t_10 = libvt.Terminal(rows=2, cols=10, scrollback=10)
+    for t_eq in (t_20, t_10):
+        t_eq.feed(b"hello\r\nrow1\r\nrow2")
+    t_10.resize(rows=2, cols=20)
+    assert t_10.snapshot().history == t_20.snapshot().history
+
+    t_nr = libvt.Terminal(rows=2, cols=6, scrollback=10)
+    t_nr.feed_str("aaa中\r\nx\r\ny")
+    t_nr.resize(rows=2, cols=4, reflow=False)
+    nr_snap = t_nr.snapshot()
+    assert nr_snap.history[0].text == "aaa中"
+    assert nr_snap.history[0][3].width_role == libvt.WidthRole.WIDE
+    assert nr_snap.history[0][4].width_role == libvt.WidthRole.SPACER_TAIL
+    assert nr_snap.at_abs(0) == nr_snap.history[0]
+    assert nr_snap.at_abs(0) in nr_snap.history
+    assert nr_snap.history.index(nr_snap.at_abs(0)) == 0
+
 
 def test_seeded_grid_and_reflow_invariants() -> None:
     """Seeded property fuzzing preserves wide-spacer and cursor bounds."""

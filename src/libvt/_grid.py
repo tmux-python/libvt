@@ -243,7 +243,7 @@ class FrozenRow:
 
     def char_at(self, col: int) -> str:
         """Return cell string at *col*."""
-        if col < 0 or col >= self.cols:
+        if col < 0:
             return " "
         if self.cells is not None:
             return self.cells[col] if col < len(self.cells) else " "
@@ -1054,6 +1054,33 @@ class _HistoryBuffer:
             return True
         self._len += 1
         return False
+
+    def replace_all(self, rows: collections.abc.Sequence[RowLike]) -> int:
+        """Replace buffer with trailing ``maxlen`` frozen rows; return evicted."""
+        self.clear()
+        n = len(rows)
+        if self._maxlen <= 0 or n == 0:
+            return n
+        evicted = max(0, n - self._maxlen)
+        kept_len = n - evicted
+        full_blocks = kept_len >> _HISTORY_BLOCK_SHIFT
+        blocks: list[tuple[FrozenRow, ...]] = []
+        pos = evicted
+        for _ in range(full_blocks):
+            nxt = pos + _HISTORY_BLOCK_SIZE
+            chunk = rows[pos:nxt]
+            blocks.append(
+                tuple(r if isinstance(r, FrozenRow) else r.freeze() for r in chunk)
+            )
+            pos = nxt
+        self._blocks = blocks
+        self._tail = [
+            r if isinstance(r, FrozenRow) else r.freeze() for r in rows[pos:n]
+        ]
+        self._head_offset = 0
+        self._len = kept_len
+        self._snapshot = None
+        return evicted
 
     def freeze(self) -> _FrozenHistory:
         """Capture an ``O(1)`` CoW :class:`_FrozenHistory` snapshot."""

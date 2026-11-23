@@ -709,7 +709,8 @@ class Snapshot:
             msg = f"abs_row {abs_row} was evicted (earliest retained is {first_abs})"
             raise IndexError(msg)
         if abs_row < self._scrolled_total:
-            return RowView(self._history.at(abs_row - first_abs))
+            fr = self._history.at(abs_row - first_abs)
+            return RowView(fr, range(max(self._cols, fr.used)))
         rel = abs_row - self._scrolled_total
         if rel < len(self._rows):
             return RowView(self._rows[rel])
@@ -719,7 +720,7 @@ class Snapshot:
     @property
     def history(self) -> collections.abc.Sequence[RowView]:
         """Return ``O(1)`` immutable :class:`RowView` sequence over scrollback rows."""
-        return _HistoryView(self._history)
+        return _HistoryView(self._history, cols=self._cols)
 
     @property
     def lines(self) -> tuple[str, ...]:
@@ -1863,7 +1864,40 @@ class Terminal:
         eff_reflow = self._profile.reflow_on_resize if reflow is None else reflow
         self._before_mutate()
         self._clear_cluster_anchor()
-        self._screens.resize(rows=rows, cols=cols, reflow=eff_reflow)
+        old_zones = tuple(self._prompt_zones)
+        zone_pins = tuple((z.abs_row, z.col) for z in old_zones)
+        remapped_pins = self._screens._resize_with_pins(
+            rows=rows,
+            cols=cols,
+            reflow=eff_reflow,
+            primary_pins=zone_pins,
+        )
+        if old_zones and len(remapped_pins) == len(old_zones):
+            prim = self._screens.primary
+            min_z_abs = prim._evicted_total
+            max_z_abs = prim._scrolled_total + rows
+            changed_z = False
+            updated_z: list[PromptZone] = []
+            for z, (new_abs, new_col) in zip(old_zones, remapped_pins, strict=True):
+                if new_abs < min_z_abs or new_abs >= max_z_abs:
+                    changed_z = True
+                    continue
+                if new_abs != z.abs_row or new_col != z.col:
+                    updated_z.append(
+                        PromptZone(
+                            kind=z.kind,
+                            abs_row=new_abs,
+                            col=new_col,
+                            exit_code=z.exit_code,
+                        )
+                    )
+                    changed_z = True
+                else:
+                    updated_z.append(z)
+            if changed_z:
+                self._prompt_zones.clear()
+                self._prompt_zones.extend(updated_z)
+                self._aux_revision += 1
         if not self._modes.is_set(Mode.DECAWM):
             self._screens.primary._pending_wrap = False
             self._screens.alternate._pending_wrap = False

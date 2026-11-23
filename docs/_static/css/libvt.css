@@ -1,0 +1,17 @@
+/* Keep triple-quoted string literals (.sd) upright for box-drawing alignment. */
+.highlight .sd {
+  font-style: normal;
+}
+
+/* Prevent unscoped light-theme italic rules from bleeding into dark Monokai. */
+@media not print {
+  body[data-theme="dark"] .highlight span:not(.ge):not(.ges) {
+    font-style: normal;
+  }
+}
+
+@media not print and (prefers-color-scheme: dark) {
+  body:not([data-theme="light"]) .highlight span:not(.ge):not(.ges) {
+    font-style: normal;
+  }
+}

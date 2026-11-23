@@ -6,6 +6,20 @@
 _Notes on the upcoming release will go here._
 <!-- END PLACEHOLDER - ADD NEW CHANGELOG ENTRIES BELOW THIS LINE -->
 
+### Fixes
+
+#### Graphics retention, `DECSTBM` `SIXEL` masking, and streaming reflow (#21)
+
+{meth}`~libvt.graphics.GraphicsTracker.on_region_scroll` preserves `SIXEL`
+visibility masks and scrollback-bound placements when `DECSTBM` top-zero
+margins advance scrollback history. {meth}`~libvt.terminal.Terminal.resize`
+and {meth}`~libvt.screen.Screen.resize` retain stored images and placements
+across reflow and non-reflow resizes, stream unwrapped scrollback lines that
+fit within `cols` in `O(1)` per row without reallocating history blocks,
+preserve monotonic {attr}`~libvt.terminal.Snapshot.scrolled_total`
+continuity, and remap {class}`~libvt.events.PromptZone` and cell-anchored
+Kitty {class}`~libvt.graphics.ImagePlacement` `(abs_row, col)` pins.
+
 ## libvt 0.0.1a0 (2026-11-22)
 
 Initial pre-alpha release of `libvt`: a pure-Python, zero-dependency virtual
