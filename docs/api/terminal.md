@@ -3,4 +3,5 @@
 ```{eval-rst}
 .. automodule:: libvt.terminal
    :members:
+   :exclude-members: _state
 ```

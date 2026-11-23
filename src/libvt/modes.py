@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections.abc
 import enum
 
 DEC_PRIVATE_MASK = 0x8000
@@ -77,12 +78,18 @@ _RECOGNIZED_MODES: frozenset[int] = frozenset(int(m) for m in Mode)
 class ModeState:
     """Mutable set of active ANSI and DEC private modes."""
 
-    __slots__ = ("_enabled",)
+    __slots__ = ("_enabled", "_on_mutate")
 
-    def __init__(self, enabled: set[Mode] | None = None) -> None:
+    def __init__(
+        self,
+        enabled: set[Mode] | None = None,
+        *,
+        on_mutate: collections.abc.Callable[[], None] | None = None,
+    ) -> None:
         self._enabled: set[Mode] = (
             set(_DEFAULT_ENABLED_MODES) if enabled is None else set(enabled)
         )
+        self._on_mutate = on_mutate
 
     def is_set(self, mode: Mode) -> bool:
         """Return ``True`` when *mode* is enabled."""
@@ -90,6 +97,11 @@ class ModeState:
 
     def set_mode(self, mode: Mode, *, enabled: bool) -> None:
         """Enable or disable *mode*."""
+        present = mode in self._enabled
+        if present == enabled:
+            return
+        if self._on_mutate is not None:
+            self._on_mutate()
         if enabled:
             self._enabled.add(mode)
         else:
@@ -106,6 +118,11 @@ class ModeState:
         Exiting alternate screen via any of ``?47l``, ``?1047l``, or ``?1049l``
         clears all three flags so ``DECRQM`` never reports a stale set bit.
         """
+        target = {entered_via} if active_is_alt else set()
+        if (self._enabled & ALT_SCREEN_MODES) == target:
+            return
+        if self._on_mutate is not None:
+            self._on_mutate()
         self._enabled.difference_update(ALT_SCREEN_MODES)
         if active_is_alt:
             self._enabled.add(entered_via)

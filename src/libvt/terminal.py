@@ -8,6 +8,7 @@ import collections
 import collections.abc
 import enum
 import html
+import itertools
 import os
 import re
 import types
@@ -23,8 +24,6 @@ from libvt._grid import (
     _CellExt,
     _FrozenHistory,
     _Row,
-    bump_row_gen,
-    current_row_gen,
     make_cell_ext,
     pack_pen_base,
     raw_width_bits,
@@ -161,13 +160,30 @@ _PRINT_ASCII_RE = re.compile(rb"[\x20-\x7e]+")
 _STR_BODY_UTF8_RE = re.compile(rb"[^\x07\x18\x1a\x1b\x7f]+")
 _STR_BODY_LATIN1_RE = re.compile(rb"[^\x07\x18\x1a\x1b\x7f\x80-\x9f]+")
 
-_NEXT_TERMINAL_ID: int = 0
+
+class _TerminalIdAllocator:
+    """Fork-safe lazy per-PID random nonce paired with monotonic counter."""
+
+    __slots__ = ("_counter", "_nonce", "_pid")
+
+    def __init__(self) -> None:
+        self._pid: int = -1
+        self._nonce: int = 0
+        self._counter = itertools.count(1).__next__
+
+    def alloc(self) -> int:
+        pid = os.getpid()
+        if pid != self._pid:
+            self._nonce = int.from_bytes(os.urandom(8), "big")
+            self._pid = pid
+        return (self._nonce << 32) | self._counter()
+
+
+_TERMINAL_IDS = _TerminalIdAllocator()
 
 
 def _alloc_terminal_id() -> int:
-    global _NEXT_TERMINAL_ID
-    _NEXT_TERMINAL_ID += 1
-    return _NEXT_TERMINAL_ID
+    return _TERMINAL_IDS.alloc()
 
 
 type SyncView = t.Literal["working", "committed"]
@@ -184,45 +200,7 @@ class ResyncReason(enum.StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class SyncToken:
-    """Opaque monotonic watermark passed to :meth:`Terminal.changes_since`.
-
-    Attributes
-    ----------
-    terminal_id : int
-        Identity cookie of the originating :class:`Terminal`.
-    view : SyncView
-        Tracked view (``"committed"`` or ``"working"``).
-    epoch : int
-        Structural epoch incremented on ``resize()``, ``RIS``, and ``?1049``
-        alternate-screen transitions.
-    revision : int
-        Monotonic row-content mutation watermark.
-    scrolled_total : int
-        Cumulative primary-screen lines scrolled into history.
-    evicted_total : int
-        Cumulative primary-screen history lines evicted by ``maxlen``.
-    history_clear_at : int
-        ``scrolled_total`` value at the most recent ``ED 3`` history clear.
-    history_clear_seq : int
-        Monotonic counter of ``ED 3`` history clears.
-    cursor : Cursor
-        Cursor state at watermark capture.
-    modes : frozenset[Mode]
-        Enabled terminal modes at watermark capture.
-    title : str
-        Window title at watermark capture.
-    cwd : str
-        Working directory at watermark capture.
-    cwd_uri : str
-        Raw ``OSC 7`` / ``OSC 9;9`` working directory URI at watermark capture.
-    aux_revision : int
-        Monotonic counter of prompt-zone, program-status, and window-metadata
-        updates.
-    graphics_revision : int
-        Monotonic graphics placement revision on the active screen.
-    """
-
+class _SyncState:
     terminal_id: int
     view: SyncView
     epoch: int
@@ -238,6 +216,70 @@ class SyncToken:
     cwd_uri: str = ""
     aux_revision: int = 0
     graphics_revision: int = 0
+
+
+def _make_sync_token(state: _SyncState) -> SyncToken:
+    tok = object.__new__(SyncToken)
+    object.__setattr__(tok, "_state", state)
+    return tok
+
+
+class SyncToken:
+    """Opaque per-:class:`Terminal` watermark passed to :meth:`Terminal.changes_since`.
+
+    Compare tokens with ``==`` and store them in sets or dictionaries via
+    :func:`hash`; obtain instances from :meth:`Terminal.sync_token` or
+    :attr:`ScreenDelta.token`.
+    """
+
+    __slots__ = ("_state",)
+    _state: _SyncState
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> t.NoReturn:
+        """Disallow direct construction; call :meth:`Terminal.sync_token`."""
+        msg = "SyncToken cannot be instantiated directly; call Terminal.sync_token()"
+        raise TypeError(msg)
+
+    def __setattr__(self, name: str, value: object) -> t.NoReturn:
+        """Disallow attribute mutation on immutable tokens."""
+        msg = f"cannot assign to attribute {name!r} on immutable SyncToken"
+        raise AttributeError(msg)
+
+    def __delattr__(self, name: str) -> t.NoReturn:
+        """Disallow attribute deletion on immutable tokens."""
+        msg = f"cannot delete attribute {name!r} on immutable SyncToken"
+        raise AttributeError(msg)
+
+    def __eq__(self, other: object) -> bool:
+        """Return ``True`` when *other* captures the identical watermark state."""
+        if self is other:
+            return True
+        if not isinstance(other, SyncToken):
+            return NotImplemented
+        return self._state == other._state
+
+    def __hash__(self) -> int:
+        """Return hash of the captured watermark state."""
+        return hash(self._state)
+
+    def __repr__(self) -> str:
+        """Return compact opaque representation."""
+        st = self._state
+        return f"SyncToken(view={st.view!r}, epoch={st.epoch}, revision={st.revision})"
+
+    def __copy__(self) -> SyncToken:
+        """Return ``self`` (immutable value)."""
+        return self
+
+    def __deepcopy__(self, _memo: dict[int, object]) -> SyncToken:
+        """Return ``self`` (immutable value)."""
+        return self
+
+    def __reduce__(
+        self,
+    ) -> tuple[collections.abc.Callable[[_SyncState], SyncToken], tuple[_SyncState]]:
+        """Serialize token state for :mod:`pickle`."""
+        return (_make_sync_token, (self._state,))
 
 
 @dataclass(frozen=True, slots=True)
@@ -954,7 +996,7 @@ class Formatter:
                 if style != cur_style:
                     out.append(_style_to_sgr(style))
                     cur_style = style
-                out.append(row.chars[c])
+                out.append(row.char_at(c))
             if not row.wrapped and row.used > limit:
                 cur_col_pos = limit
                 span_c = limit
@@ -1201,6 +1243,18 @@ class Terminal:
         self._recorder = recorder
         self._events: collections.deque[Event] = collections.deque()
         self._event_bytes: int = 0
+        self._terminal_id: int = _alloc_terminal_id()
+        self._generation: int = 0
+        self._epoch: int = 0
+        self._aux_revision: int = 0
+        self._sync_generation: int = 0
+        self._sync_hold_pending: bool = False
+        self._cached_snapshot: Snapshot | None = None
+        self._cached_row_gen: int = -1
+        self._held_snapshot: Snapshot | None = None
+        self._held_sync_token: SyncToken | None = None
+        self._step_event: StopOn = StopOn.NONE
+        self._passthrough_depth: int = 0
         self._screens = ScreenSet(
             rows=rows,
             cols=cols,
@@ -1210,10 +1264,11 @@ class Terminal:
             max_images=limits.max_images,
             max_placements=limits.max_placements,
             max_image_dimension=limits.max_image_dimension,
+            on_mutate=self._on_screen_mutate,
         )
-        self._modes = ModeState()
+        self._modes = ModeState(on_mutate=self._before_mutate)
         if newline_mode:
-            self._modes.set_mode(Mode.LNM, enabled=True)
+            self._modes._enabled.add(Mode.LNM)
         self._parser = Parser(
             encoding=encoding,
             tmux_window_rename=profile.tmux_window_rename,
@@ -1258,17 +1313,6 @@ class Terminal:
             max_records=limits.max_status_records,
         )
         self._replies = bytearray()
-        self._terminal_id: int = _alloc_terminal_id()
-        self._generation: int = 0
-        self._epoch: int = 0
-        self._aux_revision: int = 0
-        self._sync_generation: int = 0
-        self._sync_hold_pending: bool = False
-        self._cached_snapshot: Snapshot | None = None
-        self._held_snapshot: Snapshot | None = None
-        self._held_sync_token: SyncToken | None = None
-        self._step_event: StopOn = StopOn.NONE
-        self._passthrough_depth: int = 0
 
     @classmethod
     def from_size(
@@ -1515,22 +1559,24 @@ class Terminal:
         if exclude_modes:
             modes = modes - exclude_modes
         gfx_rev = scr._gfx.revision if scr._gfx is not None else 0
-        return SyncToken(
-            terminal_id=self._terminal_id,
-            view=view,
-            epoch=self._epoch,
-            revision=current_row_gen(),
-            scrolled_total=prim._scrolled_total,
-            evicted_total=prim._evicted_total,
-            history_clear_at=prim._history_clear_at,
-            history_clear_seq=prim._history_clear_seq,
-            cursor=scr.cursor,
-            modes=modes,
-            title=self._title,
-            cwd=self._cwd,
-            cwd_uri=self._cwd_uri,
-            aux_revision=self._aux_revision,
-            graphics_revision=gfx_rev,
+        return _make_sync_token(
+            _SyncState(
+                terminal_id=self._terminal_id,
+                view=view,
+                epoch=self._epoch,
+                revision=self._screens._row_gen,
+                scrolled_total=prim._scrolled_total,
+                evicted_total=prim._evicted_total,
+                history_clear_at=prim._history_clear_at,
+                history_clear_seq=prim._history_clear_seq,
+                cursor=scr.cursor,
+                modes=modes,
+                title=self._title,
+                cwd=self._cwd,
+                cwd_uri=self._cwd_uri,
+                aux_revision=self._aux_revision,
+                graphics_revision=gfx_rev,
+            )
         )
 
     def _ensure_sync_snapshot(self) -> None:
@@ -1609,12 +1655,17 @@ class Terminal:
 
         if token is None:
             return _full(ResyncReason.INITIAL)
-        if token.terminal_id != self._terminal_id or token.view != view:
+        if not isinstance(token, SyncToken):
+            msg = f"token must be SyncToken or None, got {type(token).__name__}"
+            raise TypeError(msg)
+        cur_st = cur_tok._state
+        tok_st = token._state
+        if tok_st.terminal_id != self._terminal_id or tok_st.view != view:
             return _full(ResyncReason.TERMINAL_MISMATCH)
-        if token.epoch != cur_tok.epoch:
+        if tok_st.epoch != cur_st.epoch:
             return _full(ResyncReason.EPOCH_CHANGED)
 
-        if token == cur_tok:
+        if tok_st == cur_st:
             return ScreenDelta(
                 token=cur_tok,
                 from_token=token,
@@ -1631,7 +1682,7 @@ class Terminal:
                 snapshot=cur_snap,
             )
 
-        hist_cleared = cur_tok.history_clear_seq != token.history_clear_seq
+        hist_cleared = cur_st.history_clear_seq != tok_st.history_clear_seq
         hist_len = len(cur_snap._history)
         zero_hist_cap = self._screens.primary._history.maxlen == 0 and hist_len == 0
         new_hist: collections.abc.Sequence[RowView]
@@ -1640,7 +1691,7 @@ class Terminal:
                 new_hist = ()
                 evicted_cnt = 0
             else:
-                post_clear = max(0, cur_tok.scrolled_total - cur_tok.history_clear_at)
+                post_clear = max(0, cur_st.scrolled_total - cur_st.history_clear_at)
                 if post_clear > hist_len:
                     return _full(ResyncReason.HISTORY_EVICTED)
                 new_hist = (
@@ -1648,7 +1699,7 @@ class Terminal:
                 )
                 evicted_cnt = 0
         else:
-            added = max(0, cur_tok.scrolled_total - token.scrolled_total)
+            added = max(0, cur_st.scrolled_total - tok_st.scrolled_total)
             if zero_hist_cap:
                 new_hist = ()
                 evicted_cnt = 0
@@ -1656,17 +1707,17 @@ class Terminal:
                 if added > hist_len:
                     return _full(ResyncReason.HISTORY_EVICTED)
                 new_hist = cur_snap.history[hist_len - added :] if added > 0 else ()
-                evicted_cnt = max(0, cur_tok.evicted_total - token.evicted_total)
+                evicted_cnt = max(0, cur_st.evicted_total - tok_st.evicted_total)
 
         v_scroll = (
             0
             if cur_snap.active_is_alt
-            else max(0, cur_tok.scrolled_total - token.scrolled_total)
+            else max(0, cur_st.scrolled_total - tok_st.scrolled_total)
         )
         dirty = tuple(
             idx
             for idx, r in enumerate(cur_snap._rows)
-            if r.content_gen > token.revision
+            if r.content_gen > tok_st.revision
         )
         return ScreenDelta(
             token=cur_tok,
@@ -1677,27 +1728,30 @@ class Terminal:
             new_history=new_hist,
             history_evicted=evicted_cnt,
             history_cleared=hist_cleared,
-            cursor_changed=cur_tok.cursor != token.cursor,
-            modes_changed=cur_tok.modes != token.modes,
+            cursor_changed=cur_st.cursor != tok_st.cursor,
+            modes_changed=cur_st.modes != tok_st.modes,
             metadata_changed=(
-                cur_tok.title != token.title
-                or cur_tok.cwd != token.cwd
-                or cur_tok.cwd_uri != token.cwd_uri
-                or cur_tok.aux_revision != token.aux_revision
+                cur_st.title != tok_st.title
+                or cur_st.cwd != tok_st.cwd
+                or cur_st.cwd_uri != tok_st.cwd_uri
+                or cur_st.aux_revision != tok_st.aux_revision
             ),
-            graphics_changed=cur_tok.graphics_revision != token.graphics_revision,
+            graphics_changed=cur_st.graphics_revision != tok_st.graphics_revision,
             snapshot=cur_snap,
         )
 
     def snapshot(self) -> Snapshot:
         """Capture an immutable :class:`Snapshot` of live terminal state."""
+        cur_row_gen = self._screens._row_gen
         if (
             self._cached_snapshot is not None
             and self._cached_snapshot.generation == self._generation
+            and self._cached_row_gen == cur_row_gen
         ):
             return self._cached_snapshot
         snap = self._build_snapshot()
         self._cached_snapshot = snap
+        self._cached_row_gen = cur_row_gen
         return snap
 
     @t.overload
@@ -1939,9 +1993,9 @@ class Terminal:
         self._single_shift = None
         was_sync = self.synchronized
         was_alt = self._screens.active_is_alt
-        self._modes = ModeState()
+        self._modes = ModeState(on_mutate=self._before_mutate)
         if self._newline_mode:
-            self._modes.set_mode(Mode.LNM, enabled=True)
+            self._modes._enabled.add(Mode.LNM)
         self._sync_hold_pending = False
         self._held_snapshot = None
         self._held_sync_token = None
@@ -1990,6 +2044,11 @@ class Terminal:
                     sync_generation=self._sync_generation,
                 ),
             )
+
+    def _on_screen_mutate(self, structural: bool) -> None:
+        self._before_mutate()
+        if structural:
+            self._epoch += 1
 
     def _before_mutate(self) -> None:
         if self._sync_hold_pending:
@@ -2288,13 +2347,11 @@ class Terminal:
                 set_wrap = can_advance and min_col == 0 and c_col == scr.cols - 1
                 if set_wrap and prev_row == 0 and bottom == 0:
                     scr._rows[0].wrapped = True
-                    bump_row_gen(scr._rows[0])
                 self._linefeed(scr)
                 if set_wrap and not (prev_row == 0 and bottom == 0):
                     wrap_idx = prev_row - 1 if prev_row == bottom else prev_row
                     if 0 <= wrap_idx < scr.rows:
                         scr._rows[wrap_idx].wrapped = True
-                        bump_row_gen(scr._rows[wrap_idx])
                 self._set_cursor(scr, scr._cur_row, min_col, pending_wrap=False)
                 c_col = scr._cur_col
             avail = max_col - c_col + 1
@@ -2471,7 +2528,7 @@ class Terminal:
                             and eff_right - eff_left >= 1
                         ):
                             prev_cluster_len = self._cluster_len
-                            combined = row_obj.chars[pc] + ch
+                            combined = row_obj.char_at(pc) + ch
                             base_pen = row_obj.attr_at(pc) & _PEN_BASE_MASK
                             base_ext = row_obj.ext_at(pc)
                             bce_w, bce_e = self._bce_pair()
@@ -2586,7 +2643,7 @@ class Terminal:
                         if pc == 0 and w_override == 1:
                             scr.heal_wrapped_spacer_head(pr)
                         self._cluster_len += 1
-                        self._last_printed = row_obj.chars[pc]
+                        self._last_printed = row_obj.char_at(pc)
                         if (
                             w_override == 2
                             and cur_role == int(WidthRole.NARROW)
@@ -2654,13 +2711,11 @@ class Terminal:
                 set_wrap = can_advance and min_col == 0 and c_col == scr.cols - 1
                 if set_wrap and c_row == 0 and bottom == 0:
                     scr._rows[0].wrapped = True
-                    bump_row_gen(scr._rows[0])
                 self._linefeed(scr)
                 if set_wrap and not (c_row == 0 and bottom == 0):
                     wrap_idx = c_row - 1 if c_row == bottom else c_row
                     if 0 <= wrap_idx < scr.rows:
                         scr._rows[wrap_idx].wrapped = True
-                        bump_row_gen(scr._rows[wrap_idx])
                 self._set_cursor(scr, scr._cur_row, min_col, pending_wrap=False)
                 c_row = scr._cur_row
                 c_col = scr._cur_col
@@ -3518,56 +3573,62 @@ class Terminal:
             if self._profile.pending_wrap_phantom_col and scr._pending_wrap:
                 return
             self._before_mutate()
-            n = params.get(0, 1)
-            bce_w, bce_e = self._bce_pair()
-            scr.heal_before_edit(c_row, c_col, right + 1)
-            scr._rows[c_row].insert_blanks(
-                c_col,
-                n,
-                left=left,
-                right=right,
-                bce_word=bce_w,
-                bce_ext=bce_e,
-            )
-            if scr._gfx is not None and scr._gfx.has_sixels and left <= c_col <= right:
-                scr._gfx.erase_sixel_rect(
-                    row=c_row,
-                    col=c_col,
-                    rows=1,
-                    cols=right - c_col + 1,
-                    scrolled_total=scr._scrolled_total,
-                    policy=self._profile.sixel_erase_policy,
+            if left <= c_col <= right:
+                n = params.get(0, 1)
+                bce_w, bce_e = self._bce_pair()
+                scr.heal_before_edit(c_row, c_col, right + 1)
+                scr._rows[c_row].insert_blanks(
+                    c_col,
+                    n,
+                    left=left,
+                    right=right,
+                    bce_word=bce_w,
+                    bce_ext=bce_e,
                 )
+                if scr._gfx is not None and scr._gfx.has_sixels:
+                    scr._gfx.erase_sixel_rect(
+                        row=c_row,
+                        col=c_col,
+                        rows=1,
+                        cols=right - c_col + 1,
+                        scrolled_total=scr._scrolled_total,
+                        policy=self._profile.sixel_erase_policy,
+                    )
             self._set_cursor(scr, c_row, c_col, pending_wrap=False)
         elif ch_final == "P":  # DCH
             if self._profile.pending_wrap_phantom_col and scr._pending_wrap:
                 return
             self._before_mutate()
-            n = params.get(0, 1)
-            bce_w, bce_e = self._bce_pair()
-            scr.heal_before_edit(c_row, c_col, right + 1)
-            if c_col == 0 and left == 0 and c_row > 0 and scr._rows[c_row - 1].wrapped:
-                scr._rows[c_row - 1].wrapped = False
-                bump_row_gen(scr._rows[c_row - 1])
-            scr._rows[c_row].delete_cells(
-                c_col,
-                n,
-                left=left,
-                right=right,
-                bce_word=bce_w,
-                bce_ext=bce_e,
-            )
-            if right == scr.cols - 1:
-                scr._rows[c_row].wrapped = False
-            if scr._gfx is not None and scr._gfx.has_sixels and left <= c_col <= right:
-                scr._gfx.erase_sixel_rect(
-                    row=c_row,
-                    col=c_col,
-                    rows=1,
-                    cols=right - c_col + 1,
-                    scrolled_total=scr._scrolled_total,
-                    policy=self._profile.sixel_erase_policy,
+            if left <= c_col <= right:
+                n = params.get(0, 1)
+                bce_w, bce_e = self._bce_pair()
+                scr.heal_before_edit(c_row, c_col, right + 1)
+                if (
+                    c_col == 0
+                    and left == 0
+                    and c_row > 0
+                    and scr._rows[c_row - 1].wrapped
+                ):
+                    scr._rows[c_row - 1].wrapped = False
+                scr._rows[c_row].delete_cells(
+                    c_col,
+                    n,
+                    left=left,
+                    right=right,
+                    bce_word=bce_w,
+                    bce_ext=bce_e,
                 )
+                if right == scr.cols - 1:
+                    scr._rows[c_row].wrapped = False
+                if scr._gfx is not None and scr._gfx.has_sixels:
+                    scr._gfx.erase_sixel_rect(
+                        row=c_row,
+                        col=c_col,
+                        rows=1,
+                        cols=right - c_col + 1,
+                        scrolled_total=scr._scrolled_total,
+                        policy=self._profile.sixel_erase_policy,
+                    )
             self._set_cursor(scr, c_row, c_col, pending_wrap=False)
         elif ch_final == "L":  # IL
             if top <= c_row <= bottom and left <= c_col <= right:

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
+import pickle
+import random
 import time
 import typing as t
 
@@ -403,3 +407,162 @@ def test_changes_since_watermarks_and_replica_equivalence() -> None:
     assert term.changes_since(stale_same_epoch).resync_reason == (
         ResyncReason.HISTORY_EVICTED
     )
+
+    # SyncToken is opaque per Terminal; mutating another Terminal never bumps it.
+    other_term = libvt.Terminal(rows=2, cols=6)
+    tok_before_other = term.sync_token()
+    assert not dataclasses.is_dataclass(libvt.SyncToken)
+    assert not hasattr(tok_before_other, "terminal_id")
+    assert not hasattr(tok_before_other, "_terminal_id")
+    assert not hasattr(tok_before_other, "modes")
+    assert len(repr(tok_before_other)) < 80
+    assert hash(tok_before_other) == hash(term.sync_token())
+    assert copy.copy(tok_before_other) == tok_before_other
+    assert copy.deepcopy(tok_before_other) == tok_before_other
+    for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+        roundtrip = pickle.loads(pickle.dumps(tok_before_other, protocol=proto))
+        assert roundtrip == tok_before_other
+        assert (
+            other_term.changes_since(roundtrip).resync_reason
+            == ResyncReason.TERMINAL_MISMATCH
+        )
+    with pytest.raises(TypeError):
+        libvt.SyncToken()
+    with pytest.raises(AttributeError):
+        t.cast("t.Any", tok_before_other).extra = 1
+    with pytest.raises(TypeError):
+        term.changes_since(t.cast("t.Any", "bad"))
+    other_term.feed_str("hello world")
+    assert term.sync_token() == tok_before_other
+
+    # Direct Screen / ModeState mutators preserve ?2026 holds and replica sync.
+    direct_t = libvt.Terminal(rows=3, cols=6)
+    direct_t.feed(b"HELLO")
+    d0 = direct_t.changes_since(None)
+    dh: list[RowView] = []
+    dv: list[RowView] = []
+    d0.apply_rows(dh, dv)
+    direct_t.screen.reset()
+    d1 = direct_t.changes_since(d0.token)
+    d1.apply_rows(dh, dv)
+    direct_t.feed(b"\x1b[2;1HWORLD")
+    d2 = direct_t.changes_since(d1.token)
+    d2.apply_rows(dh, dv)
+    assert [r.text for r in dv] == list(d2.snapshot.lines)
+
+    hold_t = libvt.Terminal(rows=2, cols=6)
+    hold_t.feed(b"SAFE\x1b[?2026h")
+    hold_t.screen.reset()
+    assert hold_t.committed.text == "SAFE"
+
+    # DCH / ICH / SD / IL under DECLRMM & non-reflow resize preserve row invariants.
+    dch_lr = libvt.Terminal(rows=3, cols=6)
+    dch_lr.feed(b"ABCDEFG\x1b[?69h\x1b[3;6s\x1b[1;1H")
+    lr_tok = dch_lr.sync_token(view="working")
+    dch_lr.feed(b"\x1b[P\x1b[@")
+    lr_delta = dch_lr.changes_since(lr_tok, view="working")
+    assert dch_lr.snapshot()[0].wrapped is True
+    assert lr_delta.dirty_rows == ()
+
+    sd_lr = libvt.Terminal(rows=4, cols=6)
+    sd_lr.feed("ABCDE日12".encode() + b"\x1b[?69h\x1b[3;6s\x1b[1;1H\x1b[T\x1b[?69l")
+    assert sd_lr[1].wrapped is False
+    assert sd_lr[1, 5].width_role != libvt.WidthRole.SPACER_HEAD
+
+    il_lr = libvt.Terminal(rows=3, cols=6)
+    il_lr.feed("ABCDE日1234".encode() + b"\x1b[?69h\x1b[2;5s\x1b[2;2H\x1b[L")
+    assert not (il_lr[0].wrapped and il_lr[0, 5].text == " ")
+
+    ich_w = libvt.Terminal(rows=2, cols=6)
+    ich_w.feed("ABC日".encode() + b"\x1b[?69h\x1b[2;4s\x1b[1;2H\x1b[@")
+    ref_w = libvt.Terminal(rows=2, cols=6)
+    ref_w.feed(b"A BC")
+    assert ich_w.snapshot()[0].text == "A BC"
+    assert ich_w.snapshot()[0] == ref_w.snapshot()[0]
+
+    alt_rz = libvt.Terminal(rows=3, cols=4)
+    alt_rz.feed(b"\x1b[?1049h" + "ABC日".encode())
+    alt_rz.resize(rows=3, cols=6)
+    alt_rz.feed(b"\x1b[1;5HXY")
+    assert alt_rz[0, 3].width_role != libvt.WidthRole.SPACER_HEAD
+    assert alt_rz[0].text == "ABC XY"
+
+    # Seeded replica & _Row write-barrier fingerprint fuzzer.
+    rng = random.Random(20261123)
+    fuzz_tokens: tuple[bytes, ...] = (
+        b"ABCD",
+        "日本".encode(),
+        b"a\xcc\x81",
+        b"\r",
+        b"\n",
+        b"\x08",
+        b"\x1b[1;1H",
+        b"\x1b[2;3H",
+        b"\x1b[A",
+        b"\x1b[B",
+        b"\x1b[C",
+        b"\x1b[D",
+        b"\x1b[@",
+        b"\x1b[2@",
+        b"\x1b[P",
+        b"\x1b[2P",
+        b"\x1b[2X",
+        b"\x1b[K",
+        b"\x1b[1K",
+        b"\x1b[2K",
+        b"\x1b[J",
+        b"\x1b[2J",
+        b"\x1b[3J",
+        b"\x1b[L",
+        b"\x1b[M",
+        b"\x1b[S",
+        b"\x1b[T",
+        b"\x1b[1;3r",
+        b"\x1b[2;4r",
+        b"\x1b[r",
+        b"\x1b[?69h\x1b[3;5s",
+        b"\x1b[?69l",
+        b"\x1b[31;44m",
+        b"\x1b[0m",
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+        b"\x1b[?2026h",
+        b"\x1b[?2026l",
+    )
+    for trial in range(50):
+        ft = libvt.Terminal(rows=4, cols=6, scrollback=8)
+        w_tok = ft.sync_token(view="working")
+        c_tok2 = ft.sync_token(view="committed")
+        w_hist: list[RowView] = []
+        w_view: list[RowView] = [ft.snapshot()[i] for i in range(4)]
+        c_hist: list[RowView] = []
+        c_view: list[RowView] = [ft.committed[i] for i in range(4)]
+        prev_fps = [r.debug_fingerprint() for r in ft.screen._rows]
+
+        for step_i in range(24):
+            if step_i == 12 and trial % 5 == 0:
+                ft.resize(rows=rng.choice((3, 5)), cols=rng.choice((5, 8)))
+            else:
+                ft.feed(rng.choice(fuzz_tokens))
+
+            cur_fps = [r.debug_fingerprint() for r in ft.screen._rows]
+            dw = ft.changes_since(w_tok, view="working")
+            if dw.resync_reason is ResyncReason.NONE and dw.viewport_scroll_up == 0:
+                changed_idx = tuple(
+                    i for i in range(ft.rows) if cur_fps[i] != prev_fps[i]
+                )
+                for ci in changed_idx:
+                    assert ci in dw.dirty_rows
+            dw.apply_rows(w_hist, w_view)
+            ws = dw.snapshot
+            assert w_hist == list(ws.history)
+            assert w_view == [ws[i] for i in range(ws.rows)]
+            w_tok = dw.token
+            prev_fps = cur_fps
+
+            dc = ft.changes_since(c_tok2, view="committed")
+            dc.apply_rows(c_hist, c_view)
+            cs = dc.snapshot
+            assert c_hist == list(cs.history)
+            assert c_view == [cs[i] for i in range(cs.rows)]
+            c_tok2 = dc.token

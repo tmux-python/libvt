@@ -8,7 +8,7 @@ import enum
 import re
 from dataclasses import dataclass
 
-from libvt._grid import WidthRole, _Row, bump_row_gen, raw_width_bits
+from libvt._grid import WidthRole, _Row, raw_width_bits
 from libvt.config import (
     DEFAULT_LIMITS,
     TMUX_CAPTURE_POLICY,
@@ -474,9 +474,9 @@ def _split_capture_lines(raw: CaptureInput) -> list[str]:
 
 def _row_trimmed_text_and_cols(row: _Row) -> tuple[str, int]:
     t_end = row.text_used
-    while t_end > 0 and row.chars[t_end - 1] == " ":
+    while t_end > 0 and row.char_at(t_end - 1) == " ":
         t_end -= 1
-    return "".join(row.chars[:t_end]), t_end
+    return row.slice_text(0, t_end), t_end
 
 
 def _decode_joined_lines(
@@ -567,16 +567,7 @@ def _infer_wraps_from_joined(
 
 
 def _trim_unwrapped_row(row: _Row) -> None:
-    while row.text_used > 0 and row.chars[row.text_used - 1] == " ":
-        row.text_used -= 1
-    while (
-        row.used > row.text_used
-        and row.chars[row.used - 1] == " "
-        and row.attr_at(row.used - 1) == 0
-        and row.ext_at(row.used - 1) is None
-    ):
-        row.used -= 1
-    row._frozen = None
+    row.trim_trailing_blanks()
 
 
 def _populate_screen_from_lines(
@@ -699,9 +690,9 @@ def _populate_screen_from_lines(
 
     view_rows = decoded_rows[hist_count : hist_count + rows]
     while len(view_rows) < rows:
-        view_rows.append(_Row(cols))
+        view_rows.append(_Row(cols, gen_counter=target._gen_counter))
     for r_v in view_rows:
-        bump_row_gen(r_v)
+        r_v.bind_counter(target._gen_counter)
     target._rows = view_rows
 
     zones: list[PromptZone] = []

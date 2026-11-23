@@ -24,34 +24,29 @@ def _assert_grid_invariants(term: libvt.Terminal) -> None:
     assert 0 <= scr.cursor.row < scr.rows
     assert 0 <= scr.cursor.col < scr.cols
     for r_idx, raw_row in enumerate(scr._rows):
-        assert len(raw_row.chars) == scr.cols
+        assert raw_row.cols == scr.cols
         assert 0 <= raw_row.used <= scr.cols
-        if raw_row.attrs is None:
+        if not raw_row.has_wide:
             continue
         for c_idx in range(scr.cols):
-            role = WidthRole((raw_row.attrs[c_idx] >> 60) & 0b11)
+            role = WidthRole((raw_row.attr_at(c_idx) >> 60) & 0b11)
             if role == WidthRole.WIDE:
                 assert c_idx + 1 < scr.cols, f"orphan WIDE at ({r_idx}, {c_idx})"
-                tail_role = WidthRole((raw_row.attrs[c_idx + 1] >> 60) & 0b11)
+                tail_role = WidthRole((raw_row.attr_at(c_idx + 1) >> 60) & 0b11)
                 assert tail_role == WidthRole.SPACER_TAIL
             elif role == WidthRole.SPACER_TAIL:
                 assert c_idx > 0, f"orphan SPACER_TAIL at ({r_idx}, 0)"
-                head_role = WidthRole((raw_row.attrs[c_idx - 1] >> 60) & 0b11)
+                head_role = WidthRole((raw_row.attr_at(c_idx - 1) >> 60) & 0b11)
                 assert head_role == WidthRole.WIDE
-            elif (
-                role == WidthRole.SPACER_HEAD
-                and not declrmm
-                and c_idx == scr.cols - 1
-                and r_idx + 1 < scr.rows
-                and raw_row.wrapped
-            ):
-                next_row = scr._rows[r_idx + 1]
-                next_role = (
-                    WidthRole((next_row.attrs[0] >> 60) & 0b11)
-                    if next_row.attrs is not None
-                    else WidthRole.NARROW
+            elif role == WidthRole.SPACER_HEAD:
+                assert c_idx == scr.cols - 1, (
+                    f"interior SPACER_HEAD at ({r_idx}, {c_idx})"
                 )
-                assert next_role == WidthRole.WIDE
+                assert raw_row.wrapped, f"unwrapped SPACER_HEAD at ({r_idx}, {c_idx})"
+                if not declrmm and r_idx + 1 < scr.rows:
+                    next_row = scr._rows[r_idx + 1]
+                    next_role = WidthRole((next_row.attr_at(0) >> 60) & 0b11)
+                    assert next_role == WidthRole.WIDE
 
 
 class ResizeCase(t.NamedTuple):

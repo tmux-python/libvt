@@ -6,7 +6,34 @@
 _Notes on the upcoming release will go here._
 <!-- END PLACEHOLDER - ADD NEW CHANGELOG ENTRIES BELOW THIS LINE -->
 
+### Breaking changes
+
+#### Opaque per-terminal sync watermarks (#22)
+
+{class}`~libvt.terminal.SyncToken` keeps its watermark state private, disallows
+direct instantiation, and renders a compact `repr()`. Read snapshot state from
+{attr}`~libvt.terminal.ScreenDelta.snapshot` rather than inspecting token
+attributes directly:
+
+```python
+# Before
+cur = tok.cursor
+
+# After
+delta = term.changes_since(tok)
+cur = delta.snapshot.cursor
+```
+
 ### Fixes
+
+#### Per-terminal sync isolation and horizontal-margin edits (#22)
+
+{meth}`~libvt.terminal.Terminal.sync_token` and
+{meth}`~libvt.terminal.Terminal.changes_since` isolate row-mutation watermarks
+per {class}`~libvt.terminal.Terminal` instance and report every cell,
+soft-wrap, and direct {attr}`~libvt.terminal.Terminal.screen` mutation in
+{attr}`~libvt.terminal.ScreenDelta.dirty_rows`, while `ICH` and `DCH` outside
+`DECLRMM` horizontal margins leave soft-wrapped rows intact.
 
 #### Graphics retention, `DECSTBM` `SIXEL` masking, and streaming reflow (#21)
 

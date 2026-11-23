@@ -13,3 +13,20 @@ Migration and deprecation notes for `libvt` are recorded here; see
 <!-- KEEP THIS PLACEHOLDER - DO NOT REMOVE OR MODIFY THIS LINE -->
 _Detailed migration steps for the next version will be posted here._
 <!-- END PLACEHOLDER - ADD NEW MIGRATION ENTRIES BELOW THIS LINE -->
+
+### Opaque `SyncToken` watermarks (#22)
+
+{class}`~libvt.terminal.SyncToken` no longer exposes internal watermark fields
+or direct construction; obtain tokens from
+{meth}`~libvt.terminal.Terminal.sync_token` or
+{attr}`~libvt.terminal.ScreenDelta.token` and inspect terminal state via
+{attr}`~libvt.terminal.ScreenDelta.snapshot`:
+
+```python
+# Before
+cur = tok.cursor
+
+# After
+delta = term.changes_since(tok)
+cur = delta.snapshot.cursor
+```
