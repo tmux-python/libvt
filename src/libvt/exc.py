@@ -32,24 +32,29 @@ def _iter_slot_names(cls: type[BaseException]) -> list[str]:
         for slot in slots:
             if slot in ("__dict__", "__weakref__"):
                 continue
-            attr = (
-                f"_{base.__name__.lstrip('_')}{slot}"
-                if slot.startswith("__") and not slot.endswith("__")
-                else slot
-            )
+            if slot.startswith("__") and not slot.endswith("__"):
+                stripped = base.__name__.lstrip("_")
+                attr = f"_{stripped}{slot}" if stripped else slot
+            else:
+                attr = slot
             if attr not in seen:
                 seen.add(attr)
                 names.append(attr)
     return names
 
 
+_OS_DESCRIPTOR_NAMES = ("errno", "strerror", "filename", "filename2")
+
+
 def _reconstruct_timeout_error(
     cls: type[TerminalTimeoutError],
     os_args: tuple[object, ...],
+    raw_args: tuple[object, ...] | None = None,
 ) -> TerminalTimeoutError:
     obj = OSError.__new__(cls, *os_args)
-    if os_args:
-        OSError.__init__(obj, *os_args)
+    OSError.__init__(obj, *os_args)
+    if raw_args is not None and obj.args != raw_args:
+        obj.args = raw_args
     return obj
 
 
@@ -138,17 +143,32 @@ class TerminalTimeoutError(LibVtError, TimeoutError):
 
     def __reduce__(self) -> tuple[object, ...]:
         """Serialize args, ``__dict__``, ``__notes__``, and subclass ``__slots__``."""
-        os_args = OSError.__reduce__(self)[1]
         dict_state = dict(self.__dict__)
         if isinstance(dict_state.get("__notes__"), list):
             dict_state["__notes__"] = list(dict_state["__notes__"])
+        if len(self.args) == 2 and self.errno is not None and self.strerror is not None:
+            os_args = OSError.__reduce__(self)[1]
+        elif (
+            len(self.args) <= 1
+            and self.errno is None
+            and self.strerror is None
+            and self.filename is None
+            and self.filename2 is None
+        ):
+            os_args = self.args
+        else:
+            os_args = ()
+            for attr_name in _OS_DESCRIPTOR_NAMES:
+                val = getattr(self, attr_name)
+                if val is not None:
+                    dict_state.setdefault(attr_name, val)
         slot_state = {
             name: getattr(self, name)
             for name in _iter_slot_names(type(self))
             if hasattr(self, name)
         }
         state: object = (dict_state, slot_state) if slot_state else dict_state
-        return (_reconstruct_timeout_error, (type(self), os_args), state)
+        return (_reconstruct_timeout_error, (type(self), os_args, self.args), state)
 
     def __setstate__(self, state: object) -> None:
         """Restore instance ``__dict__``, ``__notes__`` copy, and ``__slots__``."""
@@ -156,12 +176,26 @@ class TerminalTimeoutError(LibVtError, TimeoutError):
             dict_state, slot_state = state
         else:
             dict_state, slot_state = state, None
-        self.__dict__.clear()
-        if isinstance(dict_state, dict):
-            self.__dict__.update(dict_state)
-            if isinstance(self.__dict__.get("__notes__"), list):
-                self.__dict__["__notes__"] = list(self.__dict__["__notes__"])
-        if isinstance(slot_state, dict):
+        if dict_state is not None and (
+            not isinstance(dict_state, dict)
+            or not all(isinstance(k, str) for k in dict_state)
+        ):
+            msg = "state must be a str-keyed dictionary"
+            raise TypeError(msg)
+        if slot_state is not None and (
+            not isinstance(slot_state, dict)
+            or not all(isinstance(k, str) for k in slot_state)
+        ):
+            msg = "slot state must be a str-keyed dictionary"
+            raise TypeError(msg)
+        if dict_state is not None:
+            for key, val in dict_state.items():
+                setattr(
+                    self,
+                    key,
+                    list(val) if key == "__notes__" and isinstance(val, list) else val,
+                )
+        if slot_state is not None:
             for key, val in slot_state.items():
                 setattr(self, key, val)
 
