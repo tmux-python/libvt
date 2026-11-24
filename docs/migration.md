@@ -5,5 +5,5 @@
 ```
 
 ```{include} ../MIGRATION
-
+:encoding: utf-8
 ```

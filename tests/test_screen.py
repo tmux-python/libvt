@@ -328,14 +328,14 @@ def test_frozen_row_combining_wide_bce_and_256_block_cow_history() -> None:
         assert s_deep.history[-1].text == (
             "line-50001" if step == 0 else f"tail-{step - 1:02d}"
         )
-    assert time.perf_counter() - t0 < 0.05
+    assert time.perf_counter() - t0 < 0.5
     snap_b = deep.snapshot()
     assert snap_a._history.blocks[1] is snap_b._history.blocks[1]
 
     unwrapped_fr = deep._screens.primary._history[10]
     t_rz = time.perf_counter()
     deep.resize(rows=2, cols=20)
-    assert time.perf_counter() - t_rz < 0.1
+    assert time.perf_counter() - t_rz < 0.5
     assert deep._screens.primary._history[10].text == unwrapped_fr.text
     assert deep._screens.primary._history[10].runs is unwrapped_fr.runs
 

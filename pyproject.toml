@@ -12,6 +12,7 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX",
   "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
   "Framework :: Pytest",
   "Intended Audience :: Developers",
   "Programming Language :: Python",

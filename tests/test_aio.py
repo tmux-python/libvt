@@ -116,11 +116,11 @@ async def test_open_pty_controlling_tty_signals_sigpipe_and_reap() -> None:
         "    reply += ch\n"
         "print('DSR=' + repr(reply.decode('ascii', 'replace')), flush=True)\n"
         "while not winch:\n"
-        "    signal.pause()\n"
+        "    time.sleep(0.01)\n"
         "try:\n"
         "    print('WINCH=1', flush=True)\n"
         "    while True:\n"
-        "        signal.pause()\n"
+        "        time.sleep(0.05)\n"
         "except KeyboardInterrupt:\n"
         "    print('SIGINT=1', flush=True)\n"
     )
@@ -140,6 +140,17 @@ async def test_open_pty_controlling_tty_signals_sigpipe_and_reap() -> None:
         pty_sess.send(b"\x03")
         await pty_sess.wait_for("SIGINT=1", timeout=3.0)
     assert pty_sess.terminal.program_statuses == {}
+
+    # Fast-exiting child drains final PTY bytes cleanly across Linux EIO / Darwin EOF.
+    async with open_pty(
+        (
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('FAST_EXIT_DRAIN_OK\\n'); sys.stdout.flush()",
+        ),
+    ) as fast_sess:
+        snap_fast = await fast_sess.wait_for("FAST_EXIT_DRAIN_OK", timeout=3.0)
+        assert "FAST_EXIT_DRAIN_OK" in snap_fast.text
 
 
 async def test_stream_eof_aclose_and_straddling_sync_frame_wakeups() -> None:
@@ -218,6 +229,10 @@ async def test_aio_lazy_posix_imports_under_win32_simulation(
         r = asyncio.StreamReader()
         s = fresh_mod.AsyncTerminalStream(r, rows=2, cols=10)
         assert s.terminal.rows == 2
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(NotImplementedError, match="POSIX"):
+            async with fresh_mod.open_pty(("python",)):
+                pass
         await asyncio.sleep(0)
     finally:
         sys.modules.pop("_libvt_aio_win_check", None)

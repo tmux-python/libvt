@@ -167,6 +167,16 @@ preserve monotonic {attr}`~libvt.terminal.Snapshot.scrolled_total`
 continuity, and remap {class}`~libvt.events.PromptZone` and cell-anchored
 Kitty {class}`~libvt.graphics.ImagePlacement` `(abs_row, col)` pins.
 
+### Development
+
+#### macOS PTY and Windows portable-core CI (#3)
+
+GitHub Actions exercises Darwin {func}`~libvt.aio.open_pty` (`TIOCSCTTY`,
+`TTYHOG` write queueing, and fast-exiting child drain) on `macos-latest` and
+portable sans-I/O and {class}`~libvt.aio.AsyncTerminalStream` tests plus `ty`
+checks on `windows-latest`, alongside the `Operating System :: Microsoft ::
+Windows` classifier.
+
 ## libvt 0.0.1a0 (2026-11-22)
 
 Initial pre-alpha release of `libvt`: a pure-Python, zero-dependency virtual
