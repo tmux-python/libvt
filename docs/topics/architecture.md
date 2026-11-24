@@ -15,12 +15,13 @@ import only the machinery they need:
    primary-screen soft-wrap resize reflow.
 3. **Sans-I/O terminal facade** ({mod}`libvt.terminal`,
    {mod}`libvt.status`, {mod}`libvt.input`, {mod}`libvt.codec`):
-   Coordinates dual primary/alternate screens, `Profile` / `Policy` /
-   `Limits`, `OSC 7501` status records, outbound replies, and input
-   encoding with zero system calls.
+   Coordinates dual primary/alternate screens,
+   {class}`~libvt.config.Profile` / {class}`~libvt.config.Policy` /
+   {class}`~libvt.config.Limits`, `OSC 7501` status records, outbound
+   replies, and input encoding with zero system calls.
 4. **Transport and test edges** ({mod}`libvt.aio`,
    {mod}`libvt.testing`, {mod}`libvt.pytest_plugin`): Optional
-   `asyncio` stream/PTY runners and pytest diagnostics.
+   {mod}`asyncio` stream/PTY runners and pytest diagnostics.
 
 ## Configuration split
 

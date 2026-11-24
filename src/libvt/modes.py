@@ -28,6 +28,7 @@ class Mode(enum.IntEnum):
     MOUSE_ANY_EVENT = DEC_PRIVATE_MASK | 1003
     FOCUS_EVENT = DEC_PRIVATE_MASK | 1004
     MOUSE_SGR = DEC_PRIVATE_MASK | 1006
+    ALTERNATE_SCROLL = DEC_PRIVATE_MASK | 1007
     MOUSE_SGR_PIXELS = DEC_PRIVATE_MASK | 1016
     ALT_SCREEN_1047 = DEC_PRIVATE_MASK | 1047
     DECSC_1048 = DEC_PRIVATE_MASK | 1048
@@ -68,6 +69,7 @@ _DEFAULT_ENABLED_MODES: frozenset[Mode] = frozenset(
     {
         Mode.DECAWM,
         Mode.DECTCEM,
+        Mode.ALTERNATE_SCROLL,
         Mode.GRAPHEME_CLUSTERING,
     },
 )
@@ -139,6 +141,8 @@ class ModeState:
         active_is_alt: bool | None = None,
     ) -> DecrpmValue:
         """Return the ``DECRPM`` status value for raw mode number *code*."""
+        if not (0 <= code < DEC_PRIVATE_MASK):
+            return DecrpmValue.NOT_RECOGNIZED
         raw = (DEC_PRIVATE_MASK | code) if private else code
         if raw not in _RECOGNIZED_MODES:
             return DecrpmValue.NOT_RECOGNIZED

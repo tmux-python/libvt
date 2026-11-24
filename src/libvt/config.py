@@ -76,6 +76,8 @@ class Profile:
         Default foreground 8-bit RGB reported for ``OSC 10 ; ?``.
     bg_rgb : tuple[int, int, int]
         Default background 8-bit RGB reported for ``OSC 11 ; ?``.
+    cursor_rgb : tuple[int, int, int]
+        Default cursor 8-bit RGB reported for ``OSC 12 ; ?``.
     pending_wrap_phantom_col : bool
         When ``True`` (``TMUX_PROFILE``), ``pending_wrap`` treats the cursor as
         occupying phantom column ``cols`` across ``EL``/``ED``, ``ECH``/``ICH``/
@@ -139,11 +141,13 @@ class Profile:
         with ``?1049h`` / ``?1049l`` (and DEC ``?1048`` is unrecognized),
         matching ``tmux``'s ``ictx->old_cx`` vs ``s->saved_cx``.
     cell_width_px : int
-        Nominal cell width in pixels used for ``CSI 14 t``, ``CSI 16 t``, and
-        ``SIXEL`` / Kitty cell-grid geometry (default ``8``).
+        Nominal cell width in pixels used for ``CSI 14 t``, ``CSI 16 t``,
+        ``?1016``, ``?2048``, ``TIOCSWINSZ``, and ``SIXEL`` / Kitty cell-grid
+        geometry (default ``8``).
     cell_height_px : int
-        Nominal cell height in pixels used for ``CSI 14 t``, ``CSI 16 t``, and
-        ``SIXEL`` / Kitty cell-grid geometry (default ``16``).
+        Nominal cell height in pixels used for ``CSI 14 t``, ``CSI 16 t``,
+        ``?1016``, ``?2048``, ``TIOCSWINSZ``, and ``SIXEL`` / Kitty cell-grid
+        geometry (default ``16``).
     sixel_erase_policy : SixelErasePolicy
         How text overwrites and cell erases affect ``SIXEL`` placements:
         ``"cell_mask"`` (default and ``tmux >= 3.9``) clears individual cells;
@@ -161,6 +165,7 @@ class Profile:
     color_scheme: ColorScheme = ColorScheme.DARK
     fg_rgb: tuple[int, int, int] = (0xE5, 0xE5, 0xE5)
     bg_rgb: tuple[int, int, int] = (0x1E, 0x1E, 0x1E)
+    cursor_rgb: tuple[int, int, int] = (0xE5, 0xE5, 0xE5)
     pending_wrap_phantom_col: bool = False
     vs15_narrows_wide_emoji: bool = True
     vs16_always_wide: bool = False
@@ -251,8 +256,8 @@ class Policy:
         Emit :class:`~libvt.events.ClipboardWrite` events on ``OSC 52`` writes
         (default ``True``; no host clipboard is ever mutated by ``libvt``).
     allow_color_queries : bool
-        Permit ``OSC 10 ; ?``, ``OSC 11 ; ?``, and ``CSI ? 996 n`` palette and
-        color-scheme replies (default ``True``).
+        Permit ``OSC 4 ; c ; ?``, ``OSC 10 ; ?`` through ``OSC 12 ; ?``, and
+        ``CSI ? 996 n`` palette and color-scheme replies (default ``True``).
     allow_program_status_query : bool
         Permit ``OSC 7501 ; ?`` capability replies whenever
         ``profile.osc_7501_capabilities`` is non-empty (default ``True``).

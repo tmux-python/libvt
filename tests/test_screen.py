@@ -176,7 +176,7 @@ def test_resize_soft_wrap_join_alt_crop_and_inband_2048() -> None:
         False,
         "hard",
     )
-    assert term.drain_replies() == b"\x1b[48;4;20;0;0t"
+    assert term.drain_replies() == b"\x1b[48;4;20;64;160t"
     assert InBandResize(rows=4, cols=20) in term.drain_events()
 
     term.feed(b"\x1b[?1049h\x1b[H0123456789abcdefgh")

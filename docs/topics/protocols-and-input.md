@@ -22,14 +22,15 @@ fallback):
 ```
 
 `OSC 7501 ; ?` capability queries answer whenever
-`Policy.allow_program_status_query` is `True` (the default) and
-`Profile.osc_7501_capabilities` is non-empty, independent of whether
-`on_event` or `record_events=True` is attached.
+{attr}`~libvt.config.Policy.allow_program_status_query` is `True` (the default)
+and {attr}`~libvt.config.Profile.osc_7501_capabilities` is non-empty,
+independent of whether `on_event` or `record_events=True` is attached.
 
 ## Semantic prompts (`OSC 133`) and queries
 
-`OSC 133` prompt markers record monotonic `abs_row` indices across
-scrollback eviction so stored prompt zones remain valid as output
+`OSC 133` prompt markers record monotonic
+{attr}`~libvt.events.PromptZone.abs_row` indices across scrollback eviction so
+stored {attr}`~libvt.terminal.Terminal.prompt_zones` remain valid as output
 scrolls:
 
 ```python
@@ -43,14 +44,19 @@ scrolls:
 
 {func}`~libvt.input.encode_input` and {meth}`~libvt.terminal.Terminal.encode`
 consult `DECCKM`, mouse modes (`?9`, `?1000`, `?1002`, `?1003`, `?1006`,
-`?1016`), focus reporting (`?1004`), bracketed paste (`?2004`), and the
-active screen's Kitty `CSI u` keyboard stack:
+`?1007` {attr}`~libvt.modes.Mode.ALTERNATE_SCROLL`, and `?1016` pixel SGR),
+focus reporting (`?1004`), bracketed paste (`?2004`), `XTMODKEYS`
+(`CSI > 4 ; pv m` via {attr}`~libvt.terminal.Terminal.modify_other_keys`), and
+the active screen's {class}`~libvt.input.KittyKeyboardStack`:
 
 ```python
 >>> term = libvt.Terminal(rows=4, cols=20)
 >>> term.feed(b"\x1b[?1h")
 >>> term.encode(libvt.KeyEvent.parse("up"))
 b'\x1bOA'
+>>> term.feed(b"\x1b[>4;2m")
+>>> term.encode(libvt.KeyEvent.parse("ctrl+;"))
+b'\x1b[27;5;59~'
 ```
 
 {func}`~libvt.input.encode_paste` fails closed with

@@ -184,6 +184,12 @@ def _validate_pty_dims(rows: int, cols: int) -> None:
         raise ValueError(msg)
 
 
+def _pack_winsize(rows: int, cols: int, profile: Profile) -> bytes:
+    xpixel = min(65_535, max(0, cols * profile.cell_width_px))
+    ypixel = min(65_535, max(0, rows * profile.cell_height_px))
+    return struct.pack("HHHH", rows, cols, xpixel, ypixel)
+
+
 def _resolve_write_limits(
     write_high_water: int | None,
     max_write_buffer: int,
@@ -887,7 +893,7 @@ class PtySession:
         import fcntl
         import termios
 
-        winsz = struct.pack("HHHH", rows, cols, 0, 0)
+        winsz = _pack_winsize(rows, cols, self.terminal.profile)
         fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsz)
         self.terminal.resize(rows=rows, cols=cols, reflow=reflow)
         replies = self.terminal.drain_replies()
@@ -1166,7 +1172,7 @@ async def open_pty(
         fcntl.ioctl(
             slave_fd,
             termios.TIOCSWINSZ,
-            struct.pack("HHHH", rows, cols, 0, 0),
+            _pack_winsize(rows, cols, profile),
         )
         if tty_mode == "cbreak":
             tty.setcbreak(slave_fd)

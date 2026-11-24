@@ -1110,6 +1110,7 @@ class Formatter:
                 if mode not in (
                     Mode.DECAWM,
                     Mode.DECTCEM,
+                    Mode.ALTERNATE_SCROLL,
                     Mode.GRAPHEME_CLUSTERING,
                 ):
                     out.append(f"\x1b[?{code}h")
@@ -1119,6 +1120,8 @@ class Formatter:
             out.append("\x1b[?7l")
         if Mode.DECTCEM not in export_modes:
             out.append("\x1b[?25l")
+        if Mode.ALTERNATE_SCROLL not in export_modes:
+            out.append("\x1b[?1007l")
         cur = snapshot.cursor
         if (cur.shape, cur.blinking) != (CursorShape.BLOCK, True):
             decscusr_map: dict[tuple[CursorShape, bool], int] = {
@@ -1304,6 +1307,24 @@ def _event_byte_cost(event: Event) -> int:
     t.assert_never(event)
 
 
+def _parse_ascii_uint_bytes(raw: bytes, *, max_val: int) -> int | None:
+    if not raw:
+        return None
+    acc = 0
+    for b in raw:
+        if not (0x30 <= b <= 0x39):
+            return None
+        acc = acc * 10 + (b - 0x30)
+        if acc > max_val:
+            return None
+    return acc
+
+
+def _format_osc_rgb(rgb: tuple[int, int, int]) -> str:
+    r, g, b = rgb
+    return f"rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"
+
+
 def _parse_ascii_hex(raw: str) -> int | None:
     if not raw:
         return None
@@ -1368,7 +1389,14 @@ _TERMINFO_CAPS: dict[str, str] = {
 
 
 class Terminal:
-    """Sans-I/O virtual terminal emulator over a streaming VT500 parser."""
+    """Sans-I/O virtual terminal emulator over a streaming VT500 parser.
+
+    Every method call and attribute read on a :class:`Terminal` instance
+    (including capturing state via :meth:`snapshot` or :attr:`committed`)
+    belongs to a single owning thread or ``asyncio`` event loop unless
+    externally synchronized. Returned :class:`Snapshot` values are immutable
+    and safe to pass across threads without locking.
+    """
 
     def __init__(
         self,
@@ -1464,6 +1492,8 @@ class Terminal:
         self._window_name: str = ""
         self._fg_rgb: tuple[int, int, int] = profile.fg_rgb
         self._bg_rgb: tuple[int, int, int] = profile.bg_rgb
+        self._cursor_rgb: tuple[int, int, int] = profile.cursor_rgb
+        self._palette_overrides: dict[int, tuple[int, int, int]] = {}
         self._title_stack: list[str] = []
         self._cwd: str = ""
         self._cwd_uri: str = ""
@@ -1625,6 +1655,11 @@ class Terminal:
     def kitty_keyboard_flags(self) -> KittyKeyboardFlags:
         """Return active screen's :class:`~libvt.input.KittyKeyboardFlags`."""
         return self._screens.active.keyboard_stack.flags
+
+    @property
+    def modify_other_keys(self) -> int:
+        """Return active screen's ``XTMODKEYS`` ``modifyOtherKeys`` level."""
+        return self._screens.active.modify_other_keys
 
     @property
     def synchronized(self) -> bool:
@@ -2002,6 +2037,10 @@ class Terminal:
             event,
             modes=self._modes,
             kitty_flags=self.kitty_keyboard_flags,
+            modify_other_keys=self.modify_other_keys,
+            active_is_alt=self._screens.active_is_alt,
+            cell_width_px=self._profile.cell_width_px,
+            cell_height_px=self._profile.cell_height_px,
         )
 
     def expire_synchronized_output(
@@ -2150,7 +2189,9 @@ class Terminal:
         self._generation += 1
         self._epoch += 1
         if self._modes.is_set(Mode.IN_BAND_RESIZE):
-            self._emit_reply(f"\x1b[48;{rows};{cols};0;0t".encode("ascii"))
+            px_h = rows * max(0, self._profile.cell_height_px)
+            px_w = cols * max(0, self._profile.cell_width_px)
+            self._emit_reply(f"\x1b[48;{rows};{cols};{px_h};{px_w}t".encode("ascii"))
             self._emit_event(InBandResize(rows=rows, cols=cols))
 
     def reset(self, *, soft: bool = False) -> None:
@@ -2198,6 +2239,8 @@ class Terminal:
             scr._cur_shape = CursorShape.BLOCK
             scr._cur_blinking = True
             scr._pending_wrap = False
+            scr._modify_other_keys = 0
+            self._palette_overrides.clear()
             if self._profile.separate_alt_save_cursor:
                 self._saved_decsc = _SavedCursor(g_sets=def_g)
             elif self._screens.active_is_alt:
@@ -2228,6 +2271,8 @@ class Terminal:
             self._window_name = ""
             self._fg_rgb = self._profile.fg_rgb
             self._bg_rgb = self._profile.bg_rgb
+            self._cursor_rgb = self._profile.cursor_rgb
+            self._palette_overrides.clear()
             self._title_stack.clear()
             self._cwd = ""
             self._cwd_uri = ""
@@ -2288,6 +2333,12 @@ class Terminal:
         if mode == Mode.DECLRMM and not self._profile.declrmm_enabled and enabled:
             return True
         if mode == Mode.DECSC_1048 and self._profile.separate_alt_save_cursor:
+            return True
+        if (
+            mode == Mode.MOUSE_SGR_PIXELS
+            and enabled
+            and (self._profile.cell_width_px <= 0 or self._profile.cell_height_px <= 0)
+        ):
             return True
         if mode == Mode.DECTCEM:
             self._screens.primary._cur_visible = enabled
@@ -3297,6 +3348,8 @@ class Terminal:
             self._unhandled("esc", f"ESC {inter_s}{chr(final)}")
 
     def _apply_mode(self, code: int, *, private: bool, enabled: bool) -> None:
+        if not (0 <= code < DEC_PRIVATE_MASK):
+            return
         raw = (DEC_PRIVATE_MASK | code) if private else code
         try:
             mode = Mode(raw)
@@ -3311,6 +3364,11 @@ class Terminal:
             return
 
         if mode == Mode.DECSC_1048 and self._profile.separate_alt_save_cursor:
+            return
+
+        if mode == Mode.MOUSE_SGR_PIXELS and (
+            self._profile.cell_width_px <= 0 or self._profile.cell_height_px <= 0
+        ):
             return
 
         if mode in ALT_SCREEN_MODES:
@@ -3659,11 +3717,20 @@ class Terminal:
 
         # DECRQM: CSI ? Ps $ p or CSI Ps $ p
         if intermediates == b"$" and final == ord("p"):
+            if prefix not in (0, ord("?")) or len(params.values) > 1:
+                return
             private = prefix == ord("?")
             code = params.raw_or_default(0, 0)
             if private and (
                 (code == 69 and not self._profile.declrmm_enabled)
                 or (code == 1048 and self._profile.separate_alt_save_cursor)
+                or (
+                    code == 1016
+                    and (
+                        self._profile.cell_width_px <= 0
+                        or self._profile.cell_height_px <= 0
+                    )
+                )
             ):
                 pm = int(DecrpmValue.NOT_RECOGNIZED)
             else:
@@ -3751,11 +3818,48 @@ class Terminal:
                     scheme = self._profile.color_scheme
                     self._emit_reply(f"\x1b[?997;{int(scheme)}n".encode("ascii"))
                     self._emit_event(ColorSchemeQueried(scheme=scheme))
+            elif final == ord("m"):  # XTQMODKEYS: CSI ? Pp m
+                if len(params.values) == 1 and params.raw_or_default(0, -1) == 4:
+                    self._emit_reply(
+                        f"\x1b[>4;{scr._modify_other_keys}m".encode("ascii"),
+                    )
+            elif final == ord("S") and 1 <= len(params.values) <= 4:  # XTSMGRAPHICS
+                pi = params.raw_or_default(0, 0)
+                self._emit_reply(f"\x1b[?{pi};3S".encode("ascii"))
             return
 
         if prefix != 0:
-            if prefix == ord(">") and final in (ord("m"), ord("n")):
-                # XTMODKEYS: accept quietly
+            if prefix == ord(">") and final == ord("m"):
+                if not params.values:
+                    if scr._modify_other_keys != 0:
+                        self._before_mutate()
+                        scr._modify_other_keys = 0
+                elif len(params.values) <= 2:
+                    pp = params.raw_or_default(0, 0)
+                    if pp == 0 and len(params.values) == 1:
+                        if scr._modify_other_keys != 0:
+                            self._before_mutate()
+                            scr._modify_other_keys = 0
+                    elif pp == 4:
+                        pv = (
+                            params.raw_or_default(1, 0)
+                            if len(params.values) == 2
+                            else 0
+                        )
+                        if pv in (0, 1, 2) and scr._modify_other_keys != pv:
+                            self._before_mutate()
+                            scr._modify_other_keys = pv
+                return
+            if prefix == ord(">") and final == ord("n"):
+                if (
+                    not params.values
+                    or (
+                        len(params.values) == 1
+                        and params.raw_or_default(0, -1) in (0, 4)
+                    )
+                ) and scr._modify_other_keys != 0:
+                    self._before_mutate()
+                    scr._modify_other_keys = 0
                 return
             self._unhandled("csi", f"CSI {chr(prefix)}{chr(final)}")
             return
@@ -4141,15 +4245,13 @@ class Terminal:
             if op == 18:  # report text area size in chars
                 self._emit_reply(f"\x1b[8;{scr.rows};{scr.cols}t".encode("ascii"))
             elif op == 14:  # report text area size in pixels
-                px_h = scr.rows * self._profile.cell_height_px
-                px_w = scr.cols * self._profile.cell_width_px
+                px_h = scr.rows * max(0, self._profile.cell_height_px)
+                px_w = scr.cols * max(0, self._profile.cell_width_px)
                 self._emit_reply(f"\x1b[4;{px_h};{px_w}t".encode("ascii"))
             elif op == 16:  # report cell size in pixels
-                self._emit_reply(
-                    f"\x1b[6;{self._profile.cell_height_px};{self._profile.cell_width_px}t".encode(
-                        "ascii"
-                    ),
-                )
+                ch_px = max(0, self._profile.cell_height_px)
+                cw_px = max(0, self._profile.cell_width_px)
+                self._emit_reply(f"\x1b[6;{ch_px};{cw_px}t".encode("ascii"))
             elif op == 21 and self._policy.allow_title_report:
                 safe_title = "".join(
                     ch for ch in self._title if " " <= ch <= "~" and ch != "\\"
@@ -4212,7 +4314,10 @@ class Terminal:
             self._cwd = ""
             self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=""))
             return
-        decoded_path = os.fsdecode(raw_path)
+        try:
+            decoded_path = os.fsdecode(raw_path)
+        except UnicodeDecodeError:
+            decoded_path = raw_path.decode("utf-8", errors="surrogateescape")
         if raw_host in allowed_hosts:
             self._cwd = decoded_path
         else:
@@ -4236,6 +4341,45 @@ class Terminal:
             self._emit_event(TitleChanged(title=text))
         elif code == 1:
             return
+        elif code == 4:
+            if not data:
+                return
+            pos = 0
+            n_data = len(data)
+            while pos <= n_data:
+                semi1 = data.find(b";", pos)
+                if semi1 == -1:
+                    break
+                pal_idx = _parse_ascii_uint_bytes(data[pos:semi1], max_val=255)
+                if pal_idx is None:
+                    break
+                semi2 = data.find(b";", semi1 + 1)
+                if semi2 == -1:
+                    spec_b = data[semi1 + 1 :]
+                    pos = n_data + 1
+                else:
+                    spec_b = data[semi1 + 1 : semi2]
+                    pos = semi2 + 1
+                if spec_b == b"?":
+                    if self._policy.allow_color_queries and (
+                        self._on_pty_write is not None
+                        or len(self._replies) + 24 <= self._limits.max_reply_bytes
+                    ):
+                        rgb_val = self._palette_overrides.get(pal_idx)
+                        if rgb_val is None:
+                            rgb_val = _resolve_color_rgb(
+                                IndexedColor(pal_idx),
+                                (0, 0, 0),
+                            )
+                        reply = (f"\x1b]4;{pal_idx};{_format_osc_rgb(rgb_val)}").encode(
+                            "ascii"
+                        )
+                        self._emit_reply(reply + out_term)
+                    continue
+                parsed_pal = _parse_osc_rgb(spec_b)
+                if parsed_pal is None:
+                    break
+                self._palette_overrides[pal_idx] = parsed_pal
         elif code == 7:
             self._update_cwd(data.decode("utf-8", errors="replace"), from_osc7=True)
         elif code == 8:
@@ -4275,29 +4419,81 @@ class Terminal:
                         )
             elif len(parts) >= 2 and parts[0] == "9":
                 self._update_cwd(";".join(parts[1:]), from_osc7=False)
-        elif code in (10, 11):
-            if data == b"?":
-                if self._policy.allow_color_queries:
-                    r, g, b = self._fg_rgb if code == 10 else self._bg_rgb
-                    reply = (
-                        f"\x1b]{code};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"
-                    ).encode("ascii")
-                    self._emit_reply(reply + out_term)
+        elif code in (10, 11, 12):
+            if not data:
                 return
-            parsed_rgb = _parse_osc_rgb(data)
-            if parsed_rgb is not None:
-                if code == 10:
-                    self._fg_rgb = parsed_rgb
+            cur_code = code
+            pos = 0
+            n_data = len(data)
+            while cur_code <= 12 and pos <= n_data:
+                semi = data.find(b";", pos)
+                if semi == -1:
+                    spec_b = data[pos:]
+                    pos = n_data + 1
                 else:
-                    self._bg_rgb = parsed_rgb
-        elif code == 12:
+                    spec_b = data[pos:semi]
+                    pos = semi + 1
+                if spec_b == b"?":
+                    if self._policy.allow_color_queries and (
+                        self._on_pty_write is not None
+                        or len(self._replies) + 23 <= self._limits.max_reply_bytes
+                    ):
+                        cur_rgb = (
+                            self._fg_rgb
+                            if cur_code == 10
+                            else (self._bg_rgb if cur_code == 11 else self._cursor_rgb)
+                        )
+                        reply = (f"\x1b]{cur_code};{_format_osc_rgb(cur_rgb)}").encode(
+                            "ascii"
+                        )
+                        self._emit_reply(reply + out_term)
+                else:
+                    parsed_rgb = _parse_osc_rgb(spec_b)
+                    if parsed_rgb is None:
+                        break
+                    if cur_code == 10:
+                        self._fg_rgb = parsed_rgb
+                    elif cur_code == 11:
+                        self._bg_rgb = parsed_rgb
+                    else:
+                        self._cursor_rgb = parsed_rgb
+                cur_code += 1
+        elif code in (99, 777):
             return
+        elif code == 104:
+            if not self._palette_overrides:
+                return
+            if not data:
+                self._palette_overrides.clear()
+                return
+            saw_nonempty = False
+            pos = 0
+            n_data = len(data)
+            while pos <= n_data:
+                semi = data.find(b";", pos)
+                if semi == -1:
+                    tok = data[pos:]
+                    pos = n_data + 1
+                else:
+                    tok = data[pos:semi]
+                    pos = semi + 1
+                if not tok:
+                    continue
+                saw_nonempty = True
+                pal_idx = _parse_ascii_uint_bytes(tok, max_val=255)
+                if pal_idx is not None:
+                    self._palette_overrides.pop(pal_idx, None)
+            if not saw_nonempty:
+                self._palette_overrides.clear()
         elif code == 110:
-            self._fg_rgb = self._profile.fg_rgb
+            if not data:
+                self._fg_rgb = self._profile.fg_rgb
         elif code == 111:
-            self._bg_rgb = self._profile.bg_rgb
+            if not data:
+                self._bg_rgb = self._profile.bg_rgb
         elif code == 112:
-            return
+            if not data:
+                self._cursor_rgb = self._profile.cursor_rgb
         elif code == 52:
             semi = data.find(b";")
             if semi == -1:

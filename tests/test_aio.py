@@ -8,13 +8,14 @@ import importlib.util
 import os
 import pathlib
 import socket
+import struct
 import sys
 import typing as t
 
 import pytest
 
 import libvt
-from libvt.aio import AsyncTerminalStream, open_pty
+from libvt.aio import AsyncTerminalStream, _pack_winsize, open_pty
 from libvt.exc import TerminalTimeoutError
 from libvt.parser import ParserState
 
@@ -244,9 +245,13 @@ async def test_pty_session_write_queue_paste_ordering_resize_and_cancel() -> Non
         "paste_ok = buf[:target] == (b'\\x1b[200~' + b'P' * 24576 + b'\\x1b[201~')\n"
         "tail = bytes(buf[target:])\n"
         "dsr_ok = b'R' in tail\n"
-        "rsz_ok = b'\\x1b[48;12;64;' in tail\n"
+        "rsz_ok = b'\\x1b[48;12;64;192;512t' in tail\n"
+        "import fcntl, struct, termios\n"
+        "ws = struct.unpack('HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, b'\\x00' * 8))\n"
+        "ws_ok = ws == (12, 64, 512, 192)\n"
         "sys.stdout.write(\n"
-        "    f'PASTE={paste_ok} DSR={dsr_ok} RSZ={rsz_ok}\\x1b[?2026hTAIL_EOF'\n"
+        "    f'PASTE={paste_ok} DSR={dsr_ok} RSZ={rsz_ok} WS={ws_ok}'"
+        " + '\\x1b[?2026hTAIL_EOF'\n"
         ")\n"
         "sys.stdout.flush()\n"
     )
@@ -273,7 +278,14 @@ async def test_pty_session_write_queue_paste_ordering_resize_and_cancel() -> Non
         assert "PASTE=True" in snap.text
         assert "DSR=True" in snap.text
         assert "RSZ=True" in snap.text
+        assert "WS=True" in snap.text
     assert sess.terminal.synchronized is False
+    packed_ws = _pack_winsize(
+        1_000,
+        1_000,
+        libvt.Profile(cell_width_px=100, cell_height_px=100),
+    )
+    assert struct.unpack("HHHH", packed_ws) == (1_000, 1_000, 65_535, 65_535)
     gen_after_close = sess.terminal.committed_generation
     await sess.aclose()
     assert sess.terminal.committed_generation == gen_after_close

@@ -17,7 +17,8 @@ Sans-I/O layering, lazy 64-bit viewport rows, RLE scrollback, and Unicode 17 clu
 :::{grid-item-card} Synchronized Output & `asyncio`
 :link: sync-and-asyncio
 :link-type: doc
-DEC `?2026` copy-on-write holds, `feed_until`, `AsyncTerminalStream`, and `open_pty`.
+DEC `?2026` copy-on-write holds, {meth}`~libvt.terminal.Terminal.feed_until`,
+{class}`~libvt.aio.AsyncTerminalStream`, and {func}`~libvt.aio.open_pty`.
 :::
 
 :::{grid-item-card} Protocols & Input Encoding

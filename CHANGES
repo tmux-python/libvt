@@ -8,6 +8,25 @@ _Notes on the upcoming release will go here._
 
 ### Breaking changes
 
+#### Cell-calibrated `MouseEvent.pixel_x` and `pixel_y` defaults (#26)
+
+{attr}`~libvt.input.MouseEvent.pixel_x` and
+{attr}`~libvt.input.MouseEvent.pixel_y` now default to `None`
+(`int | None = None`) instead of `0` so `?1016` SGR-Pixel encoding derives
+cell-center pixel coordinates from `row`, `col`, and
+{class}`~libvt.config.Profile` cell geometry unless explicit pixel coordinates
+are supplied:
+
+```python
+# Before
+ev = MouseEvent(button=MouseButton.LEFT, action=MouseAction.PRESS, row=2, col=3)
+assert (ev.pixel_x, ev.pixel_y) == (0, 0)
+
+# After
+ev = MouseEvent(button=MouseButton.LEFT, action=MouseAction.PRESS, row=2, col=3)
+assert (ev.pixel_x, ev.pixel_y) == (None, None)  # encodes cell center (28, 40)
+```
+
 #### Scoped `CSI 5:3 m` overline decoding (#18)
 
 {func}`~libvt.parser.parse_sgr` and live {meth}`~libvt.terminal.Terminal.feed`
@@ -42,6 +61,27 @@ cur = delta.snapshot.cursor
 ```
 
 ### What's new
+
+#### `OSC 4`/`12` queries, `XTMODKEYS`, `?1007`, and pixel `?1016` (#26)
+
+{class}`~libvt.terminal.Terminal` answers `OSC 4` / `OSC 104` 256-palette
+overrides and queries, semicolon-chained `OSC 10`–`12` / `OSC 110`–`112`
+foreground, background, and cursor color queries
+({attr}`~libvt.config.Profile.cursor_rgb`), `DECRQM` across all ANSI and DEC
+modes, `XTSMGRAPHICS` (`CSI ? Pi ; Pa ; Pv S` returning `\x1b[?{pi};3S`), and
+`XTMODKEYS` (`CSI > 4 ; pv m` and `CSI ? 4 m` via
+{attr}`~libvt.terminal.Terminal.modify_other_keys` and
+{attr}`~libvt.screen.Screen.modify_other_keys`), while consuming `OSC 9`,
+`OSC 99`, and `OSC 777` notifications silently.
+{func}`~libvt.input.encode_input` and {meth}`~libvt.terminal.Terminal.encode`
+encode `XTMODKEYS` levels `1` and `2`, default-enabled `?1007`
+({attr}`~libvt.modes.Mode.ALTERNATE_SCROLL`) wheel-to-arrow presses on the
+alternate screen, and cell-calibrated `?1016`
+({attr}`~libvt.input.MouseEvent.pixel_x` /
+{attr}`~libvt.input.MouseEvent.pixel_y`) mouse coordinates, while
+{meth}`~libvt.terminal.Terminal.resize`, {func}`~libvt.aio.open_pty`, and
+{meth}`~libvt.aio.PtySession.resize` report pixel dimensions in `?2048` and
+`TIOCSWINSZ`.
 
 #### Chained `tmux` capture bundles and `-N -T -F` wide-wrap decoding (#18)
 

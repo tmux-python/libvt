@@ -758,3 +758,139 @@ def test_profile_decstr_decsc_declrmm_and_top_margin_history() -> None:
     def_top.feed(b"HDR\r\nR1\r\nR2\r\nFTR\x1b[2;3r\x1b[3;1H\nNEW2")
     assert list(def_top.history) == []
     assert def_top.lines == ("HDR", "R2", "NEW2", "FTR")
+
+
+def test_osc_palette_dynamic_colors_decrqm_xtsmgraphics_and_notifications() -> None:
+    """``OSC 4/104/10-12/112``, ``DECRQM``, ``XTSMGRAPHICS``, and ``OSC 9/99/777``."""
+    term = libvt.Terminal(
+        rows=4,
+        cols=10,
+        policy=Policy(strict=True),
+        record_events=True,
+    )
+    # Default OSC 4 query + multi-pair set/query + selective/full OSC 104 reset.
+    term.feed(b"\x1b]4;1;?\x07")
+    assert term.drain_replies() == b"\x1b]4;1;rgb:cdcd/0000/0000\x07"
+
+    term.feed(b"\x1b]4;1;#123456;2;rgb:aa/bb/cc;1;?;2;?\x1b\\")
+    assert term.drain_replies() == (
+        b"\x1b]4;1;rgb:1212/3434/5656\x1b\\\x1b]4;2;rgb:aaaa/bbbb/cccc\x1b\\"
+    )
+    term.feed(b"\x1b]104;1\x07\x1b]104;999\x07\x1b]4;1;?;2;?\x07")
+    assert term.drain_replies() == (
+        b"\x1b]4;1;rgb:cdcd/0000/0000\x07\x1b]4;2;rgb:aaaa/bbbb/cccc\x07"
+    )
+
+    # Semicolon-chained OSC 10;?;?;? + OSC 12 / OSC 112 + DECSTR palette reset.
+    term.feed(b"\x1b]12;#abcdef\x07\x1b]10;?;?;?\x07")
+    assert term.drain_replies() == (
+        b"\x1b]10;rgb:e5e5/e5e5/e5e5\x07"
+        b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"
+        b"\x1b]12;rgb:abab/cdcd/efef\x07"
+    )
+    # DECSTR resets OSC 4 palette overrides while keeping OSC 10-12 dynamic colors.
+    term.feed(b"\x1b[!p\x1b]4;2;?\x07\x1b]12;?\x07")
+    assert term.drain_replies() == (
+        b"\x1b]4;2;rgb:0000/cdcd/0000\x07\x1b]12;rgb:abab/cdcd/efef\x07"
+    )
+    term.feed(b"\x1b]112;extra\x07\x1b]12;?\x07\x1b]112\x07\x1b]12;?\x07")
+    assert term.drain_replies() == (
+        b"\x1b]12;rgb:abab/cdcd/efef\x07\x1b]12;rgb:e5e5/e5e5/e5e5\x07"
+    )
+
+    # DECRQM unknown modes return 0; XTSMGRAPHICS replies ?Pi;3S before DA1 sentinel.
+    term.feed(
+        b"\x1b[4$p\x1b[99$p\x1b[?2026$p\x1b[?9999$p"
+        b"\x1b[>1$p\x1b[?1;2$p"
+        b"\x1b[?1;1;0S\x1b[?2;3;800;600S\x1b[c"
+    )
+    assert term.drain_replies() == (
+        b"\x1b[4;2$y"
+        b"\x1b[99;0$y"
+        b"\x1b[?2026;2$y"
+        b"\x1b[?9999;0$y"
+        b"\x1b[?1;3S"
+        b"\x1b[?2;3S" + DEFAULT_PROFILE.da1
+    )
+
+    # Policy(allow_color_queries=False) suppresses OSC 4 and OSC 10-12 replies.
+    no_color = libvt.Terminal(rows=2, cols=8, policy=Policy(allow_color_queries=False))
+    no_color.feed(b"\x1b]4;1;?\x07\x1b]10;?;?;?\x07")
+    assert no_color.drain_replies() == b""
+
+    # Partial OSC 4 / 10-12 stops at first malformed pair; OSC 104 / 110 / RIS resets.
+    edge_t = libvt.Terminal(
+        rows=2,
+        cols=8,
+        profile=libvt.Profile(cursor_rgb=(1, 2, 3)),
+        limits=libvt.Limits(max_reply_bytes=64),
+    )
+    edge_t.feed(
+        b"\x1b]4;1;#112233;bad;#445566;2;#778899\x07"
+        b"\x1b]4;2;#223344;3;notacolor;4;#778899\x07"
+        b"\x1b]4;+1;#999999;256;#999999\x07"
+        b"\x1b]4;1;?;2;?;3;?;4;?\x07"
+    )
+    capped_rep = edge_t.drain_replies()
+    assert len(capped_rep) <= 64
+    assert capped_rep.startswith(
+        b"\x1b]4;1;rgb:1111/2222/3333\x07\x1b]4;2;rgb:2222/3333/4444\x07"
+    )
+    edge_t.feed(b"\x1b]4;3;?;4;?\x07")
+    assert edge_t.drain_replies() == (
+        b"\x1b]4;3;rgb:cdcd/cdcd/0000\x07\x1b]4;4;rgb:0000/0000/eeee\x07"
+    )
+    edge_t.feed(b"\x1b]104;;\x07\x1b]4;1;?\x07")
+    assert edge_t.drain_replies() == b"\x1b]4;1;rgb:cdcd/0000/0000\x07"
+
+    # 2000-pair OSC 4 query flood respects max_reply_bytes without dropping sets.
+    flood = b"\x1b]4;" + b"1;?;" * 2_000 + b"5;#abcdef\x07"
+    edge_t.feed(flood)
+    assert len(edge_t.drain_replies()) <= 64
+    edge_t.feed(b"\x1b]4;5;?\x07")
+    assert edge_t.drain_replies() == b"\x1b]4;5;rgb:abab/cdcd/efef\x07"
+    edge_t.feed(b"\x1b]104\x07\x1b]4;5;?\x07")
+    assert edge_t.drain_replies() == b"\x1b]4;5;rgb:cdcd/0000/cdcd\x07"
+
+    # Chained OSC 10 set/query stops past 12 or on bad spec; OSC 110/111 & RIS reset.
+    edge_t2 = libvt.Terminal(
+        rows=2, cols=8, profile=libvt.Profile(cursor_rgb=(1, 2, 3))
+    )
+    edge_t2.feed(b"\x1b]10;#112233;bad;#778899\x07\x1b]10;?;?;?;?\x07")
+    assert edge_t2.drain_replies() == (
+        b"\x1b]10;rgb:1111/2222/3333\x07"
+        b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"
+        b"\x1b]12;rgb:0101/0202/0303\x07"
+    )
+    edge_t2.feed(b"\x1b]110;extra\x07\x1b]10;?\x07\x1b]110\x07\x1b]10;?\x07")
+    assert edge_t2.drain_replies() == (
+        b"\x1b]10;rgb:1111/2222/3333\x07\x1b]10;rgb:e5e5/e5e5/e5e5\x07"
+    )
+    edge_t2.feed(b"\x1b]10;#112233;#445566;#778899\x07\x1bc\x1b]12;?\x07")
+    assert edge_t2.drain_replies() == b"\x1b]12;rgb:0101/0202/0303\x07"
+
+    # DEC_PRIVATE_MASK (32768) boundary: Ps >= 32768 never aliases DEC modes,
+    # and Formatter(OutputFormat.VT) round-trips ?1007l.
+    edge_t2.feed(b"\x1b[32769$p\x1b[33775$p\x1b[?32769$p\x1b[33817h\x1b[?1007l")
+    assert edge_t2.screens.active_is_alt is False
+    assert edge_t2.drain_replies() == b"\x1b[32769;0$y\x1b[33775;0$y\x1b[?32769;0$y"
+    vt_1007 = edge_t2.snapshot().format(libvt.OutputFormat.VT)
+    restored_1007 = libvt.Terminal(rows=2, cols=8)
+    restored_1007.feed(vt_1007.encode())
+    assert restored_1007.modes.is_set(libvt.Mode.ALTERNATE_SCROLL) is False
+    edge_t2.feed(b"\x1b]7;file://localhost/%ff\x07")
+    assert edge_t2.cwd != ""
+
+    # ?2048 resize reports pixel height and width from Profile cell dimensions.
+    term.feed(b"\x1b[?2048h")
+    term.resize(rows=10, cols=40)
+    assert term.drain_replies() == b"\x1b[48;10;40;160;320t"
+
+    # OSC 9 (text), OSC 99, and OSC 777 consume silently under Policy(strict=True).
+    term.drain_events()
+    term.feed(
+        b"\x1b]9;Desktop alert\x07"
+        b"\x1b]99;i=1:d=0;Hello\x1b\\"
+        b"\x1b]777;notify;Build;Done\x07"
+    )
+    assert term.drain_events() == ()

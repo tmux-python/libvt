@@ -1157,7 +1157,12 @@ def decode_tmux_capture(
     term.modes.set_mode(Mode.MOUSE_SGR, enabled=meta.mouse_sgr_flag)
     term.modes.set_mode(Mode.FOCUS_EVENT, enabled=meta.focus_events_flag)
     for priv_code in meta.private_modes:
-        if priv_code not in (47, 1047, 1049, 2026):
+        if 0 <= priv_code < DEC_PRIVATE_MASK and priv_code not in (
+            47,
+            1047,
+            1049,
+            2026,
+        ):
             raw_m = DEC_PRIVATE_MASK | priv_code
             with contextlib.suppress(ValueError):
                 term.modes.set_mode(Mode(raw_m), enabled=True)

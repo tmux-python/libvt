@@ -61,4 +61,5 @@ conf = merge_sphinx_config(
         "project/adr/_template.md",
     ],
 )
+conf.setdefault("autodoc_default_options", {})["private-members"] = False
 globals().update(conf)

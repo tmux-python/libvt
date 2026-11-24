@@ -832,6 +832,7 @@ class Screen:
         "_max_image_dimension",
         "_max_images",
         "_max_placements",
+        "_modify_other_keys",
         "_on_mutate",
         "_pending_wrap",
         "_rows",
@@ -896,6 +897,7 @@ class Screen:
         self._tabstops: set[int] = set(range(8, cols, 8))
         self._tabstops_sorted: list[int] = sorted(self._tabstops)
         self.keyboard_stack = KittyKeyboardStack(max_depth=keyboard_stack_depth)
+        self._modify_other_keys: int = 0
 
     def _bind_counter(self, counter: _RowGenCounter) -> None:
         self._gen_counter = counter
@@ -949,6 +951,11 @@ class Screen:
     def tabstops(self) -> tuple[int, ...]:
         """Return sorted horizontal tabstop columns."""
         return tuple(self._tabstops_sorted)
+
+    @property
+    def modify_other_keys(self) -> int:
+        """Return ``XTMODKEYS`` ``modifyOtherKeys`` level (``0``, ``1``, or ``2``)."""
+        return self._modify_other_keys
 
     def add_tabstop(self, col: int) -> None:
         """Set a horizontal tabstop at *col* (``HTS``)."""
@@ -1777,6 +1784,7 @@ class Screen:
         self._tabstops = set(range(8, self._cols, 8))
         self._tabstops_sorted = sorted(self._tabstops)
         self.keyboard_stack.reset()
+        self._modify_other_keys = 0
         if self._gfx is not None:
             self._gfx.reset()
 
