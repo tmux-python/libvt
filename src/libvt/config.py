@@ -7,7 +7,10 @@ import re
 import typing as t
 from dataclasses import dataclass
 
+#: Supported ``G0``..``G3`` character-set designators (US-ASCII, DEC Special, UK).
 type Charset = t.Literal["B", "0", "A"]
+
+#: ``SIXEL`` cell-overwrite and rectangular-erase clipping policy.
 type SixelErasePolicy = t.Literal["cell_mask", "whole_image"]
 
 _TMUX_VERSION_RE = re.compile(
@@ -120,6 +123,21 @@ class Profile:
         ``CSI J`` with cursor at ``(0, 0)``) scrolls rows up to the last
         non-empty or image-bearing row into scrollback before clearing with
         ``BCE``, matching ``tmux``'s ``scroll-on-clear`` default.
+    declrmm_enabled : bool
+        When ``True`` (default), DEC mode ``?69`` (``DECLRMM``) enables
+        ``DECSLRM`` horizontal margins on ``CSI Pl ; Pr s``; when ``False``
+        (``TMUX_PROFILE``), ``?69`` is unrecognized and any ``CSI ... s``
+        executes ``SCOSC`` cursor save, matching ``tmux``'s ``input.c``.
+    top_margin_scrolls_to_history : bool
+        When ``True`` (``TMUX_PROFILE``), primary-screen full-width upward
+        scrolls (``LF``, ``IND``, ``NEL``, ``SU``) push ``DECSTBM``'s top row
+        into scrollback even when ``top > 0``, matching ``tmux``'s
+        ``grid_scroll_history_region``.
+    separate_alt_save_cursor : bool
+        When ``True`` (``TMUX_PROFILE``), ``DECSC`` / ``SCOSC`` uses an
+        independent cursor save slot rather than sharing primary-screen state
+        with ``?1049h`` / ``?1049l`` (and DEC ``?1048`` is unrecognized),
+        matching ``tmux``'s ``ictx->old_cx`` vs ``s->saved_cx``.
     cell_width_px : int
         Nominal cell width in pixels used for ``CSI 14 t``, ``CSI 16 t``, and
         ``SIXEL`` / Kitty cell-grid geometry (default ``8``).
@@ -155,6 +173,9 @@ class Profile:
     default_g1_charset: Charset = "B"
     decstr_enabled: bool = True
     ed2_scrolls_primary_to_history: bool = False
+    declrmm_enabled: bool = True
+    top_margin_scrolls_to_history: bool = False
+    separate_alt_save_cursor: bool = False
     cell_width_px: int = 8
     cell_height_px: int = 16
     sixel_erase_policy: SixelErasePolicy = "cell_mask"
@@ -193,6 +214,9 @@ class Profile:
             rep_wraps=at_least_3_9,
             decstr_enabled=False,
             ed2_scrolls_primary_to_history=True,
+            declrmm_enabled=False,
+            top_margin_scrolls_to_history=True,
+            separate_alt_save_cursor=True,
             sixel_erase_policy="cell_mask" if at_least_3_9 else "whole_image",
         )
 
@@ -207,6 +231,7 @@ class Profile:
         )
 
 
+#: Default ``OSC 7`` ``file://`` hostnames accepted in sans-I/O mode.
 DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
 
 
@@ -338,18 +363,31 @@ class Limits:
     max_image_dimension: int = 10_000
 
 
-DEFAULT_PROFILE = Profile()
-XTERM_PROFILE = Profile(
+#: Default modern VT500 / ``Ghostty``-aligned terminal profile.
+DEFAULT_PROFILE: Profile = Profile()
+
+#: ``xterm`` compatibility profile (no resize reflow, alt-screen ``ED 3`` clear).
+XTERM_PROFILE: Profile = Profile(
     name="xterm",
     osc_7501_capabilities="",
     reflow_on_resize=False,
     ed3_clears_scrollback_on_alt=True,
 )
-TMUX_PROFILE = Profile.tmux("3.8a")
-LINUX_CONSOLE_PROFILE = Profile.linux_console()
-DEFAULT_POLICY = Policy()
-TMUX_CAPTURE_POLICY = Policy(allow_passthrough=False)
-DEFAULT_LIMITS = Limits()
+
+#: ``tmux 3.8a`` inner-pane compatibility profile.
+TMUX_PROFILE: Profile = Profile.tmux("3.8a")
+
+#: Linux virtual-console compatibility profile.
+LINUX_CONSOLE_PROFILE: Profile = Profile.linux_console()
+
+#: Default host security and query policy.
+DEFAULT_POLICY: Policy = Policy()
+
+#: Default policy for :func:`~libvt.tmux.decode_tmux_capture`.
+TMUX_CAPTURE_POLICY: Policy = Policy(allow_passthrough=False)
+
+#: Default memory and sequence-size ceilings.
+DEFAULT_LIMITS: Limits = Limits()
 
 __all__ = [
     "DEFAULT_LIMITS",

@@ -40,6 +40,7 @@ _DCS_STOP_LATIN1_RE = re.compile(rb"[\x18\x1a\x1b\x7f\x80-\x9f]")
 _APC_STOP_RE = re.compile(rb"[\x18\x1a\x1b]")
 _APC_STOP_LATIN1_RE = re.compile(rb"[\x18\x1a\x1b\x80-\x9f]")
 
+#: Wire input byte encoding accepted by :class:`Parser`.
 type ParserEncoding = t.Literal["utf-8", "latin-1"]
 
 
@@ -74,6 +75,9 @@ class CsiParams:
     colon_mask : int
         Bitmask where bit ``i`` is ``1`` when ``values[i]`` was preceded by
         ``:`` (an ITU T.416 subparameter of the nearest preceding ``;`` slot).
+        When parameter slots overflow ``max_csi_params``, bit ``len(values)``
+        marks a truncated ``:`` subparameter on ``values[-1]`` and bit
+        ``len(values) + 1`` marks a ``:`` subparameter in later dropped slots.
     omitted_mask : int
         Bitmask where bit ``i`` is ``1`` when slot ``i`` contained no digits.
     """
@@ -242,6 +246,7 @@ class ApcDispatch:
     data: bytes
 
 
+#: Closed union of parser actions emitted by :meth:`Parser.feed`.
 type Action = (
     Print
     | Execute
@@ -337,54 +342,71 @@ class _ListSink:
 def _parse_csi_param_bytes(raw: bytes, *, max_params: int) -> CsiParams:
     if not raw:
         return EMPTY_PARAMS
+    cap = max(0, max_params)
     vals: list[int] = []
     colon_mask = 0
     omitted_mask = 0
     cur = 0
     has_digit = False
     is_colon = False
+    overflow_idx = 0
     for b in raw:
         if 0x30 <= b <= 0x39:
             cur = min(_PARAM_CLAMP, cur * 10 + (b - 0x30))
             has_digit = True
         elif b in (0x3B, 0x3A):
             idx = len(vals)
-            if idx < max_params:
+            if idx < cap:
                 vals.append(cur)
                 if is_colon:
                     colon_mask |= 1 << idx
                 if not has_digit:
                     omitted_mask |= 1 << idx
+            else:
+                if is_colon:
+                    colon_mask |= 1 << (cap if overflow_idx == 0 else cap + 1)
+                overflow_idx += 1
             cur = 0
             has_digit = False
             is_colon = b == 0x3A
     idx = len(vals)
-    if idx < max_params:
+    if idx < cap:
         vals.append(cur)
         if is_colon:
             colon_mask |= 1 << idx
         if not has_digit:
             omitted_mask |= 1 << idx
+    elif is_colon:
+        colon_mask |= 1 << (cap if overflow_idx == 0 else cap + 1)
     return CsiParams(tuple(vals), colon_mask, omitted_mask)
 
 
 def _decode_extended_color(
     sub: tuple[int, ...],
-    flat_groups: list[tuple[int, ...]],
+    sub_omit: int,
+    flat_groups: list[tuple[tuple[int, ...], int]],
     group_idx: int,
 ) -> tuple[Color, int]:
     """Decode ``38`` / ``48`` / ``58`` color group into ``(color, consumed)``."""
     if len(sub) >= 2:
+        if (sub_omit >> 1) & 1:
+            return None, 1
         mode = sub[1]
         if mode == 5 and len(sub) >= 3:
+            if (sub_omit >> 2) & 1:
+                return None, 1
             cidx = sub[2]
             if 0 <= cidx <= 255:
                 return IndexedColor(cidx), 1
             return None, 1
         if mode == 2:
             if len(sub) >= 6:
+                if sub_omit & 0b111000:
+                    return None, 1
                 r, g, b = sub[3], sub[4], sub[5]
             elif len(sub) == 5:
+                if sub_omit & 0b11100:
+                    return None, 1
                 r, g, b = sub[2], sub[3], sub[4]
             else:
                 return None, 1
@@ -395,20 +417,45 @@ def _decode_extended_color(
 
     if group_idx + 1 >= len(flat_groups):
         return None, 1
-    mode = flat_groups[group_idx + 1][0]
+    mode = flat_groups[group_idx + 1][0][0]
     if mode == 5 and group_idx + 2 < len(flat_groups):
-        cidx = flat_groups[group_idx + 2][0]
+        cidx = flat_groups[group_idx + 2][0][0]
         if 0 <= cidx <= 255:
             return IndexedColor(cidx), 3
         return None, 3
     if mode == 2 and group_idx + 4 < len(flat_groups):
-        r = flat_groups[group_idx + 2][0]
-        g = flat_groups[group_idx + 3][0]
-        b = flat_groups[group_idx + 4][0]
+        r = flat_groups[group_idx + 2][0][0]
+        g = flat_groups[group_idx + 3][0][0]
+        b = flat_groups[group_idx + 4][0][0]
         if 0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255:
             return RgbColor(r, g, b), 5
         return None, 5
     return None, 2
+
+
+def _sgr_groups_with_omitted(
+    params: CsiParams,
+) -> list[tuple[tuple[int, ...], int]]:
+    """Group ``params`` into ``(subparams, omitted_submask)`` tuples."""
+    vals = params.values
+    if not vals:
+        return []
+    c_mask = params.colon_mask
+    o_mask = params.omitted_mask
+    groups: list[tuple[list[int], int]] = [([vals[0]], o_mask & 1)]
+    for idx in range(1, len(vals)):
+        is_omit = (o_mask >> idx) & 1
+        if (c_mask >> idx) & 1:
+            cur_list, cur_omit = groups[-1]
+            sub_pos = len(cur_list)
+            cur_list.append(vals[idx])
+            if is_omit:
+                groups[-1] = (cur_list, cur_omit | (1 << sub_pos))
+        else:
+            groups.append(([vals[idx]], is_omit))
+    if (c_mask >> len(vals)) & 1:
+        groups.pop()
+    return [(tuple(g), go) for g, go in groups]
 
 
 _UL_MAP: dict[int, UnderlineStyle] = {
@@ -451,13 +498,16 @@ def parse_sgr(
     strike = current.strikethrough
     overline = current.overline
 
-    groups = params.groups()
+    groups = _sgr_groups_with_omitted(params)
     idx = 0
     total = len(groups)
     while idx < total:
-        grp = groups[idx]
+        grp, grp_omit = groups[idx]
         code = grp[0]
-        if code == 0 and len(grp) == 1:
+        if len(grp) > 1 and code not in (4, 38, 48, 58):
+            idx += 1
+            continue
+        if code == 0:
             fg = None
             bg = None
             ul_color = None
@@ -477,9 +527,11 @@ def parse_sgr(
         elif code == 3:
             italic = True
         elif code == 4:
-            sub_ul = grp[1] if len(grp) >= 2 else 1
-            underline = _UL_MAP.get(sub_ul, UnderlineStyle.SINGLE)
-        elif code in (5, 6) and len(grp) == 1:
+            if len(grp) == 1:
+                underline = UnderlineStyle.SINGLE
+            elif len(grp) == 2 and not ((grp_omit >> 1) & 1):
+                underline = _UL_MAP.get(grp[1], UnderlineStyle.SINGLE)
+        elif code in (5, 6):
             blink = True
         elif code == 7:
             reverse = True
@@ -507,7 +559,7 @@ def parse_sgr(
         elif 30 <= code <= 37:
             fg = AnsiColor(code - 30)
         elif code == 38:
-            parsed_fg, step = _decode_extended_color(grp, groups, idx)
+            parsed_fg, step = _decode_extended_color(grp, grp_omit, groups, idx)
             if parsed_fg is not None:
                 fg = parsed_fg
             idx += step
@@ -517,7 +569,7 @@ def parse_sgr(
         elif 40 <= code <= 47:
             bg = AnsiColor(code - 40)
         elif code == 48:
-            parsed_bg, step = _decode_extended_color(grp, groups, idx)
+            parsed_bg, step = _decode_extended_color(grp, grp_omit, groups, idx)
             if parsed_bg is not None:
                 bg = parsed_bg
             idx += step
@@ -529,7 +581,7 @@ def parse_sgr(
         elif code == 55:
             overline = False
         elif code == 58:
-            parsed_ul, step = _decode_extended_color(grp, groups, idx)
+            parsed_ul, step = _decode_extended_color(grp, grp_omit, groups, idx)
             if parsed_ul is not None:
                 ul_color = parsed_ul
             idx += step
@@ -574,6 +626,7 @@ class Parser:
         "_csi_is_colon",
         "_csi_memo",
         "_csi_omitted_mask",
+        "_csi_overflow_idx",
         "_csi_prefix",
         "_csi_vals",
         "_dcs_final",
@@ -620,6 +673,7 @@ class Parser:
         self._csi_vals: list[int] = []
         self._csi_colon_mask: int = 0
         self._csi_omitted_mask: int = 0
+        self._csi_overflow_idx: int = 0
         self._csi_cur: int = 0
         self._csi_has_digit: bool = False
         self._csi_is_colon: bool = False
@@ -661,6 +715,7 @@ class Parser:
         self._csi_vals.clear()
         self._csi_colon_mask = 0
         self._csi_omitted_mask = 0
+        self._csi_overflow_idx: int = 0
         self._csi_cur = 0
         self._csi_has_digit = False
         self._csi_is_colon = False
@@ -675,13 +730,20 @@ class Parser:
         self._reset_csi()
 
     def _push_param(self, *, next_is_colon: bool) -> None:
+        cap = max(0, self._limits.max_csi_params)
         idx = len(self._csi_vals)
-        if idx < self._limits.max_csi_params:
+        if idx < cap:
             self._csi_vals.append(self._csi_cur)
             if self._csi_is_colon:
                 self._csi_colon_mask |= 1 << idx
             if not self._csi_has_digit:
                 self._csi_omitted_mask |= 1 << idx
+        else:
+            if self._csi_is_colon:
+                self._csi_colon_mask |= 1 << (
+                    cap if self._csi_overflow_idx == 0 else cap + 1
+                )
+            self._csi_overflow_idx += 1
         self._csi_cur = 0
         self._csi_has_digit = False
         self._csi_is_colon = next_is_colon
@@ -873,7 +935,7 @@ class Parser:
                     self._intermediates.clear()
                     self._state = ParserState.ESCAPE
                 elif b == 0x7F:
-                    pass
+                    self._flush_incomplete_utf8(sink)
                 else:
                     self._flush_incomplete_utf8(sink)
                     sink.on_execute(b)

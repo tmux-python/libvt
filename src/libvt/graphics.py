@@ -1016,14 +1016,68 @@ class GraphicsTracker:
             p_right = p.col + p.cols - 1
 
             if history_advanced > 0:
-                if p_bot <= abs_bot:
-                    kept.append(p)
-                    continue
-                if p_top > abs_bot:
-                    p.abs_row += history_advanced
-                    changed = True
-                    kept.append(p)
-                    continue
+                if top == 0:
+                    if p_bot <= abs_bot:
+                        kept.append(p)
+                        continue
+                    if p_top > abs_bot:
+                        p.abs_row += history_advanced
+                        changed = True
+                        kept.append(p)
+                        continue
+                else:
+                    if p_bot < scrolled_total:
+                        kept.append(p)
+                        continue
+                    if p_top < scrolled_total <= p_bot:
+                        keep_hist_rows = scrolled_total - p_top
+                        crop_bot = p.rows - keep_hist_rows
+                        if (
+                            p.protocol == GraphicsProtocol.KITTY
+                            or p.parent_image_id > 0
+                        ):
+                            if p.source_height > 0 and p.rows > 0:
+                                crop_px = (p.source_height * crop_bot) // p.rows
+                                p.source_height = max(0, p.source_height - crop_px)
+                                if p.source_height <= 0:
+                                    changed = True
+                                    continue
+                            p.rows = keep_hist_rows
+                        else:
+                            if (
+                                p.visible_mask is not None
+                                and keep_hist_rows * p.cols <= _MAX_MASK_CELLS
+                            ):
+                                p.visible_mask &= (1 << (keep_hist_rows * p.cols)) - 1
+                                if p.visible_mask == 0:
+                                    changed = True
+                                    continue
+                            p.rows = keep_hist_rows
+                            _trim_masked_sixel_rows(p)
+                            if p.rows <= 0:
+                                changed = True
+                                continue
+                        changed = True
+                        kept.append(p)
+                        continue
+                    if p_top >= scrolled_total and p_bot < abs_top:
+                        p.abs_row += history_advanced
+                        changed = True
+                        kept.append(p)
+                        continue
+                    if p_top >= abs_top and p_bot < abs_top + history_advanced:
+                        p.abs_row -= top
+                        changed = True
+                        kept.append(p)
+                        continue
+                    if p_top >= abs_top + history_advanced and p_bot <= abs_bot:
+                        kept.append(p)
+                        continue
+                    if p_top > abs_bot:
+                        p.abs_row += history_advanced
+                        changed = True
+                        kept.append(p)
+                        continue
 
             inside = (
                 p_top >= abs_top
@@ -1857,7 +1911,9 @@ class GraphicsTracker:
             abs_r = post_scrolled + anchor_r
             col_pos = cursor_col
             min_abs = (
-                (post_scrolled + min_row) if post_scrolled == scrolled_total else 0
+                (post_scrolled + min_row)
+                if (min_row > 0 or post_scrolled == scrolled_total)
+                else 0
             )
 
         if not virtual and abs_r < min_abs:

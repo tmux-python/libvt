@@ -59,6 +59,25 @@ wide-wrap spacers in a single pass.
 
 ### Fixes
 
+#### `BCE` hyperlinks, `SU` scrollback, `DEL` UTF-8 flush, and profiles (#25)
+
+{class}`~libvt.terminal.Terminal` strips `OSC 8` hyperlinks from `BCE` blank
+fills, pushes primary-screen `SU` (`CSI Ps S`) lines into scrollback when
+unbounded horizontally, ignores non-`m` `CSI` sequences carrying `:`
+subparameters while restricting {func}`~libvt.parser.parse_sgr` colons to
+well-formed `4`/`38`/`48`/`58` groups, and flushes incomplete multi-byte UTF-8
+sequences on `0x7F` (`DEL`) in {class}`~libvt.parser.Parser`. `DECSLRM` partial
+scrolls preserve wide glyphs wholly inside `[left, right]`, and
+{class}`~libvt.terminal.Formatter` restores `IRM`, `DECOM`, `DECLRMM`, and
+`DECSCUSR` after rendering cells while padding `wrapped=True` rows to `cols`.
+{class}`~libvt.config.Profile` splits {data}`~libvt.config.DEFAULT_PROFILE` and
+{data}`~libvt.config.XTERM_PROFILE` (VT510 `DECSTR` mode set, shared primary
+`DECSC`/`?1049h` save slot with isolated alternate `DECSC` slot, and
+`SS2`/`SS3` single-shift preservation) from {data}`~libvt.config.TMUX_PROFILE`
+({attr}`~libvt.config.Profile.declrmm_enabled` `False` so `CSI 5;10 s` saves
+the cursor, {attr}`~libvt.config.Profile.top_margin_scrolls_to_history` `True`,
+and {attr}`~libvt.config.Profile.separate_alt_save_cursor` `True`).
+
 #### Buffered PTY writes, `?2026` EOF expiry, and frame-commit wakeups (#24)
 
 {class}`~libvt.aio.PtySession` queues synchronous

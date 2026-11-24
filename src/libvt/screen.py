@@ -838,6 +838,7 @@ class Screen:
         "_scrolled_total",
         "_tabstops",
         "_tabstops_sorted",
+        "_top_margin_scrolls_to_history",
         "keyboard_stack",
         "scroll_region",
     )
@@ -854,16 +855,14 @@ class Screen:
         max_placements: int = 1_024,
         max_image_dimension: int = 10_000,
         is_alt: bool = False,
-        gen_counter: _RowGenCounter | None = None,
+        top_margin_scrolls_to_history: bool = False,
         on_mutate: collections.abc.Callable[[bool], None] | None = None,
     ) -> None:
         if rows < 1 or cols < 1:
             msg = f"rows and cols must be >= 1, got ({rows}, {cols})"
             raise ValueError(msg)
         self._cols = cols
-        self._gen_counter: _RowGenCounter = (
-            _RowGenCounter() if gen_counter is None else gen_counter
-        )
+        self._gen_counter: _RowGenCounter = _RowGenCounter()
         self._on_mutate = on_mutate
         self._rows: list[_Row] = [
             _Row(cols, gen_counter=self._gen_counter) for _ in range(rows)
@@ -874,6 +873,9 @@ class Screen:
         self._history_clear_at: int = 0
         self._history_clear_seq: int = 0
         self._is_alt: bool = is_alt
+        self._top_margin_scrolls_to_history: bool = (
+            top_margin_scrolls_to_history and not is_alt
+        )
         self._cell_height_px: int = max(1, cell_height_px)
         self._max_images: int = max_images
         self._max_placements: int = max_placements
@@ -894,6 +896,11 @@ class Screen:
         self._tabstops: set[int] = set(range(8, cols, 8))
         self._tabstops_sorted: list[int] = sorted(self._tabstops)
         self.keyboard_stack = KittyKeyboardStack(max_depth=keyboard_stack_depth)
+
+    def _bind_counter(self, counter: _RowGenCounter) -> None:
+        self._gen_counter = counter
+        for r in self._rows:
+            r.bind_counter(counter, stamp=False)
 
     @property
     def rows(self) -> int:
@@ -1080,7 +1087,6 @@ class Screen:
         right: int | None = None,
         save_history: bool = True,
         bce_word: int = 0,
-        bce_ext: _CellExt | None = None,
         is_line_op: bool = False,
     ) -> None:
         """Scroll region ``[top..bottom, left..right]`` upward by *count* lines."""
@@ -1102,7 +1108,12 @@ class Screen:
             if b_row < len(self._rows) - 1:
                 self._rows[b_row].wrapped = False
                 self._clear_row_spacer_head(self._rows[b_row])
-            advances_abs = save_history and t_row == 0 and not self._is_alt
+            advances_abs = (
+                save_history
+                and not self._is_alt
+                and (t_row == 0 or self._top_margin_scrolls_to_history)
+            )
+            eff_count = count if full_screen else shift
             has_hist_cap = self._history.maxlen is not None and self._history.maxlen > 0
             hist_adv = shift if (advances_abs and not full_screen) else 0
             if self._gfx is not None and not (full_screen and advances_abs):
@@ -1111,24 +1122,25 @@ class Screen:
                     bottom=b_row,
                     left=left,
                     right=r_col,
-                    delta_rows=-count,
+                    delta_rows=-eff_count,
                     is_scroll=not is_line_op,
                     scrolled_total=self._scrolled_total,
                     cell_height_px=self._cell_height_px,
-                    history_advanced=(
-                        count if (advances_abs and not full_screen) else 0
-                    ),
+                    history_advanced=hist_adv,
                 )
             evicted = self._rows[t_row : t_row + shift]
             if advances_abs:
+                if t_row > 0 and evicted:
+                    evicted[-1].wrapped = False
+                    self._clear_row_spacer_head(evicted[-1])
                 if has_hist_cap:
                     for row_ev in evicted:
                         self._append_history(row_ev.freeze())
-                    extra = count - shift
+                    extra = eff_count - shift
                     if extra > 0:
                         maxlen = self._history.maxlen or 0
                         blank_row = _Row(self._cols)
-                        blank_row.reset_blank(self._cols, bce_word, bce_ext)
+                        blank_row.reset_blank(self._cols, bce_word)
                         blank_frozen = blank_row.freeze()
                         skip_evict = max(0, extra - maxlen)
                         if skip_evict > 0:
@@ -1137,19 +1149,20 @@ class Screen:
                         for _ in range(extra - skip_evict):
                             self._append_history(blank_frozen)
                 else:
-                    self._evicted_total += count
-                self._scrolled_total += count
+                    self._evicted_total += eff_count
+                self._scrolled_total += eff_count
                 if self._gfx is not None:
                     self._gfx.reap_evicted_history(
                         self._scrolled_total - len(self._history),
                     )
             del self._rows[t_row : t_row + shift]
             for row_ev in evicted:
-                row_ev.reset_blank(self._cols, bce_word, bce_ext)
+                row_ev.reset_blank(self._cols, bce_word)
             self._rows[b_row - shift + 1 : b_row - shift + 1] = evicted
             if not (full_screen and advances_abs):
+                stamp_start = 0 if hist_adv > 0 else t_row
                 stamp_end = len(self._rows) if hist_adv > 0 else (b_row + 1)
-                for idx_s in range(t_row, stamp_end):
+                for idx_s in range(stamp_start, stamp_end):
                     self._rows[idx_s].stamp()
             return
 
@@ -1186,7 +1199,7 @@ class Screen:
                 and self._clear_row_spacer_head(self._rows[clr_r - 1])
             ):
                 self._rows[clr_r - 1].wrapped = False
-            self._rows[clr_r].clear_range(left, r_col + 1, bce_word, bce_ext)
+            self._rows[clr_r].clear_range(left, r_col + 1, bce_word, None)
 
     def scroll_down(
         self,
@@ -1197,7 +1210,6 @@ class Screen:
         left: int = 0,
         right: int | None = None,
         bce_word: int = 0,
-        bce_ext: _CellExt | None = None,
         is_line_op: bool = False,
     ) -> None:
         """Scroll region ``[top..bottom, left..right]`` downward by *count* lines."""
@@ -1230,11 +1242,10 @@ class Screen:
             recycled = self._rows[b_row - shift + 1 : b_row + 1]
             del self._rows[b_row - shift + 1 : b_row + 1]
             for row_ev in recycled:
-                row_ev.reset_blank(self._cols, bce_word, bce_ext)
+                row_ev.reset_blank(self._cols, bce_word)
             self._rows[t_row:t_row] = recycled
-            if b_row < len(self._rows) - 1:
-                self._rows[b_row].wrapped = False
-                self._clear_row_spacer_head(self._rows[b_row])
+            self._rows[b_row].wrapped = False
+            self._clear_row_spacer_head(self._rows[b_row])
             for idx_s in range(t_row, b_row + 1):
                 self._rows[idx_s].stamp()
             return
@@ -1261,12 +1272,11 @@ class Screen:
                 and self._clear_row_spacer_head(self._rows[clr_r - 1])
             ):
                 self._rows[clr_r - 1].wrapped = False
-            self._rows[clr_r].clear_range(left, r_col + 1, bce_word, bce_ext)
+            self._rows[clr_r].clear_range(left, r_col + 1, bce_word, None)
 
     def push_scrollback_and_clear(
         self,
         bce_word: int = 0,
-        bce_ext: _CellExt | None = None,
         *,
         include_cursor_row: bool = True,
     ) -> None:
@@ -1287,6 +1297,8 @@ class Screen:
                 last_used = idx
                 break
         if last_used >= 0 and not self._is_alt:
+            self._rows[last_used].wrapped = False
+            self._clear_row_spacer_head(self._rows[last_used])
             if self._history.maxlen is not None and self._history.maxlen > 0:
                 for idx in range(last_used + 1):
                     self._append_history(self._rows[idx].freeze())
@@ -1300,7 +1312,7 @@ class Screen:
         elif self._gfx is not None:
             self._gfx.clear_active_screen(self._scrolled_total, len(self._rows))
         for r in self._rows:
-            r.reset_blank(self._cols, bce_word, bce_ext)
+            r.reset_blank(self._cols, bce_word)
 
     def _reflow_primary(
         self,
@@ -1785,6 +1797,7 @@ class ScreenSet:
         max_images: int = 256,
         max_placements: int = 1_024,
         max_image_dimension: int = 10_000,
+        top_margin_scrolls_to_history: bool = False,
         on_mutate: collections.abc.Callable[[bool], None] | None = None,
     ) -> None:
         counter = _RowGenCounter()
@@ -1799,9 +1812,10 @@ class ScreenSet:
             max_images=max_images,
             max_placements=max_placements,
             max_image_dimension=max_image_dimension,
-            gen_counter=counter,
+            top_margin_scrolls_to_history=top_margin_scrolls_to_history,
             on_mutate=on_mutate,
         )
+        self.primary._bind_counter(counter)
         self.alternate = Screen(
             rows=rows,
             cols=cols,
@@ -1812,9 +1826,9 @@ class ScreenSet:
             max_placements=max_placements,
             max_image_dimension=max_image_dimension,
             is_alt=True,
-            gen_counter=counter,
             on_mutate=on_mutate,
         )
+        self.alternate._bind_counter(counter)
         self._active_is_alt: bool = False
 
     @property

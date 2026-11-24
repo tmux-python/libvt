@@ -25,7 +25,7 @@ def _assert_grid_invariants(term: libvt.Terminal) -> None:
     assert 0 <= scr.cursor.col < scr.cols
     for r_idx, raw_row in enumerate(scr._rows):
         assert raw_row.cols == scr.cols
-        assert 0 <= raw_row.used <= scr.cols
+        assert 0 <= raw_row.text_used <= raw_row.used <= scr.cols
         if not raw_row.has_wide:
             continue
         for c_idx in range(scr.cols):
@@ -415,3 +415,34 @@ def test_seeded_grid_and_reflow_invariants() -> None:
         if trial % 4 == 0:
             term.resize(rows=rng.choice((3, 6, 9)), cols=rng.choice((5, 8, 14)))
             _assert_grid_invariants(term)
+
+
+def test_decslrm_partial_scroll_preserves_interior_wide_glyphs() -> None:
+    """``DECSLRM`` partial scroll keeps wide glyphs wholly inside ``[left, right]``."""
+    term = libvt.Terminal(rows=3, cols=8)
+    # Row 0: wide pairs straddling left=2 (cols 1..2) and right=5 (cols 5..6)
+    # Row 1: wide pairs wholly inside [2..5] at (2, 3) and (4, 5)
+    term.feed_str("A漢BB中C\r\n..日本ZZ")
+    term.feed(b"\x1b[?69h\x1b[3;6s\x1b[1;3H\x1b[S")
+    _assert_grid_invariants(term)
+    assert term.lines[0] == "A 日本 C"
+    assert term[0, 2].text == "日"
+    assert term[0, 2].width_role == WidthRole.WIDE
+    assert term[0, 3].width_role == WidthRole.SPACER_TAIL
+    assert term[0, 4].text == "本"
+    assert term[0, 4].width_role == WidthRole.WIDE
+    assert term[0, 5].width_role == WidthRole.SPACER_TAIL
+    assert term.lines[1] == "..    ZZ"
+
+    # Scroll down (SD) also preserves wide glyphs at exact left/right boundaries.
+    term.feed(b"\x1b[T")
+    _assert_grid_invariants(term)
+    assert term.lines[0] == "A      C"
+    assert term.lines[1] == "..日本ZZ"
+    assert term[1, 2].width_role == WidthRole.WIDE
+    assert term[1, 4].width_role == WidthRole.WIDE
+
+    # Full-width scroll_down onto bottom row clears orphan SPACER_HEAD / wrapped.
+    sd_bot = libvt.Terminal(rows=3, cols=6)
+    sd_bot.feed(b"\x1b[2;1HGHIJK" + "漢".encode() + b"\x1b[1;1H\x1b[1T\x1b[3;1H\n")
+    _assert_grid_invariants(sd_bot)

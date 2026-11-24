@@ -248,3 +248,52 @@ def test_parse_sgr_ignores_colon_5_3_outside_tmux_capture() -> None:
     assert (vt[0, 0].style.overline, vt[0, 0].style.blink) == (False, False)
     assert (vt[0, 1].style.overline, vt[0, 1].style.blink) == (True, False)
     assert (vt[0, 2].style.overline, vt[0, 2].style.blink) == (False, True)
+
+
+def test_del_flushes_incomplete_utf8_and_colon_subparams_restricted() -> None:
+    """``0x7F`` flushes pending UTF-8; non-``m`` and non-``4/38/48/58`` colons drop."""
+    for byte_wise in (False, True):
+        vt = libvt.Terminal(rows=3, cols=8)
+        payload = b"\xe2\x7f\x82\xac"
+        if byte_wise:
+            for idx in range(len(payload)):
+                vt.feed(payload[idx : idx + 1])
+        else:
+            vt.feed(payload)
+        assert vt.lines[0] == "\ufffd\ufffd\ufffd"
+
+    step_vt = libvt.Terminal(rows=2, cols=8)
+    res1 = step_vt.feed_until(b"\xe2", stop=libvt.StopOn.GROUND)
+    assert res1.stopped_on == libvt.StopOn.EOF
+    res2 = step_vt.feed_until(b"\x7f", stop=libvt.StopOn.GROUND)
+    assert res2.stopped_on == libvt.StopOn.GROUND
+    assert step_vt.lines[0] == "\ufffd"
+
+    csi_vt = libvt.Terminal(rows=4, cols=8)
+    csi_vt.feed(b"\x1b[2;3HX\x1b[1:1H\x1b[2:2J\x1b[?25:0l\x1b[1:2;31:5;4:3;32mY")
+    assert (csi_vt.cursor.row, csi_vt.cursor.col, csi_vt.cursor.visible) == (1, 4, True)
+    assert csi_vt[1, 2].text == "X"
+    cell_y = csi_vt[1, 3]
+    assert cell_y.text == "Y"
+    assert cell_y.style.bold is False
+    assert cell_y.style.fg == libvt.AnsiColor.GREEN
+    assert cell_y.style.underline == libvt.UnderlineStyle.CURLY
+
+    # Omitted colon subparams (4:m, 38:5:m, 38:2:10:20:m) and >2 underline
+    # subparams (4:3:9m) are ignored; >= max_csi_params colons still drop/truncate.
+    omitted_vt = libvt.Terminal(rows=2, cols=8)
+    omitted_vt.feed(
+        b"\x1b[4:3;31m\x1b[4:m\x1b[38:5:mA\x1b[0m\x1b[4:3:9mB\x1b[38:2:10:20:mC"
+    )
+    assert omitted_vt[0, 0].style.underline == libvt.UnderlineStyle.CURLY
+    assert omitted_vt[0, 0].style.fg == libvt.AnsiColor.RED
+    assert omitted_vt[0, 1].style.underline == libvt.UnderlineStyle.NONE
+    assert omitted_vt[0, 2].style.fg is None
+
+    assert hasattr(libvt.Parser(), "_csi_overflow_idx")
+    for slow_pad in (b"1;" * 31, b"00000001;" * 35):
+        over_vt = libvt.Terminal(rows=4, cols=8)
+        over_vt.feed(b"\x1b[3;4H\x1b[" + slow_pad + b"1:2H")
+        assert (over_vt.cursor.row, over_vt.cursor.col) == (2, 3)
+        over_vt.feed(b"\x1b[" + (b"0;" * 31) + b"1:2mZ")
+        assert over_vt[2, 3].style.bold is False

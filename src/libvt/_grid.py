@@ -515,14 +515,16 @@ class _Row:
                 self._attrs[col - 1] &= _WIDTH_CLEAR_MASK
         if healed_pair_end != -1:
             if self._text_used == healed_pair_end:
-                pair_lo = max(0, healed_pair_end - 2)
-                self._text_used = pair_lo
-                if (
-                    self._used == healed_pair_end
-                    and self.attr_at(healed_pair_end - 1) == 0
-                    and self.ext_at(healed_pair_end - 1) is None
+                while self._text_used > 0 and self._chars[self._text_used - 1] == " ":
+                    self._text_used -= 1
+                while (
+                    self._used > self._text_used
+                    and self._chars[self._used - 1] == " "
+                    and self.attr_at(self._used - 1) == 0
+                    and self.ext_at(self._used - 1) is None
                 ):
-                    self._used = pair_lo
+                    self._used -= 1
+            self._used = max(self._used, self._text_used)
             self.stamp()
 
     def clear_spacer_head(self, col: int) -> bool:
@@ -574,10 +576,16 @@ class _Row:
         """Copy cells ``[left..right]`` from *src_row* during partial scroll."""
         if right == len(src_row._chars) - 1 and src_row.clear_spacer_head(right):
             src_row.wrapped = False
-        self._heal_wide_boundary(left)
-        self._heal_wide_boundary(right)
-        src_row._heal_wide_boundary(left)
-        src_row._heal_wide_boundary(right)
+        if self._has_wide and self._attrs is not None:
+            if raw_width_bits(self._attrs[left]) == int(WidthRole.SPACER_TAIL):
+                self._heal_wide_boundary(left)
+            if raw_width_bits(self._attrs[right]) == int(WidthRole.WIDE):
+                self._heal_wide_boundary(right)
+        if src_row._has_wide and src_row._attrs is not None:
+            if raw_width_bits(src_row._attrs[left]) == int(WidthRole.SPACER_TAIL):
+                src_row._heal_wide_boundary(left)
+            if raw_width_bits(src_row._attrs[right]) == int(WidthRole.WIDE):
+                src_row._heal_wide_boundary(right)
         for c in range(left, right + 1):
             word = src_row.attr_at(c)
             role = unpack_width_role(word)
@@ -615,6 +623,8 @@ class _Row:
                 ):
                     cand_u -= 1
             self._used = max(cand_u, self._text_used)
+        else:
+            self._used = max(self._used, self._text_used)
         self.stamp()
 
     def write_narrow(
@@ -655,17 +665,10 @@ class _Row:
         n = len(text)
         end = col + n
         if self._has_wide and self._attrs is not None:
-            self._heal_wide_boundary(col)
-            if end - 1 > col:
+            if raw_width_bits(self._attrs[col]) == int(WidthRole.SPACER_TAIL):
+                self._heal_wide_boundary(col)
+            if raw_width_bits(self._attrs[end - 1]) == int(WidthRole.WIDE):
                 self._heal_wide_boundary(end - 1)
-            for idx in range(col, end):
-                if (
-                    raw_width_bits(self._attrs[idx]) == int(WidthRole.WIDE)
-                    and idx + 1 >= end
-                    and idx + 1 < len(self._chars)
-                ):
-                    self._chars[idx + 1] = " "
-                    self._attrs[idx + 1] &= _WIDTH_CLEAR_MASK
 
         self._chars[col:end] = list(text)
         word = pen_word | (_HAS_EXT_BIT if cell_ext is not None else 0)
@@ -799,9 +802,11 @@ class _Row:
             self.reset_blank(cols, bce_word, bce_ext)
             return
 
-        if self._has_wide:
-            self._heal_wide_boundary(lo)
-            self._heal_wide_boundary(hi - 1)
+        if self._has_wide and self._attrs is not None:
+            if raw_width_bits(self._attrs[lo]) == int(WidthRole.SPACER_TAIL):
+                self._heal_wide_boundary(lo)
+            if raw_width_bits(self._attrs[hi - 1]) == int(WidthRole.WIDE):
+                self._heal_wide_boundary(hi - 1)
 
         n = hi - lo
         self._chars[lo:hi] = [" "] * n
@@ -830,6 +835,7 @@ class _Row:
                 self._used = min(self._used, lo)
         if hi >= self._text_used:
             self._text_used = min(self._text_used, lo)
+        self._used = max(self._used, self._text_used)
         self.stamp()
 
     def insert_blanks(
@@ -961,6 +967,7 @@ class _Row:
                 self._used = max(col, self._used - shift)
         if self._text_used <= right + 1 and self._text_used > col:
             self._text_used = max(col, self._text_used - shift)
+        self._used = max(self._used, self._text_used)
         self.stamp()
 
     def resize(self, cols: int) -> None:

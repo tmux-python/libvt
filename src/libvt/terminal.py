@@ -83,6 +83,7 @@ from libvt.modes import (
     ALT_SCREEN_MODES,
     DEC_PRIVATE_MASK,
     TRANSIENT_SNAPSHOT_MODES,
+    DecrpmValue,
     Mode,
     ModeState,
 )
@@ -194,6 +195,7 @@ def _alloc_terminal_id() -> int:
     return _TERMINAL_IDS.alloc()
 
 
+#: Buffer view selector for :meth:`Terminal.sync_token` and incremental deltas.
 type SyncView = t.Literal["working", "committed"]
 
 
@@ -243,7 +245,7 @@ class SyncToken:
     __slots__ = ("_state",)
     _state: _SyncState
 
-    def __new__(cls, *_args: object, **_kwargs: object) -> t.NoReturn:
+    def __new__(cls, *args: object, **kwargs: object) -> t.NoReturn:
         """Disallow direct construction; call :meth:`Terminal.sync_token`."""
         msg = "SyncToken cannot be instantiated directly; call Terminal.sync_token()"
         raise TypeError(msg)
@@ -279,7 +281,7 @@ class SyncToken:
         """Return ``self`` (immutable value)."""
         return self
 
-    def __deepcopy__(self, _memo: dict[int, object]) -> SyncToken:
+    def __deepcopy__(self, memo: dict[int, object]) -> SyncToken:
         """Return ``self`` (immutable value)."""
         return self
 
@@ -518,6 +520,8 @@ class _SavedCursor:
         Saved ``G0``..``G3`` character-set designations.
     gl : int
         Saved active locking-shift slot index (``0..3``).
+    single_shift : int | None
+        Saved pending single-shift slot (``2`` for ``SS2``, ``3`` for ``SS3``).
     protected : bool
         Saved ``DECSCA`` character-protection pen attribute.
     """
@@ -529,11 +533,70 @@ class _SavedCursor:
     decom: bool = False
     g_sets: tuple[Charset, Charset, Charset, Charset] = ("B", "B", "B", "B")
     gl: int = 0
+    single_shift: int | None = None
     protected: bool = False
+
+
+def _make_snapshot(
+    *,
+    rows: tuple[_Row, ...],
+    history: _FrozenHistory | collections.abc.Sequence[FrozenRow] = (
+        _EMPTY_FROZEN_HISTORY
+    ),
+    cols: int,
+    cursor: Cursor,
+    title: str,
+    cwd: str,
+    cwd_uri: str = "",
+    modes: frozenset[Mode],
+    active_is_alt: bool,
+    prompt_zones: tuple[PromptZone, ...],
+    program_status: ProgramStatus | None,
+    program_statuses: collections.abc.Mapping[str, ProgramStatus],
+    generation: int,
+    images: collections.abc.Mapping[int, ImageMeta] | None = None,
+    placements: tuple[ImagePlacement, ...] = (),
+    scrolled_total: int | None = None,
+    evicted_total: int | None = None,
+) -> Snapshot:
+    snap = object.__new__(Snapshot)
+    object.__setattr__(snap, "_frozen", False)
+    snap._rows = rows
+    hist_obj = _FrozenHistory.from_sequence(history)
+    snap._history = hist_obj
+    snap._cols = cols
+    eff_scrolled = (
+        (0 if active_is_alt else len(hist_obj))
+        if scrolled_total is None
+        else scrolled_total
+    )
+    snap._scrolled_total = eff_scrolled
+    snap._evicted_total = (
+        (0 if active_is_alt else max(0, eff_scrolled - len(hist_obj)))
+        if evicted_total is None
+        else evicted_total
+    )
+    snap.cursor = cursor
+    snap.title = title
+    snap.cwd = cwd
+    snap.cwd_uri = cwd_uri
+    snap.modes = modes
+    snap.active_is_alt = active_is_alt
+    snap.prompt_zones = prompt_zones
+    snap.program_status = program_status
+    snap.program_statuses = types.MappingProxyType(dict(program_statuses))
+    snap.generation = generation
+    snap.images = types.MappingProxyType(dict(images) if images is not None else {})
+    snap.placements = placements
+    object.__setattr__(snap, "_frozen", True)
+    return snap
 
 
 class Snapshot:
     """Immutable point-in-time capture of terminal screen, history, and metadata.
+
+    Obtain instances via :meth:`Terminal.snapshot`, :attr:`Terminal.committed`,
+    or :meth:`Snapshot.from_tmux_capture`.
 
     Attributes
     ----------
@@ -585,62 +648,29 @@ class Snapshot:
         "title",
     )
 
-    def __init__(
-        self,
-        *,
-        rows: tuple[_Row, ...],
-        history: _FrozenHistory | collections.abc.Sequence[FrozenRow] = (
-            _EMPTY_FROZEN_HISTORY
-        ),
-        cols: int,
-        cursor: Cursor,
-        title: str,
-        cwd: str,
-        cwd_uri: str = "",
-        modes: frozenset[Mode],
-        active_is_alt: bool,
-        prompt_zones: tuple[PromptZone, ...],
-        program_status: ProgramStatus | None,
-        program_statuses: collections.abc.Mapping[str, ProgramStatus],
-        generation: int,
-        images: collections.abc.Mapping[int, ImageMeta] | None = None,
-        placements: tuple[ImagePlacement, ...] = (),
-        scrolled_total: int | None = None,
-        evicted_total: int | None = None,
-    ) -> None:
-        object.__setattr__(self, "_frozen", False)
-        self._rows = rows
-        hist_obj = _FrozenHistory.from_sequence(history)
-        self._history: _FrozenHistory = hist_obj
-        self._cols = cols
-        eff_scrolled = (
-            (0 if active_is_alt else len(hist_obj))
-            if scrolled_total is None
-            else scrolled_total
-        )
-        self._scrolled_total = eff_scrolled
-        self._evicted_total = (
-            (0 if active_is_alt else max(0, eff_scrolled - len(hist_obj)))
-            if evicted_total is None
-            else evicted_total
-        )
-        self.cursor = cursor
-        self.title = title
-        self.cwd = cwd
-        self.cwd_uri = cwd_uri
-        self.modes = modes
-        self.active_is_alt = active_is_alt
-        self.prompt_zones = prompt_zones
-        self.program_status = program_status
-        self.program_statuses: collections.abc.Mapping[str, ProgramStatus] = (
-            types.MappingProxyType(dict(program_statuses))
-        )
-        self.generation = generation
-        self.images: collections.abc.Mapping[int, ImageMeta] = types.MappingProxyType(
-            dict(images) if images is not None else {}
-        )
-        self.placements = placements
-        object.__setattr__(self, "_frozen", True)
+    _cols: int
+    _evicted_total: int
+    _frozen: bool
+    _history: _FrozenHistory
+    _rows: tuple[_Row, ...]
+    _scrolled_total: int
+    active_is_alt: bool
+    cursor: Cursor
+    cwd: str
+    cwd_uri: str
+    generation: int
+    images: collections.abc.Mapping[int, ImageMeta]
+    modes: frozenset[Mode]
+    placements: tuple[ImagePlacement, ...]
+    program_status: ProgramStatus | None
+    program_statuses: collections.abc.Mapping[str, ProgramStatus]
+    prompt_zones: tuple[PromptZone, ...]
+    title: str
+
+    def __new__(cls, *args: object, **kwargs: object) -> t.NoReturn:
+        """Disallow direct construction; call :meth:`Terminal.snapshot`."""
+        msg = "Snapshot cannot be instantiated directly; call Terminal.snapshot()"
+        raise TypeError(msg)
 
     def __setattr__(self, name: str, value: object) -> None:
         """Reject attribute mutation once snapshot initialization completes."""
@@ -977,26 +1007,41 @@ class Formatter:
         export_modes = snapshot.modes - TRANSIENT_SNAPSHOT_MODES
         if not snapshot.active_is_alt:
             export_modes = export_modes - ALT_SCREEN_MODES
-        for mode in sorted(export_modes, key=int):
-            raw = int(mode)
-            if raw & DEC_PRIVATE_MASK:
-                code = raw & ~DEC_PRIVATE_MASK
-                if mode not in (
-                    Mode.DECAWM,
-                    Mode.DECTCEM,
-                    Mode.GRAPHEME_CLUSTERING,
-                ):
-                    out.append(f"\x1b[?{code}h")
-            else:
-                out.append(f"\x1b[{raw}h")
-        if Mode.DECTCEM not in export_modes:
-            out.append("\x1b[?25l")
+        else:
+            for alt_mode in sorted(export_modes & ALT_SCREEN_MODES, key=int):
+                code = int(alt_mode) & ~DEC_PRIVATE_MASK
+                out.append(f"\x1b[?{code}h")
+        if Mode.GRAPHEME_CLUSTERING not in export_modes:
+            out.append("\x1b[?2027l")
         cur_style = DEFAULT_STYLE
         cur_link: Hyperlink | None = None
+        cols = snapshot.cols
+        n_rows = len(snapshot._rows)
         for r_idx, row in enumerate(snapshot._rows):
+            eff_wrapped = row.wrapped and r_idx + 1 < n_rows
             if r_idx > 0:
-                out.append("\r\n" if not snapshot._rows[r_idx - 1].wrapped else "")
-            limit = row.used if row.wrapped else row.text_used
+                prev_wrapped = snapshot._rows[r_idx - 1].wrapped
+                if not prev_wrapped:
+                    out.append("\r\n")
+                elif not eff_wrapped and row.text_used == 0 and cols > 0:
+                    if cur_link is not None:
+                        out.append("\x1b]8;;\x1b\\")
+                        cur_link = None
+                    if cur_style != DEFAULT_STYLE:
+                        out.append("\x1b[0m")
+                        cur_style = DEFAULT_STYLE
+                    out.append(f" \x1b[{r_idx + 1};1H\x1b[K")
+            if eff_wrapped:
+                has_spacer_head = (
+                    cols > 0
+                    and raw_width_bits(row.attr_at(cols - 1))
+                    == int(WidthRole.SPACER_HEAD)
+                    and raw_width_bits(snapshot._rows[r_idx + 1].attr_at(0))
+                    == int(WidthRole.WIDE)
+                )
+                limit = max(0, cols - 1) if has_spacer_head else cols
+            else:
+                limit = min(cols, row.text_used)
             for c in range(limit):
                 word = row.attr_at(c)
                 rb = raw_width_bits(word)
@@ -1016,10 +1061,10 @@ class Formatter:
                     out.append(_style_to_sgr(style))
                     cur_style = style
                 out.append(row.char_at(c))
-            if not row.wrapped and row.used > limit:
+            if not eff_wrapped and row.used > limit:
                 cur_col_pos = limit
                 span_c = limit
-                row_used = min(snapshot.cols, row.used)
+                row_used = min(cols, row.used)
                 while span_c < row_used:
                     word = row.attr_at(span_c)
                     ext = row.ext_at(span_c)
@@ -1049,7 +1094,7 @@ class Formatter:
                         if style != cur_style:
                             out.append(_style_to_sgr(style))
                             cur_style = style
-                        if end_c == snapshot.cols:
+                        if end_c == cols:
                             out.append("\x1b[K")
                         else:
                             out.append(f"\x1b[{end_c - span_c}X")
@@ -1058,7 +1103,34 @@ class Formatter:
             out.append("\x1b]8;;\x1b\\")
         if cur_style != DEFAULT_STYLE:
             out.append("\x1b[0m")
-        out.append(f"\x1b[{snapshot.cursor.row + 1};{snapshot.cursor.col + 1}H")
+        for mode in sorted(export_modes - ALT_SCREEN_MODES, key=int):
+            raw = int(mode)
+            if raw & DEC_PRIVATE_MASK:
+                code = raw & ~DEC_PRIVATE_MASK
+                if mode not in (
+                    Mode.DECAWM,
+                    Mode.DECTCEM,
+                    Mode.GRAPHEME_CLUSTERING,
+                ):
+                    out.append(f"\x1b[?{code}h")
+            else:
+                out.append(f"\x1b[{raw}h")
+        if Mode.DECAWM not in export_modes:
+            out.append("\x1b[?7l")
+        if Mode.DECTCEM not in export_modes:
+            out.append("\x1b[?25l")
+        cur = snapshot.cursor
+        if (cur.shape, cur.blinking) != (CursorShape.BLOCK, True):
+            decscusr_map: dict[tuple[CursorShape, bool], int] = {
+                (CursorShape.BLOCK, False): 2,
+                (CursorShape.UNDERLINE, True): 3,
+                (CursorShape.UNDERLINE, False): 4,
+                (CursorShape.BAR, True): 5,
+                (CursorShape.BAR, False): 6,
+            }
+            ps = decscusr_map.get((cur.shape, cur.blinking), 1)
+            out.append(f"\x1b[{ps} q")
+        out.append(f"\x1b[{cur.row + 1};{cur.col + 1}H")
         return "".join(out)
 
     def _render_html(self, snapshot: Snapshot) -> str:
@@ -1347,6 +1419,7 @@ class Terminal:
             max_images=limits.max_images,
             max_placements=limits.max_placements,
             max_image_dimension=limits.max_image_dimension,
+            top_margin_scrolls_to_history=profile.top_margin_scrolls_to_history,
             on_mutate=self._on_screen_mutate,
         )
         self._modes = ModeState(
@@ -1380,6 +1453,8 @@ class Terminal:
         self._single_shift: int | None = None
         self._saved_primary = _SavedCursor(g_sets=def_g)
         self._saved_alt = _SavedCursor(g_sets=def_g)
+        self._saved_decsc = _SavedCursor(g_sets=def_g)
+        self._has_alt_saved: bool = False
         self._last_printed: str = ""
         self._last_printed_pos: tuple[int, int] | None = None
         self._cluster_state: int = CLUSTER_NONE
@@ -1629,7 +1704,7 @@ class Terminal:
         if exclude_modes:
             modes = modes - exclude_modes
         active_alt = self._screens.active_is_alt
-        return Snapshot(
+        return _make_snapshot(
             rows=tuple(r.clone() for r in scr._rows),
             history=self._screens.primary._history.freeze(),
             cols=scr.cols,
@@ -1990,10 +2065,9 @@ class Terminal:
         )
 
     def _bce_pair(self) -> tuple[int, _CellExt | None]:
-        if self._style.bg is None and self._hyperlink is None:
+        if self._style.bg is None:
             return 0, None
-        bce_style = Style(bg=self._style.bg)
-        return pack_pen_base(bce_style), make_cell_ext(bce_style, self._hyperlink)
+        return pack_pen_base(Style(bg=self._style.bg)), None
 
     def _notify_erase(self, rect: Rect, cause: EraseCause) -> None:
         if (
@@ -2070,6 +2144,7 @@ class Terminal:
                 decom=self._saved_primary.decom,
                 g_sets=self._saved_primary.g_sets,
                 gl=self._saved_primary.gl,
+                single_shift=self._saved_primary.single_shift,
                 protected=self._saved_primary.protected,
             )
         self._generation += 1
@@ -2097,19 +2172,20 @@ class Terminal:
         self._gl = 0
         self._single_shift = None
         was_sync = self.synchronized
-        was_alt = self._screens.active_is_alt
-        self._modes = ModeState(
-            on_mutate=self._before_mutate,
-            on_set_mode=self._intercept_mode_set,
-        )
-        if self._newline_mode:
-            self._modes._enabled.add(Mode.LNM)
-        self._sync_hold_pending = False
-        self._held_snapshot = None
-        self._held_sync_token = None
         if soft:
-            if was_alt:
-                self._modes.sync_alt_screen(active_is_alt=True)
+            for mode_off in (
+                Mode.IRM,
+                Mode.DECOM,
+                Mode.REVERSE_WRAP,
+                Mode.DECCKM,
+                Mode.DECLRMM,
+            ):
+                self._modes.set_mode(mode_off, enabled=False)
+            for mode_on in (
+                Mode.DECAWM,
+                Mode.DECTCEM,
+            ):
+                self._modes.set_mode(mode_on, enabled=True)
             scr = self._screens.active
             scr.scroll_region = ScrollRegion(
                 top=0,
@@ -2117,10 +2193,27 @@ class Terminal:
                 left=0,
                 right=scr.cols - 1,
             )
-            scr._cur_visible = True
+            self._screens.primary._cur_visible = True
+            self._screens.alternate._cur_visible = True
+            scr._cur_shape = CursorShape.BLOCK
+            scr._cur_blinking = True
             scr._pending_wrap = False
-            scr.keyboard_stack.reset()
+            if self._profile.separate_alt_save_cursor:
+                self._saved_decsc = _SavedCursor(g_sets=def_g)
+            elif self._screens.active_is_alt:
+                self._saved_alt = _SavedCursor(g_sets=def_g)
+            else:
+                self._saved_primary = _SavedCursor(g_sets=def_g)
         else:
+            self._modes = ModeState(
+                on_mutate=self._before_mutate,
+                on_set_mode=self._intercept_mode_set,
+            )
+            if self._newline_mode:
+                self._modes._enabled.add(Mode.LNM)
+            self._sync_hold_pending = False
+            self._held_snapshot = None
+            self._held_sync_token = None
             self._epoch += 1
             self._parser.reset()
             self._passthrough_parser = None
@@ -2129,6 +2222,8 @@ class Terminal:
             self._screens.alternate.reset()
             self._saved_primary = _SavedCursor(g_sets=def_g)
             self._saved_alt = _SavedCursor(g_sets=def_g)
+            self._saved_decsc = _SavedCursor(g_sets=def_g)
+            self._has_alt_saved = False
             self._title = ""
             self._window_name = ""
             self._fg_rgb = self._profile.fg_rgb
@@ -2145,9 +2240,9 @@ class Terminal:
             )
         self._cached_snapshot = None
         self._generation += 1
-        if was_sync or not self.synchronized:
+        if (not soft and was_sync) or not self.synchronized:
             self._committed_generation += 1
-        if was_sync:
+        if not soft and was_sync:
             self._emit_event(
                 RenderHoldChanged(
                     active=False,
@@ -2190,6 +2285,13 @@ class Terminal:
         if mode == Mode.SYNCHRONIZED_OUTPUT:
             self._set_synchronized_output(enabled)
             return True
+        if mode == Mode.DECLRMM and not self._profile.declrmm_enabled and enabled:
+            return True
+        if mode == Mode.DECSC_1048 and self._profile.separate_alt_save_cursor:
+            return True
+        if mode == Mode.DECTCEM:
+            self._screens.primary._cur_visible = enabled
+            self._screens.alternate._cur_visible = enabled
         return False
 
     def _before_mutate(self) -> None:
@@ -2314,23 +2416,42 @@ class Terminal:
         if clear_cluster:
             self._clear_cluster_anchor()
 
-    def _shift_prompt_zones_below(
+    def _remap_prompt_zones_on_scroll(
         self,
         prev_scrolled: int,
+        *,
+        top: int,
         bottom: int,
-        count: int,
+        rows: int,
+        hist_delta: int,
     ) -> None:
-        if not self._prompt_zones or count <= 0:
+        if not self._prompt_zones or hist_delta <= 0:
             return
-        cutoff = prev_scrolled + bottom
+        if top == 0 and bottom >= rows - 1:
+            return
+        abs_top = prev_scrolled + top
+        abs_bot = prev_scrolled + bottom
         changed = False
         updated: list[PromptZone] = []
         for z in self._prompt_zones:
-            if z.abs_row > cutoff:
+            old_abs = z.abs_row
+            if top == 0:
+                new_abs = old_abs + hist_delta if old_abs > abs_bot else old_abs
+            elif old_abs < prev_scrolled:
+                new_abs = old_abs
+            elif old_abs < abs_top:
+                new_abs = old_abs + hist_delta
+            elif old_abs < abs_top + hist_delta:
+                new_abs = old_abs - top
+            elif old_abs <= abs_bot:
+                new_abs = old_abs
+            else:
+                new_abs = old_abs + hist_delta
+            if new_abs != old_abs:
                 updated.append(
                     PromptZone(
                         kind=z.kind,
-                        abs_row=z.abs_row + count,
+                        abs_row=new_abs,
                         col=z.col,
                         exit_code=z.exit_code,
                     ),
@@ -2354,7 +2475,7 @@ class Terminal:
         )
         if scr._cur_row == bottom and left <= scr._cur_col <= right:
             prev_scrolled = scr._scrolled_total
-            bce_word, bce_ext = self._bce_pair()
+            bce_word, _ = self._bce_pair()
             save_hist = not self._screens.active_is_alt
             scr.scroll_up(
                 1,
@@ -2364,17 +2485,16 @@ class Terminal:
                 right=right,
                 save_history=save_hist,
                 bce_word=bce_word,
-                bce_ext=bce_ext,
             )
             hist_delta = scr._scrolled_total - prev_scrolled
-            if (
-                hist_delta > 0
-                and top == 0
-                and bottom < scr.rows - 1
-                and left == 0
-                and right == scr.cols - 1
-            ):
-                self._shift_prompt_zones_below(prev_scrolled, bottom, hist_delta)
+            if hist_delta > 0 and left == 0 and right == scr.cols - 1:
+                self._remap_prompt_zones_on_scroll(
+                    prev_scrolled,
+                    top=top,
+                    bottom=bottom,
+                    rows=scr.rows,
+                    hist_delta=hist_delta,
+                )
             self._notify_erase(
                 Rect(bottom, left, 1, right - left + 1),
                 EraseCause.SCROLL,
@@ -2409,7 +2529,7 @@ class Terminal:
             self._set_cursor(scr, orig_row + to_bottom, final_col, pending_wrap=False)
             return orig_row
         prev_scrolled = scr._scrolled_total
-        bce_word, bce_ext = self._bce_pair()
+        bce_word, _ = self._bce_pair()
         save_hist = not self._screens.active_is_alt
         scr.scroll_up(
             scroll_cnt,
@@ -2419,17 +2539,16 @@ class Terminal:
             right=right,
             save_history=save_hist,
             bce_word=bce_word,
-            bce_ext=bce_ext,
         )
         hist_delta = scr._scrolled_total - prev_scrolled
-        if (
-            hist_delta > 0
-            and top == 0
-            and bottom < scr.rows - 1
-            and left == 0
-            and right == scr.cols - 1
-        ):
-            self._shift_prompt_zones_below(prev_scrolled, bottom, hist_delta)
+        if hist_delta > 0 and left == 0 and right == scr.cols - 1:
+            self._remap_prompt_zones_on_scroll(
+                prev_scrolled,
+                top=top,
+                bottom=bottom,
+                rows=scr.rows,
+                hist_delta=hist_delta,
+            )
         erase_h = min(scroll_cnt, bottom - top + 1)
         self._notify_erase(
             Rect(bottom - erase_h + 1, left, erase_h, right - left + 1),
@@ -3038,9 +3157,9 @@ class Terminal:
         elif byte == 0x0F:  # SI -> G0
             self._gl = 0
 
-    def _save_cursor(self) -> None:
+    def _capture_saved_cursor(self) -> _SavedCursor:
         scr = self._screens.active
-        saved = _SavedCursor(
+        return _SavedCursor(
             row=scr._cur_row,
             col=scr._cur_col,
             pending_wrap=scr._pending_wrap,
@@ -3053,24 +3172,26 @@ class Terminal:
                 self._g_sets[3],
             ),
             gl=self._gl,
+            single_shift=self._single_shift,
             protected=self._protected,
         )
-        if self._screens.active_is_alt:
-            self._saved_alt = saved
-        else:
-            self._saved_primary = saved
 
-    def _restore_cursor(self) -> None:
+    def _apply_saved_cursor(
+        self,
+        saved: _SavedCursor,
+        *,
+        restore_decom: bool = True,
+    ) -> None:
         self._before_mutate()
         scr = self._screens.active
-        saved = self._saved_alt if self._screens.active_is_alt else self._saved_primary
         self._style = saved.style
         self._protected = saved.protected
         self._sync_pen_cache()
         self._g_sets = list(saved.g_sets)
         self._gl = saved.gl
-        self._single_shift = None
-        self._modes.set_mode(Mode.DECOM, enabled=saved.decom)
+        self._single_shift = saved.single_shift
+        if restore_decom:
+            self._modes.set_mode(Mode.DECOM, enabled=saved.decom)
         restored_wrap = (
             False if self._profile.pending_wrap_phantom_col else saved.pending_wrap
         )
@@ -3080,6 +3201,24 @@ class Terminal:
             saved.col,
             pending_wrap=restored_wrap,
         )
+
+    def _save_cursor(self) -> None:
+        saved = self._capture_saved_cursor()
+        if self._profile.separate_alt_save_cursor:
+            self._saved_decsc = saved
+        elif self._screens.active_is_alt:
+            self._saved_alt = saved
+        else:
+            self._saved_primary = saved
+
+    def _restore_cursor(self) -> None:
+        if self._profile.separate_alt_save_cursor:
+            saved = self._saved_decsc
+        else:
+            saved = (
+                self._saved_alt if self._screens.active_is_alt else self._saved_primary
+            )
+        self._apply_saved_cursor(saved)
 
     def _handle_esc(self, intermediates: bytes, final: int) -> None:
         self._last_printed = ""
@@ -3100,7 +3239,7 @@ class Terminal:
                 top, bottom, left, right = self._effective_margins(scr)
                 keep_wrap = self._profile.pending_wrap_phantom_col and scr._pending_wrap
                 if scr._cur_row == top and left <= scr._cur_col <= right:
-                    bce_w, bce_e = self._bce_pair()
+                    bce_w, _ = self._bce_pair()
                     scr.scroll_down(
                         1,
                         top=top,
@@ -3108,7 +3247,6 @@ class Terminal:
                         left=left,
                         right=right,
                         bce_word=bce_w,
-                        bce_ext=bce_e,
                     )
                     self._notify_erase(
                         Rect(top, left, 1, right - left + 1),
@@ -3169,26 +3307,65 @@ class Terminal:
             self._set_synchronized_output(enabled)
             return
 
+        if mode == Mode.DECLRMM and not self._profile.declrmm_enabled:
+            return
+
+        if mode == Mode.DECSC_1048 and self._profile.separate_alt_save_cursor:
+            return
+
         if mode in ALT_SCREEN_MODES:
             self._before_mutate()
             self._clear_cluster_anchor()
+            def_g: tuple[Charset, Charset, Charset, Charset] = (
+                "B",
+                self._profile.default_g1_charset,
+                "B",
+                "B",
+            )
+            cur_vis = self._modes.is_set(Mode.DECTCEM)
             if enabled and not self._screens.active_is_alt:
                 if mode == Mode.ALT_SCREEN:
-                    self._save_cursor()
+                    self._saved_primary = self._capture_saved_cursor()
+                    self._has_alt_saved = True
+                self._single_shift = None
                 self._screens.alternate.reset()
+                self._screens.alternate._cur_visible = cur_vis
+                self._saved_alt = _SavedCursor(g_sets=def_g)
                 self._screens.active_is_alt = True
                 self._epoch += 1
                 self._modes.sync_alt_screen(active_is_alt=True, entered_via=mode)
+            elif enabled and self._screens.active_is_alt:
+                if (
+                    mode == Mode.ALT_SCREEN
+                    and not self._profile.separate_alt_save_cursor
+                ):
+                    self._saved_alt = self._capture_saved_cursor()
             elif not enabled and self._screens.active_is_alt:
                 if mode in (Mode.ALT_SCREEN_1047, Mode.ALT_SCREEN):
                     self._screens.alternate.reset()
+                    self._screens.alternate._cur_visible = cur_vis
+                    self._saved_alt = _SavedCursor(g_sets=def_g)
+                self._single_shift = None
+                self._screens.primary._cur_visible = cur_vis
                 self._screens.active_is_alt = False
                 self._epoch += 1
                 self._modes.sync_alt_screen(active_is_alt=False)
-                if mode == Mode.ALT_SCREEN:
-                    self._restore_cursor()
+                if mode == Mode.ALT_SCREEN and (
+                    not self._profile.separate_alt_save_cursor or self._has_alt_saved
+                ):
+                    self._apply_saved_cursor(
+                        self._saved_primary,
+                        restore_decom=not self._profile.separate_alt_save_cursor,
+                    )
             elif not enabled:
                 self._modes.sync_alt_screen(active_is_alt=False)
+                if mode == Mode.ALT_SCREEN and (
+                    not self._profile.separate_alt_save_cursor or self._has_alt_saved
+                ):
+                    self._apply_saved_cursor(
+                        self._saved_primary,
+                        restore_decom=not self._profile.separate_alt_save_cursor,
+                    )
             return
 
         self._before_mutate()
@@ -3196,7 +3373,8 @@ class Terminal:
         scr = self._screens.active
 
         if mode == Mode.DECTCEM:
-            scr._cur_visible = enabled
+            self._screens.primary._cur_visible = enabled
+            self._screens.alternate._cur_visible = enabled
         elif mode == Mode.DECOM:
             top, _, left, _ = self._effective_margins(scr)
             self._set_cursor(
@@ -3256,7 +3434,6 @@ class Terminal:
         if scroll_clear:
             scr.push_scrollback_and_clear(
                 bce_w,
-                bce_e,
                 include_cursor_row=False,
             )
             self._notify_erase(Rect(0, 0, scr.rows, scr.cols), cause)
@@ -3341,7 +3518,7 @@ class Terminal:
             self._notify_erase(Rect(0, 0, scr.rows, scr.cols), cause)
         elif mode == 22 and not selective:
             if not self._screens.active_is_alt:
-                scr.push_scrollback_and_clear(bce_w, bce_e)
+                scr.push_scrollback_and_clear(bce_w)
             else:
                 for r in range(scr.rows):
                     scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e)
@@ -3440,6 +3617,10 @@ class Terminal:
     ) -> None:
         prev_printed = self._last_printed
         self._last_printed = ""
+        if params.colon_mask != 0 and not (
+            prefix == 0 and not intermediates and final == ord("m")
+        ):
+            return
         scr = self._screens.active
         top, bottom, left, right = self._effective_margins(scr)
 
@@ -3480,13 +3661,19 @@ class Terminal:
         if intermediates == b"$" and final == ord("p"):
             private = prefix == ord("?")
             code = params.raw_or_default(0, 0)
-            pm = int(
-                self._modes.decrpm(
-                    code,
-                    private=private,
-                    active_is_alt=self._screens.active_is_alt,
-                ),
-            )
+            if private and (
+                (code == 69 and not self._profile.declrmm_enabled)
+                or (code == 1048 and self._profile.separate_alt_save_cursor)
+            ):
+                pm = int(DecrpmValue.NOT_RECOGNIZED)
+            else:
+                pm = int(
+                    self._modes.decrpm(
+                        code,
+                        private=private,
+                        active_is_alt=self._screens.active_is_alt,
+                    ),
+                )
             q = "?" if private else ""
             self._emit_reply(f"\x1b[{q}{code};{pm}$y".encode("ascii"))
             return
@@ -3757,7 +3944,7 @@ class Terminal:
             if top <= c_row <= bottom and left <= c_col <= right:
                 self._before_mutate()
                 n = params.get(0, 1)
-                bce_w, bce_e = self._bce_pair()
+                bce_w, _ = self._bce_pair()
                 keep_wrap = (
                     not self._profile.il_dl_resets_col
                     and self._profile.pending_wrap_phantom_col
@@ -3770,7 +3957,6 @@ class Terminal:
                     left=left,
                     right=right,
                     bce_word=bce_w,
-                    bce_ext=bce_e,
                     is_line_op=True,
                 )
                 self._notify_erase(
@@ -3783,7 +3969,7 @@ class Terminal:
             if top <= c_row <= bottom and left <= c_col <= right:
                 self._before_mutate()
                 n = params.get(0, 1)
-                bce_w, bce_e = self._bce_pair()
+                bce_w, _ = self._bce_pair()
                 keep_wrap = (
                     not self._profile.il_dl_resets_col
                     and self._profile.pending_wrap_phantom_col
@@ -3797,7 +3983,6 @@ class Terminal:
                     right=right,
                     save_history=False,
                     bce_word=bce_w,
-                    bce_ext=bce_e,
                     is_line_op=True,
                 )
                 self._notify_erase(
@@ -3813,23 +3998,33 @@ class Terminal:
                 self._set_cursor(scr, c_row, target_col, pending_wrap=keep_wrap)
         elif ch_final == "S":  # SU
             self._before_mutate()
-            n = params.get(0, 1)
-            bce_w, bce_e = self._bce_pair()
+            region_h = bottom - top + 1
+            n = min(params.get(0, 1), region_h)
+            prev_scrolled = scr._scrolled_total
+            bce_w, _ = self._bce_pair()
             scr.scroll_up(
                 n,
                 top=top,
                 bottom=bottom,
                 left=left,
                 right=right,
-                save_history=False,
+                save_history=not self._screens.active_is_alt,
                 bce_word=bce_w,
-                bce_ext=bce_e,
             )
+            hist_delta = scr._scrolled_total - prev_scrolled
+            if hist_delta > 0 and left == 0 and right == scr.cols - 1:
+                self._remap_prompt_zones_on_scroll(
+                    prev_scrolled,
+                    top=top,
+                    bottom=bottom,
+                    rows=scr.rows,
+                    hist_delta=hist_delta,
+                )
             self._notify_erase(
                 Rect(
                     max(top, bottom - n + 1),
                     left,
-                    min(n, bottom - top + 1),
+                    min(n, region_h),
                     right - left + 1,
                 ),
                 EraseCause.SCROLL,
@@ -3838,7 +4033,7 @@ class Terminal:
         elif ch_final == "T":  # SD
             self._before_mutate()
             n = params.get(0, 1)
-            bce_w, bce_e = self._bce_pair()
+            bce_w, _ = self._bce_pair()
             scr.scroll_down(
                 n,
                 top=top,
@@ -3846,7 +4041,6 @@ class Terminal:
                 left=left,
                 right=right,
                 bce_word=bce_w,
-                bce_ext=bce_e,
             )
             self._notify_erase(
                 Rect(top, left, min(n, bottom - top + 1), right - left + 1),
@@ -3891,25 +4085,26 @@ class Terminal:
                 )
         elif ch_final == "s":  # DECSLRM (when ?69 set) or SCOSC
             if self._modes.is_set(Mode.DECLRMM):
-                l_arg = params.get(0, 1) - 1
-                r_arg = params.get(1, scr.cols) - 1
-                l_clamped = max(0, min(scr.cols - 1, l_arg))
-                r_clamped = max(0, min(scr.cols - 1, r_arg))
-                if l_clamped < r_clamped:
-                    sr = scr.scroll_region
-                    scr.scroll_region = ScrollRegion(
-                        top=sr.top,
-                        bottom=sr.bottom,
-                        left=l_clamped,
-                        right=r_clamped,
-                    )
-                    decom = self._modes.is_set(Mode.DECOM)
-                    self._set_cursor(
-                        scr,
-                        sr.top if decom else 0,
-                        l_clamped if decom else 0,
-                    )
-            else:
+                if len(params.values) <= 2:
+                    l_arg = params.get(0, 1) - 1
+                    r_arg = params.get(1, scr.cols) - 1
+                    l_clamped = max(0, min(scr.cols - 1, l_arg))
+                    r_clamped = max(0, min(scr.cols - 1, r_arg))
+                    if l_clamped < r_clamped:
+                        sr = scr.scroll_region
+                        scr.scroll_region = ScrollRegion(
+                            top=sr.top,
+                            bottom=sr.bottom,
+                            left=l_clamped,
+                            right=r_clamped,
+                        )
+                        decom = self._modes.is_set(Mode.DECOM)
+                        self._set_cursor(
+                            scr,
+                            sr.top if decom else 0,
+                            l_clamped if decom else 0,
+                        )
+            elif not self._profile.declrmm_enabled or not params.values:
                 self._save_cursor()
         elif ch_final == "u":  # SCORC
             self._restore_cursor()
@@ -4306,11 +4501,14 @@ class Terminal:
                     else:
                         post_r = self._advance_rows(scr, s_rows, final_col=0)
                         eff_rows = min(s_rows, max(1, scr.rows - post_r))
-                        min_sixel_abs = (
-                            scr._scrolled_total + (top if in_margins else 0)
-                            if scr._scrolled_total == pre_scrolled
-                            else scr._scrolled_total - len(scr._history)
-                        )
+                        if in_margins and top > 0:
+                            min_sixel_abs = scr._scrolled_total + top
+                        elif scr._scrolled_total == pre_scrolled:
+                            min_sixel_abs = scr._scrolled_total + (
+                                top if in_margins else 0
+                            )
+                        else:
+                            min_sixel_abs = scr._scrolled_total - len(scr._history)
                     gfx.commit_sixel(
                         payload_len=len(data),
                         width_px=w_px,
