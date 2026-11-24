@@ -189,7 +189,8 @@ class OscDispatch:
     Attributes
     ----------
     code : int
-        Numeric ``OSC`` command identifier (``-1`` when absent or non-numeric).
+        Numeric ``OSC`` command identifier in ``0..65535`` (``-1`` when absent,
+        non-ASCII, or above ``65535``).
     data : bytes
         Raw payload bytes following the first ``;`` (or the full body when no
         ``;`` is present).
@@ -729,12 +730,9 @@ class Parser:
         self._abort_string()
         semi = raw.find(b";")
         if semi == -1:
-            code = int(raw) if raw.isdigit() else -1
-            sink.on_osc(code, b"", terminator)
+            sink.on_osc(_parse_osc_code(raw), b"", terminator)
         else:
-            head = raw[:semi]
-            code = int(head) if head.isdigit() else -1
-            sink.on_osc(code, raw[semi + 1 :], terminator)
+            sink.on_osc(_parse_osc_code(raw[:semi]), raw[semi + 1 :], terminator)
 
     def _dispatch_dcs(self, sink: ActionSink) -> None:
         if not self._str_overflow:
@@ -1187,6 +1185,71 @@ class Parser:
                     self._enter_dcs_passthrough(b)
                 else:
                     self._state = ParserState.DCS_IGNORE
+
+
+def _parse_osc_code(buf: bytes) -> int:
+    """Parse ASCII digits ``0x30..0x39`` into ``0..65535``, or ``-1``."""
+    if not buf:
+        return -1
+    acc = 0
+    for b in buf:
+        if not (0x30 <= b <= 0x39):
+            return -1
+        acc = acc * 10 + (b - 0x30)
+        if acc > 65_535:
+            return -1
+    return acc
+
+
+def _parse_ascii_uint(raw: str, *, max_val: int) -> int | None:
+    """Parse non-empty ASCII digits ``0..9`` up to *max_val*, else ``None``."""
+    if not raw:
+        return None
+    acc = 0
+    for ch in raw:
+        code = ord(ch)
+        if not (0x30 <= code <= 0x39):
+            return None
+        acc = acc * 10 + (code - 0x30)
+        if acc > max_val:
+            return None
+    return acc
+
+
+def _parse_ascii_int(raw: str, *, min_val: int, max_val: int) -> int | None:
+    """Parse optional ``+``/``-`` plus ASCII digits within ``[min_val, max_val]``."""
+    if not raw:
+        return None
+    neg = False
+    start = 0
+    first = raw[0]
+    if first == "-":
+        neg = True
+        start = 1
+    elif first == "+":
+        start = 1
+    if start >= len(raw):
+        return None
+    acc = 0
+    if neg:
+        limit = -min_val
+        for idx in range(start, len(raw)):
+            code = ord(raw[idx])
+            if not (0x30 <= code <= 0x39):
+                return None
+            acc = acc * 10 + (code - 0x30)
+            if acc > limit:
+                return None
+        val = -acc
+        return val if val <= max_val else None
+    for idx in range(start, len(raw)):
+        code = ord(raw[idx])
+        if not (0x30 <= code <= 0x39):
+            return None
+        acc = acc * 10 + (code - 0x30)
+        if acc > max_val:
+            return None
+    return acc if acc >= min_val else None
 
 
 __all__ = [

@@ -19,7 +19,7 @@ from libvt.config import (
 )
 from libvt.events import PromptKind, PromptZone
 from libvt.modes import DEC_PRIVATE_MASK, Mode
-from libvt.parser import CsiParams, Parser
+from libvt.parser import CsiParams, Parser, _parse_ascii_int, _parse_ascii_uint
 from libvt.screen import Screen, ScrollRegion
 from libvt.style import DEFAULT_STYLE
 from libvt.terminal import Snapshot, Terminal
@@ -135,26 +135,12 @@ def unescape_tmux_control_output(data: collections.abc.Buffer | str) -> bytes:
 
 
 def _opt_int(raw: str, default: int) -> int:
-    s = raw.strip()
-    if not s:
-        return default
-    try:
-        return int(s)
-    except ValueError:
-        return default
+    val = _parse_ascii_int(raw.strip(), min_val=-2_147_483_648, max_val=2_147_483_647)
+    return default if val is None else val
 
 
 def _opt_saved_coord(raw: str) -> int | None:
-    s = raw.strip()
-    if not s:
-        return None
-    try:
-        val = int(s)
-    except ValueError:
-        return None
-    if val < 0 or val >= _TMUX_UINT_MAX:
-        return None
-    return val
+    return _parse_ascii_uint(raw.strip(), max_val=_TMUX_UINT_MAX - 1)
 
 
 def _opt_bool(raw: str, *, default: bool = False) -> bool:
@@ -295,8 +281,9 @@ class TmuxPaneMetadata:
         elif priv_raw:
             for tok in priv_raw.split(","):
                 p_str = tok.strip().lstrip("?")
-                if p_str.isdigit():
-                    priv_modes.add(int(p_str))
+                p_val = _parse_ascii_uint(p_str, max_val=65_535)
+                if p_val is not None:
+                    priv_modes.add(p_val)
             focus_on = 1004 in priv_modes
 
         tabs_raw = parts[20].strip()
@@ -304,14 +291,15 @@ class TmuxPaneMetadata:
         if tabs_raw:
             parsed_tabs: list[int] = []
             for tok in tabs_raw.split(","):
-                t_str = tok.strip()
-                if t_str.isdigit():
-                    parsed_tabs.append(int(t_str))
+                t_val = _parse_ascii_uint(tok.strip(), max_val=65_535)
+                if t_val is not None:
+                    parsed_tabs.append(t_val)
             tabs = tuple(sorted(set(parsed_tabs)))
         gen_raw = parts[24].strip()
-        out_gen = int(gen_raw) if gen_raw.isdigit() else None
+        out_gen = _parse_ascii_uint(gen_raw, max_val=(1 << 64) - 1)
         sr_low_raw = parts[9].strip()
-        sr_lower = int(sr_low_raw) if sr_low_raw.isdigit() else (rows - 1)
+        sr_val = _parse_ascii_uint(sr_low_raw, max_val=65_535)
+        sr_lower = sr_val if sr_val is not None else (rows - 1)
         return cls(
             cols=cols,
             rows=rows,

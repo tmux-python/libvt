@@ -12,6 +12,8 @@ import typing as t
 import zlib
 from dataclasses import dataclass
 
+from libvt.parser import _parse_ascii_uint
+
 if t.TYPE_CHECKING:
     from libvt.config import SixelErasePolicy
 
@@ -497,14 +499,51 @@ class _PendingKittyUpload:
     failed_error: str | None = None
 
 
+_KITTY_UINT32_MAX = 0xFFFF_FFFF
+_KITTY_INT32_MIN = -2_147_483_648
+_KITTY_INT32_MAX = 2_147_483_647
+
+
+def _parse_uint32(control: dict[str, str], key: str, default: int = 0) -> int:
+    raw = control.get(key)
+    if raw is None or not raw:
+        return default
+    val = _parse_ascii_uint(raw, max_val=_KITTY_UINT32_MAX)
+    return default if val is None else val
+
+
 def _parse_int(control: dict[str, str], key: str, default: int = 0) -> int:
     raw = control.get(key)
     if raw is None or not raw:
         return default
-    try:
-        return int(raw)
-    except ValueError:
+    neg = False
+    start = 0
+    first = raw[0]
+    if first == "-":
+        neg = True
+        start = 1
+    elif first == "+":
+        start = 1
+    if start >= len(raw):
         return default
+    limit = -_KITTY_INT32_MIN if neg else _KITTY_UINT32_MAX
+    acc = 0
+    for idx in range(start, len(raw)):
+        code = ord(raw[idx])
+        if not (0x30 <= code <= 0x39):
+            return default
+        if acc < limit:
+            acc = min(limit, acc * 10 + (code - 0x30))
+    return -acc if neg else acc
+
+
+def _valid_quiet(control: dict[str, str]) -> int:
+    raw = control.get("q")
+    if raw == "2":
+        return 2
+    if raw == "1":
+        return 1
+    return 0
 
 
 def _kitty_reply(
@@ -514,15 +553,15 @@ def _kitty_reply(
     is_error: bool,
     reply_image_id: int | None = None,
 ) -> bytes | None:
-    quiet = _parse_int(control, "q", 0)
+    quiet = _valid_quiet(control)
     if quiet == 2 or (quiet == 1 and not is_error):
         return None
-    client_id = _parse_int(control, "i", 0)
-    client_num = _parse_int(control, "I", 0)
+    client_id = _parse_uint32(control, "i", 0)
+    client_num = _parse_uint32(control, "I", 0)
     if client_id <= 0 and client_num <= 0:
         return None
     img_id = reply_image_id if reply_image_id is not None else client_id
-    pid = _parse_int(control, "p", 0)
+    pid = _parse_uint32(control, "p", 0)
     tokens: list[str] = []
     if img_id > 0:
         tokens.append(f"i={img_id}")
@@ -1329,14 +1368,21 @@ class GraphicsTracker:
             else scrolled_total
         )
 
-        if _parse_int(control, "i", 0) > 0 and _parse_int(control, "I", 0) > 0:
-            self._pending = None
-            return _kitty_reply(
-                control, "EINVAL:cannot specify both i and I", is_error=True
-            )
-
         if explicit_action == "d":
             self._pending = None
+            for id_key in ("i", "I", "p", "P", "Q"):
+                raw_id = control.get(id_key)
+                if (
+                    raw_id is not None
+                    and raw_id != ""
+                    and _parse_ascii_uint(raw_id, max_val=_KITTY_UINT32_MAX) is None
+                ):
+                    return None
+            if (
+                _parse_uint32(control, "i", 0) > 0
+                and _parse_uint32(control, "I", 0) > 0
+            ):
+                return None
             self._handle_kitty_delete(
                 control,
                 cursor_row=cursor_row,
@@ -1346,23 +1392,63 @@ class GraphicsTracker:
             )
             return None
 
+        reply_ctx = control
         if self._pending is not None:
             up = self._pending
-            in_id = _parse_int(control, "i", 0)
-            up_id = _parse_int(up.control, "i", 0)
+            raw_in_i = control.get("i")
+            in_i_valid = (
+                _parse_ascii_uint(raw_in_i, max_val=_KITTY_UINT32_MAX)
+                if (raw_in_i is not None and raw_in_i != "")
+                else 0
+            )
+            up_id = _parse_uint32(up.control, "i", 0)
             stale = (
                 explicit_action in ("q", "p")
                 or ("t" in control and control.get("t", "d") != "d")
-                or (in_id > 0 and up_id > 0 and in_id != up_id)
+                or (
+                    in_i_valid is not None
+                    and in_i_valid > 0
+                    and up_id > 0
+                    and in_i_valid != up_id
+                )
             )
             if stale:
                 self._pending = None
             elif explicit_action in (None, "t", "T"):
-                if _parse_int(control, "q", 0) >= 1:
-                    up.control["q"] = control["q"]
+                merged_q = max(_valid_quiet(up.control), _valid_quiet(control))
+                merged_ctrl = dict(up.control)
                 for k, v in control.items():
                     if k not in ("m", "q"):
-                        up.control.setdefault(k, v)
+                        merged_ctrl.setdefault(k, v)
+                if merged_q > 0:
+                    merged_ctrl["q"] = str(merged_q)
+                reply_ctx = merged_ctrl
+
+                for id_key in ("i", "I", "p", "P", "Q"):
+                    raw_id = control.get(id_key)
+                    if (
+                        raw_id is not None
+                        and raw_id != ""
+                        and _parse_ascii_uint(raw_id, max_val=_KITTY_UINT32_MAX) is None
+                    ):
+                        self._pending = None
+                        return _kitty_reply(
+                            reply_ctx,
+                            f"EINVAL:invalid uint32 {id_key}",
+                            is_error=True,
+                        )
+                if (
+                    _parse_uint32(merged_ctrl, "i", 0) > 0
+                    and _parse_uint32(merged_ctrl, "I", 0) > 0
+                ):
+                    self._pending = None
+                    return _kitty_reply(
+                        reply_ctx,
+                        "EINVAL:cannot specify both i and I",
+                        is_error=True,
+                    )
+
+                up.control = merged_ctrl
                 up.chunks += 1
                 if up.chunks > _MAX_UPLOAD_CHUNKS:
                     self._pending = None
@@ -1387,10 +1473,30 @@ class GraphicsTracker:
                     advance_cursor=advance_cursor,
                 )
 
+        for id_key in ("i", "I", "p", "P", "Q"):
+            raw_id = control.get(id_key)
+            if (
+                raw_id is not None
+                and raw_id != ""
+                and _parse_ascii_uint(raw_id, max_val=_KITTY_UINT32_MAX) is None
+            ):
+                self._pending = None
+                return _kitty_reply(
+                    reply_ctx,
+                    f"EINVAL:invalid uint32 {id_key}",
+                    is_error=True,
+                )
+
+        if _parse_uint32(control, "i", 0) > 0 and _parse_uint32(control, "I", 0) > 0:
+            self._pending = None
+            return _kitty_reply(
+                reply_ctx, "EINVAL:cannot specify both i and I", is_error=True
+            )
+
         action = explicit_action or "t"
         if action in ("t", "T", "q"):
-            if action == "q" and _parse_int(control, "i", 0) <= 0:
-                if _parse_int(control, "I", 0) > 0:
+            if action == "q" and _parse_uint32(control, "i", 0) <= 0:
+                if _parse_uint32(control, "I", 0) > 0:
                     return _kitty_reply(
                         control, "EINVAL:image ID required for query", is_error=True
                     )
@@ -1400,14 +1506,14 @@ class GraphicsTracker:
                 self._pending = None
                 return _kitty_reply(
                     control,
-                    f"EINVAL:unsupported transmission medium {medium!r}",
+                    f"EINVAL:unsupported transmission medium {medium!a}",
                     is_error=True,
                 )
             comp = control.get("o", "")
             if comp not in ("", "z"):
                 return _kitty_reply(
                     control,
-                    f"EINVAL:unsupported compression {comp!r}",
+                    f"EINVAL:unsupported compression {comp!a}",
                     is_error=True,
                 )
             fmt = _parse_int(control, "f", 32)
@@ -1707,7 +1813,9 @@ class GraphicsTracker:
 
         cols = min(max(1, screen_cols * 4), cols)
         rows = min(max(1, self._max_dim), rows)
-        z_idx = _parse_int(control, "z", 0)
+        z_idx = max(
+            _KITTY_INT32_MIN, min(_KITTY_INT32_MAX, _parse_int(control, "z", 0))
+        )
         move_cursor = (
             not virtual and parent_id == 0 and _parse_int(control, "C", 0) == 0
         )
@@ -1717,16 +1825,25 @@ class GraphicsTracker:
             if target_meta is not None
             else (
                 meta.image_id
-                if (_parse_int(control, "i", 0) > 0 or _parse_int(control, "I", 0) > 0)
+                if (
+                    _parse_uint32(control, "i", 0) > 0
+                    or _parse_uint32(control, "I", 0) > 0
+                )
                 else None
             )
         )
 
         if parent_pl is not None:
-            abs_r = parent_pl.abs_row + _parse_int(control, "V", 0)
-            col_pos = max(
-                0, min(screen_cols - 1, parent_pl.col + _parse_int(control, "H", 0))
+            rel_v = max(
+                -self._max_dim,
+                min(self._max_dim, _parse_int(control, "V", 0)),
             )
+            rel_h = max(
+                -self._max_dim,
+                min(self._max_dim, _parse_int(control, "H", 0)),
+            )
+            abs_r = parent_pl.abs_row + rel_v
+            col_pos = max(0, min(screen_cols - 1, parent_pl.col + rel_h))
             min_abs = 0
         else:
             anchor_r = cursor_row

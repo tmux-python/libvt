@@ -8,6 +8,8 @@ import enum
 import re
 from dataclasses import dataclass
 
+from libvt.parser import _parse_ascii_uint
+
 _APP_RE = re.compile(r"^[A-Za-z0-9_.+-]{1,32}$")
 _KEY_RE = re.compile(r"^[a-z]{1,16}$")
 _SEG_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -256,11 +258,8 @@ class ProgramStatusStore:
 
         progress: int | None = None
         if "progress" in fields:
-            raw_prog = fields["progress"]
-            if not raw_prog.isdigit():
-                return False, self.most_urgent
-            prog_val = int(raw_prog)
-            if not 0 <= prog_val <= 100:
+            prog_val = _parse_ascii_uint(fields["progress"], max_val=100)
+            if prog_val is None:
                 return False, self.most_urgent
             progress = prog_val
 

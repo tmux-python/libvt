@@ -86,7 +86,15 @@ from libvt.modes import (
     Mode,
     ModeState,
 )
-from libvt.parser import CsiParams, Parser, ParserEncoding, ParserState, parse_sgr
+from libvt.parser import (
+    CsiParams,
+    Parser,
+    ParserEncoding,
+    ParserState,
+    _parse_ascii_int,
+    _parse_ascii_uint,
+    parse_sgr,
+)
 from libvt.screen import (
     Cell,
     Cursor,
@@ -1160,25 +1168,89 @@ class _TerminalSink:
         self._term._handle_window_rename(data)
 
 
+def _utf8_len(text: str) -> int:
+    return len(text) if text.isascii() else len(text.encode("utf-8", "surrogatepass"))
+
+
 def _event_byte_cost(event: Event) -> int:
     if isinstance(event, Passthrough):
         return 64 + len(event.data)
     if isinstance(event, SixelGraphic):
-        return 64 + len(event.data.payload)
+        return 64 + len(event.data.payload) + len(event.data.params) * 8
     if isinstance(event, KittyGraphic):
-        return 64 + len(event.command.payload)
+        ctrl_cost = sum(
+            32 + _utf8_len(k) + _utf8_len(v) for k, v in event.command.control.items()
+        )
+        return 64 + len(event.command.payload) + ctrl_cost
     if isinstance(event, ClipboardWrite):
-        return 64 + len(event.text)
-    return 64
+        return 64 + _utf8_len(event.selection) + _utf8_len(event.text)
+    if isinstance(event, TitleChanged):
+        return 64 + _utf8_len(event.title)
+    if isinstance(event, WindowRenamed):
+        return 64 + _utf8_len(event.name)
+    if isinstance(event, WorkingDirectoryChanged):
+        return 64 + _utf8_len(event.uri) + _utf8_len(event.path)
+    if isinstance(event, ProgramStatusChanged):
+        cost = 64 + _utf8_len(event.task_id)
+        st = event.status
+        if st is not None:
+            cost += 64 + _utf8_len(st.id)
+            if st.app is not None:
+                cost += _utf8_len(st.app)
+            if st.effective_app is not None:
+                cost += _utf8_len(st.effective_app)
+            if st.title is not None:
+                cost += _utf8_len(st.title)
+            if st.msg is not None:
+                cost += _utf8_len(st.msg)
+        return cost
+    if isinstance(event, UnhandledSequence):
+        return 64 + _utf8_len(event.kind) + _utf8_len(event.summary)
+    if isinstance(
+        event,
+        (
+            Bell,
+            PromptMark,
+            RenderHoldChanged,
+            ColorSchemeQueried,
+            InBandResize,
+            ScreenErased,
+        ),
+    ):
+        return 64
+    t.assert_never(event)
+
+
+def _parse_ascii_hex(raw: str) -> int | None:
+    if not raw:
+        return None
+    acc = 0
+    for ch in raw:
+        code = ord(ch)
+        if 0x30 <= code <= 0x39:
+            digit = code - 0x30
+        elif 0x41 <= code <= 0x46:
+            digit = code - 0x41 + 10
+        elif 0x61 <= code <= 0x66:
+            digit = code - 0x61 + 10
+        else:
+            return None
+        acc = (acc << 4) | digit
+    return acc
 
 
 def _parse_osc_rgb(spec: bytes) -> tuple[int, int, int] | None:
-    text = spec.decode("ascii", errors="ignore").strip()
+    try:
+        text = spec.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return None
     if text.startswith("#") and len(text) == 7:
-        try:
-            return (int(text[1:3], 16), int(text[3:5], 16), int(text[5:7], 16))
-        except ValueError:
+        r = _parse_ascii_hex(text[1:3])
+        g = _parse_ascii_hex(text[3:5])
+        b = _parse_ascii_hex(text[5:7])
+        if r is None or g is None or b is None:
             return None
+        return (r, g, b)
     if text.lower().startswith("rgb:"):
         parts = text[4:].split("/")
         if len(parts) != 3:
@@ -1187,9 +1259,8 @@ def _parse_osc_rgb(spec: bytes) -> tuple[int, int, int] | None:
         for comp in parts:
             if not (1 <= len(comp) <= 4):
                 return None
-            try:
-                raw = int(comp, 16)
-            except ValueError:
+            raw = _parse_ascii_hex(comp)
+            if raw is None:
                 return None
             scale = (1 << (4 * len(comp))) - 1
             vals.append((raw * 255) // scale)
@@ -1784,15 +1855,14 @@ class Terminal:
             max_ev = self._limits.max_events
             max_bytes = self._limits.max_event_bytes
             cost = _event_byte_cost(event)
-            if max_ev > 0 and max_bytes > 0:
+            if max_ev > 0 and max_bytes > 0 and cost <= max_bytes:
                 while self._events and (
                     len(self._events) >= max_ev or self._event_bytes + cost > max_bytes
                 ):
                     dropped = self._events.popleft()
                     self._event_bytes -= _event_byte_cost(dropped)
-                if cost <= max_bytes:
-                    self._events.append(event)
-                    self._event_bytes += cost
+                self._events.append(event)
+                self._event_bytes += cost
         if self._on_event is not None:
             self._on_event(event)
 
@@ -1804,7 +1874,7 @@ class Terminal:
             self._emit_event(UnhandledSequence(kind=kind, summary=summary))
 
     def drain_events(self) -> tuple[Event, ...]:
-        """Return and clear buffered :data:`~libvt.events.Event` records."""
+        """Return and clear buffered ``Event`` records from :mod:`libvt.events`."""
         if not self._events:
             return ()
         out = tuple(self._events)
@@ -3873,12 +3943,17 @@ class Terminal:
             self._cwd = safe_uri
             self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=safe_uri))
             return
-        parsed = urllib.parse.urlsplit(cleaned)
+        try:
+            parsed = urllib.parse.urlsplit(cleaned)
+            raw_host = urllib.parse.unquote(parsed.hostname or "").lower()
+        except ValueError:
+            self._cwd = ""
+            self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=""))
+            return
         if parsed.scheme.lower() != "file" or not parsed.path.startswith("/"):
             self._cwd = ""
             self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=""))
             return
-        raw_host = urllib.parse.unquote(parsed.hostname or "").lower()
         allowed_hosts = (
             self._policy.osc7_hosts
             if self._policy.osc7_hosts is not None
@@ -3935,14 +4010,21 @@ class Terminal:
         elif code == 9:
             text = data.decode("utf-8", errors="replace")
             parts = text.split(";")
-            if len(parts) >= 2 and parts[0] == "4" and parts[1].isdigit():
-                self._before_mutate()
-                sub = int(parts[1])
-                prog = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None
-                changed, status = self._status_store.apply_osc_9_4(sub, prog)
-                if changed:
-                    self._aux_revision += 1
-                    self._emit_event(ProgramStatusChanged(status=status, task_id=""))
+            if len(parts) >= 2 and parts[0] == "4":
+                sub = _parse_ascii_uint(parts[1], max_val=255)
+                if sub is not None:
+                    self._before_mutate()
+                    prog = (
+                        _parse_ascii_uint(parts[2], max_val=1_000)
+                        if len(parts) >= 3
+                        else None
+                    )
+                    changed, status = self._status_store.apply_osc_9_4(sub, prog)
+                    if changed:
+                        self._aux_revision += 1
+                        self._emit_event(
+                            ProgramStatusChanged(status=status, task_id="")
+                        )
             elif len(parts) >= 2 and parts[0] == "9":
                 self._update_cwd(";".join(parts[1:]), from_osc7=False)
         elif code in (10, 11):
@@ -3994,12 +4076,12 @@ class Terminal:
                 kind = PromptKind(raw_kind)
                 exit_code: int | None = None
                 is_continuation = any(p.strip() == "k=s" for p in parts[1:])
-                if (
-                    kind == PromptKind.COMMAND_FINISHED
-                    and len(parts) >= 2
-                    and parts[1].lstrip("-").isdigit()
-                ):
-                    exit_code = int(parts[1])
+                if kind == PromptKind.COMMAND_FINISHED and len(parts) >= 2:
+                    exit_code = _parse_ascii_int(
+                        parts[1],
+                        min_val=-2_147_483_648,
+                        max_val=2_147_483_647,
+                    )
                 if not self._screens.active_is_alt:
                     abs_r = self._screens.primary.scrolled_total + scr._cur_row
                     zone = PromptZone(

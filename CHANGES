@@ -26,6 +26,18 @@ cur = delta.snapshot.cursor
 
 ### Fixes
 
+#### Bounded ASCII integer parsing and UTF-8 event accounting (#23)
+
+{class}`~libvt.parser.Parser`, {class}`~libvt.terminal.Terminal`,
+{mod}`libvt.graphics`, {mod}`libvt.status`, and {mod}`libvt.tmux` parse numeric
+parameters strictly from ASCII digits `0`–`9` with bounded accumulators
+(`<= 65535` for `OSC` command codes, unsigned 32-bit Kitty `i=` / `I=` / `p=` /
+`P=` / `Q=` identifiers, and signed 32-bit `OSC 133;D` exit codes), while
+{meth}`~libvt.terminal.Terminal.feed` isolates malformed `OSC 7` / `OSC 9;9`
+URIs and non-hex `OSC 10` / `OSC 11` color specs without raising `ValueError`.
+Event retention limits charge UTF-8 payload bytes across every `Event` variant
+in {mod}`libvt.events` under {attr}`~libvt.config.Limits.max_event_bytes`.
+
 #### Per-terminal sync isolation and horizontal-margin edits (#22)
 
 {meth}`~libvt.terminal.Terminal.sync_token` and

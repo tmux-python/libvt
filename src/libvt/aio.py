@@ -26,6 +26,7 @@ from libvt.config import (
 )
 from libvt.exc import TerminalTimeoutError
 from libvt.input import InputEvent, KeyEvent, PasteEvent
+from libvt.parser import _parse_ascii_uint
 from libvt.terminal import FlightRecorder, Snapshot, Terminal
 
 type TtyMode = t.Literal["cooked", "cbreak", "raw"]
@@ -75,7 +76,8 @@ def _raise_exec_error(err_payload: bytes, cmd: str, default_errno: int) -> t.NoR
         stage, code_s, err_msg = parts
     else:
         stage, code_s, err_msg = "exec", "", body.decode("utf-8", "replace")
-    err_no = int(code_s) if code_s.isdigit() else default_errno
+    parsed_err = _parse_ascii_uint(code_s, max_val=65_535)
+    err_no = default_errno if parsed_err is None else parsed_err
     target = cmd if stage == "exec" else f"open_pty({stage})"
     raise OSError(err_no, err_msg or os.strerror(err_no), target)
 

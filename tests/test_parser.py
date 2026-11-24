@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import typing as t
 
 import pytest
@@ -171,3 +172,70 @@ def test_string_esc_abort_dcs_del_bel_and_payload_limits() -> None:
     term.feed(b"\x1b]2;" + (b"x" * 64) + b"\x07clean")
     assert (term.title, term.text) == ("", "clean")
     assert any(isinstance(ev, libvt.UnhandledSequence) for ev in term.drain_events())
+
+
+def test_bounded_ascii_ints_and_utf8_event_byte_cost() -> None:
+    """Bounded ASCII int parsers never raise on >4300 digits or malformed URIs."""
+    vt = libvt.Terminal(
+        rows=3,
+        cols=12,
+        limits=Limits(max_osc_bytes=16_384, max_event_bytes=512, max_events=4096),
+        record_events=True,
+    )
+    vt.feed(b"\x1b]" + b"9" * 4_500 + b";x\x07")
+    assert Parser().feed(b"\x1b]65536;x\x07") == [OscDispatch(-1, b"x", b"\x07")]
+    vt.feed(
+        "\x1b]9;4;²;²\x07\x1b]133;D;--5\x07\x1b]133;D;²\x07".encode()
+        + b"\x1b]7501;state=working:progress=+50\x07"
+        + b"\x1b]7501;state=working:progress=101\x07"
+        + b"\x1b]7;file://[\x07\x1b]7;file://[bad]/tmp\x07"
+        + "\x1b]7;file://\uff03/tmp\x07".encode()
+        + b"\x1b]9;9;file://[\x07"
+        + b"\x1b]10;#-f-f-f\x07\x1b]10;rgb:-fff/-fff/-fff\x07\x1b]10;?\x07"
+        + b"\x1b]133;D;-42\x07"
+    )
+    assert [z.exit_code for z in vt.prompt_zones] == [None, None, -42]
+    assert vt.program_status is None
+    assert b"-" not in vt.drain_replies()
+
+    raw_px = base64.b64encode(b"\xff" * (8 * 16 * 3))
+    vt.feed(b"\x1b_Ga=t,f=24,s=8,v=16,i=4294967295;" + raw_px + b"\x1b\\")
+    assert 4_294_967_295 in vt.images
+    vt.drain_replies()
+    vt.feed(
+        b"\x1b_Ga=t,f=24,s=8,v=16,i=4294967296;"
+        + raw_px
+        + b"\x1b\\"
+        + b"\x1b_Ga=p,i="
+        + b"9" * 5_000
+        + b"\x1b\\"
+    )
+    assert 4_294_967_296 not in vt.images
+    vt.drain_replies()
+
+    raw_2x2 = base64.b64encode(b"\xff" * 12)
+    vt.feed(b"\x1b_Ga=t,f=24,s=2,v=2,i=5,q=2,m=1;" + raw_2x2[:8] + b"\x1b\\")
+    vt.feed(b"\x1b_Gq=999999999999999,m=0;" + raw_2x2[8:] + b"\x1b\\")
+    assert vt.drain_replies() == b""
+
+    vt.feed(b"\x1b_Ga=t,f=24,s=2,v=2,i=6,m=1;" + raw_2x2[:8] + b"\x1b\\")
+    vt.feed(b"\x1b_GI=7,m=0;" + raw_2x2[8:] + b"\x1b\\")
+    assert 6 not in vt.images
+    assert b"EINVAL:cannot specify both i and I" in vt.drain_replies()
+
+    vt.feed(b"\x1b_Ga=T,f=24,s=2,v=2,i=8,m=1;" + raw_2x2[:8] + b"\x1b\\")
+    vt.feed(b"\x1b_Gp=4294967296,m=0;" + raw_2x2[8:] + b"\x1b\\")
+    assert vt.drain_replies() == b"\x1b_Gi=8;EINVAL:invalid uint32 p\x1b\\"
+
+    vt.feed("\x1b_Gi=9,t=é;\x1b\\".encode())
+    assert b"EINVAL:unsupported transmission medium" in vt.drain_replies()
+
+    vt.drain_events()
+    vt.feed(b"\x07\x07\x07")
+    vt.feed(b"\x1b]2;" + (b"x" * 600) + b"\x07")
+    assert len(vt.drain_events()) == 3
+
+    for i in range(20):
+        vt.feed_str(f"\x1b]2;{'🔥' * 30}-{i}\x07")
+    evs = vt.drain_events()
+    assert 1 <= len(evs) <= 3
