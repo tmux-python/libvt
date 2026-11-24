@@ -11,8 +11,35 @@ type Charset = t.Literal["B", "0", "A"]
 type SixelErasePolicy = t.Literal["cell_mask", "whole_image"]
 
 _TMUX_VERSION_RE = re.compile(
-    r"^\s*(?:tmux\s+)?(?:next-)?(\d+)\.(\d+)(?:[a-z]|-rc\d*)?\s*$",
+    r"^\s*(?:tmux\s+)?(?:next-)?([0-9]{1,3})\.([0-9]{1,3})(?:[a-z]|-rc[0-9]{0,3})?\s*\Z",
+    re.ASCII,
 )
+
+
+def _parse_tmux_version(version: tuple[int, int] | str) -> tuple[int, int]:
+    """Parse ``version`` tuple or ``tmux -V`` string into ``(major, minor)``."""
+    if isinstance(version, tuple):
+        if len(version) != 2 or any(
+            isinstance(v, bool) or not isinstance(v, int) or not (0 <= v <= 999)
+            for v in version
+        ):
+            msg = (
+                f"invalid tmux version {repr(version)[:64]}; expected "
+                "(major, minor) ints in 0..999"
+            )
+            raise ValueError(msg)
+        return version
+    if not isinstance(version, str):
+        msg = f"invalid tmux version type {type(version).__name__}"
+        raise TypeError(msg)
+    m = _TMUX_VERSION_RE.match(version)
+    if m is None:
+        msg = (
+            f"invalid tmux version {version[:64]!r}; expected e.g. "
+            "'3.8a', 'next-3.9', or (3, 8)"
+        )
+        raise ValueError(msg)
+    return int(m.group(1)), int(m.group(2))
 
 
 class ColorScheme(enum.IntEnum):
@@ -152,17 +179,7 @@ class Profile:
         ValueError
             If *version* cannot be parsed as a ``tmux`` version identifier.
         """
-        if isinstance(version, tuple):
-            major, minor = version
-        else:
-            m = _TMUX_VERSION_RE.match(version)
-            if m is None:
-                msg = (
-                    f"invalid tmux version {version!r}; expected e.g. "
-                    "'3.8a', 'next-3.9', or (3, 8)"
-                )
-                raise ValueError(msg)
-            major, minor = int(m.group(1)), int(m.group(2))
+        major, minor = _parse_tmux_version(version)
         at_least_3_9 = (major, minor) >= (3, 9)
         return cls(
             name="tmux",

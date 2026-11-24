@@ -659,14 +659,21 @@ class Snapshot:
         cols: int = 80,
         scrollback: int | None = None,
         flagged: bool = False,
+        trim_trailing: bool = False,
         joined_capture: CaptureInput | None = None,
         saved_primary_capture: CaptureInput | None = None,
         saved_primary_flagged: bool | None = None,
+        saved_primary_trim_trailing: bool | None = None,
+        saved_primary_joined_capture: CaptureInput | None = None,
+        post_metadata: TmuxPaneMetadata | str | None = None,
         profile: Profile = TMUX_PROFILE,
         policy: Policy = TMUX_CAPTURE_POLICY,
         limits: Limits = DEFAULT_LIMITS,
     ) -> Snapshot:
-        """Decode ``tmux capture-pane`` output directly into a :class:`Snapshot`."""
+        """Decode ``tmux capture-pane`` output directly into a :class:`Snapshot`.
+
+        See :func:`~libvt.tmux.decode_tmux_capture` for parameter semantics.
+        """
         from libvt.tmux import decode_tmux_capture
 
         return decode_tmux_capture(
@@ -676,9 +683,13 @@ class Snapshot:
             cols=cols,
             scrollback=scrollback,
             flagged=flagged,
+            trim_trailing=trim_trailing,
             joined_capture=joined_capture,
             saved_primary_capture=saved_primary_capture,
             saved_primary_flagged=saved_primary_flagged,
+            saved_primary_trim_trailing=saved_primary_trim_trailing,
+            saved_primary_joined_capture=saved_primary_joined_capture,
+            post_metadata=post_metadata,
             profile=profile,
             policy=policy,
             limits=limits,
@@ -1415,14 +1426,21 @@ class Terminal:
         cols: int = 80,
         scrollback: int | None = None,
         flagged: bool = False,
+        trim_trailing: bool = False,
         joined_capture: CaptureInput | None = None,
         saved_primary_capture: CaptureInput | None = None,
         saved_primary_flagged: bool | None = None,
+        saved_primary_trim_trailing: bool | None = None,
+        saved_primary_joined_capture: CaptureInput | None = None,
+        post_metadata: TmuxPaneMetadata | str | None = None,
         profile: Profile = TMUX_PROFILE,
         policy: Policy = TMUX_CAPTURE_POLICY,
         limits: Limits = DEFAULT_LIMITS,
     ) -> Terminal:
-        """Reconstruct a live :class:`Terminal` from ``tmux capture-pane`` output."""
+        """Reconstruct a live :class:`Terminal` from ``tmux capture-pane`` output.
+
+        See :func:`~libvt.tmux.decode_tmux_capture` for parameter semantics.
+        """
         from libvt.tmux import decode_tmux_capture
 
         return decode_tmux_capture(
@@ -1432,9 +1450,13 @@ class Terminal:
             cols=cols,
             scrollback=scrollback,
             flagged=flagged,
+            trim_trailing=trim_trailing,
             joined_capture=joined_capture,
             saved_primary_capture=saved_primary_capture,
             saved_primary_flagged=saved_primary_flagged,
+            saved_primary_trim_trailing=saved_primary_trim_trailing,
+            saved_primary_joined_capture=saved_primary_joined_capture,
+            post_metadata=post_metadata,
             profile=profile,
             policy=policy,
             limits=limits,

@@ -14,6 +14,23 @@ Migration and deprecation notes for `libvt` are recorded here; see
 _Detailed migration steps for the next version will be posted here._
 <!-- END PLACEHOLDER - ADD NEW MIGRATION ENTRIES BELOW THIS LINE -->
 
+### `CSI 5:3 m` overline scoped to `tmux` capture decoding (#18)
+
+{func}`~libvt.parser.parse_sgr` and live {meth}`~libvt.terminal.Terminal.feed`
+no longer treat `CSI 5:3 m` as overline (or blink); emit standard `CSI 53 m` on
+live VT streams and pass `tmux capture-pane -e` output through
+{func}`~libvt.tmux.decode_tmux_capture` or
+{meth}`~libvt.terminal.Terminal.from_tmux_capture`:
+
+```python
+# Before
+term.feed(b"\x1b[5:3moverline\x1b[0m")
+
+# After
+term.feed(b"\x1b[53moverline\x1b[0m")
+cap_term = Terminal.from_tmux_capture(["\x1b[5:3moverline\x1b[0m"])
+```
+
 ### Opaque `SyncToken` watermarks (#22)
 
 {class}`~libvt.terminal.SyncToken` no longer exposes internal watermark fields

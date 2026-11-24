@@ -8,6 +8,23 @@ _Notes on the upcoming release will go here._
 
 ### Breaking changes
 
+#### Scoped `CSI 5:3 m` overline decoding (#18)
+
+{func}`~libvt.parser.parse_sgr` and live {meth}`~libvt.terminal.Terminal.feed`
+ignore `CSI 5:3 m` (`5` with colon subparameter `3`, neither enabling overline
+nor blink), matching `tmux` and `Ghostty` input parsing, while
+{func}`~libvt.tmux.decode_tmux_capture` continues decoding `tmux`
+`grid_string_cells_code`'s `5:3m` overline serialization:
+
+```python
+# Before
+style = parse_sgr(CsiParams((5, 3), colon_mask=0b10))  # overline=True
+
+# After
+style = parse_sgr(CsiParams((53,)))  # standard SGR 53 overline
+res = decode_tmux_capture(["\x1b[5:3mOV\x1b[0m"], rows=1, cols=4)
+```
+
 #### Opaque per-terminal sync watermarks (#22)
 
 {class}`~libvt.terminal.SyncToken` keeps its watermark state private, disallows
@@ -23,6 +40,22 @@ cur = tok.cursor
 delta = term.changes_since(tok)
 cur = delta.snapshot.cursor
 ```
+
+### What's new
+
+#### Chained `tmux` capture bundles and `-N -T -F` wide-wrap decoding (#18)
+
+{func}`~libvt.tmux.build_tmux_capture_command` and
+{class}`~libvt.tmux.TmuxCaptureCommand` construct single-invocation `tmux`
+command chains bracketing `capture-pane -S - -E - -e -p -N -T -F` (`-e -p -N
+-T` + `-e -p -J` on `3.4`–`3.7`, `-e -p -N` + `-e -p -J` on `3.3a`) with
+`display-message` metadata headers and footers so pane output cannot drift
+mid-capture and trailing blank viewport lines survive line-splitting wrappers.
+{func}`~libvt.tmux.decode_tmux_capture`,
+{meth}`~libvt.terminal.Terminal.from_tmux_capture`, and
+{meth}`~libvt.terminal.Snapshot.from_tmux_capture` accept `trim_trailing=True`
+to preserve explicit trailing spaces and disambiguate `GRID_FLAG_PADDING`
+wide-wrap spacers in a single pass.
 
 ### Fixes
 

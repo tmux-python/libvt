@@ -239,3 +239,12 @@ def test_bounded_ascii_ints_and_utf8_event_byte_cost() -> None:
         vt.feed_str(f"\x1b]2;{'🔥' * 30}-{i}\x07")
     evs = vt.drain_events()
     assert 1 <= len(evs) <= 3
+
+
+def test_parse_sgr_ignores_colon_5_3_outside_tmux_capture() -> None:
+    """Global ``parse_sgr`` and live ``Terminal`` ignore ``CSI 5:3 m``."""
+    vt = libvt.Terminal(rows=2, cols=8)
+    vt.feed(b"\x1b[5:3mA\x1b[53mB\x1b[55;5mC")
+    assert (vt[0, 0].style.overline, vt[0, 0].style.blink) == (False, False)
+    assert (vt[0, 1].style.overline, vt[0, 1].style.blink) == (True, False)
+    assert (vt[0, 2].style.overline, vt[0, 2].style.blink) == (False, True)
