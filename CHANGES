@@ -59,6 +59,22 @@ wide-wrap spacers in a single pass.
 
 ### Fixes
 
+#### Buffered PTY writes, `?2026` EOF expiry, and frame-commit wakeups (#24)
+
+{class}`~libvt.aio.PtySession` queues synchronous
+{meth}`~libvt.aio.PtySession.send`, {meth}`~libvt.aio.PtySession.paste`, and
+terminal query auto-replies onto a single bounded FIFO drained via
+`loop.add_writer` with {meth}`~libvt.aio.PtySession.drain` high-water
+backpressure, keeping bracketed pastes atomic above kernel `TTYHOG` limits
+while flushing `?2048` replies inside {meth}`~libvt.aio.PtySession.resize` and
+closing `master_fd` inside non-awaiting `finally` guards.
+{class}`~libvt.aio.AsyncTerminalStream` and {class}`~libvt.aio.PtySession`
+drive {meth}`~libvt.aio.AsyncTerminalStream.wait_for` and
+{meth}`~libvt.aio.PtySession.wait_for` from
+{attr}`~libvt.terminal.Terminal.committed_generation` and expire unclosed
+`?2026` holds on `EOF`, {meth}`~libvt.aio.AsyncTerminalStream.aclose`, and
+{meth}`~libvt.aio.PtySession.aclose`.
+
 #### Bounded ASCII integer parsing and UTF-8 event accounting (#23)
 
 {class}`~libvt.parser.Parser`, {class}`~libvt.terminal.Terminal`,

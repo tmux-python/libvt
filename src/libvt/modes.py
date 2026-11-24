@@ -78,18 +78,20 @@ _RECOGNIZED_MODES: frozenset[int] = frozenset(int(m) for m in Mode)
 class ModeState:
     """Mutable set of active ANSI and DEC private modes."""
 
-    __slots__ = ("_enabled", "_on_mutate")
+    __slots__ = ("_enabled", "_on_mutate", "_on_set_mode")
 
     def __init__(
         self,
         enabled: set[Mode] | None = None,
         *,
         on_mutate: collections.abc.Callable[[], None] | None = None,
+        on_set_mode: collections.abc.Callable[[Mode, bool], bool] | None = None,
     ) -> None:
         self._enabled: set[Mode] = (
             set(_DEFAULT_ENABLED_MODES) if enabled is None else set(enabled)
         )
         self._on_mutate = on_mutate
+        self._on_set_mode = on_set_mode
 
     def is_set(self, mode: Mode) -> bool:
         """Return ``True`` when *mode* is enabled."""
@@ -97,6 +99,8 @@ class ModeState:
 
     def set_mode(self, mode: Mode, *, enabled: bool) -> None:
         """Enable or disable *mode*."""
+        if self._on_set_mode is not None and self._on_set_mode(mode, enabled):
+            return
         present = mode in self._enabled
         if present == enabled:
             return

@@ -49,11 +49,16 @@ hold only when `sync_generation` still matches the stalled batch.
 and POSIX pseudo-terminals without adding background threads to the core:
 
 - {class}`~libvt.aio.AsyncTerminalStream` pumps an
-  `asyncio.StreamReader`, flushes {meth}`~libvt.terminal.Terminal.drain_replies`
-  to an optional writer, and coalesces `wait_for(...)` wakeups across
-  `?2026` batches up to `sync_timeout`.
+  {class}`asyncio.StreamReader`, flushes
+  {meth}`~libvt.terminal.Terminal.drain_replies` to an optional writer, wakes
+  {meth}`~libvt.aio.AsyncTerminalStream.wait_for` whenever
+  {attr}`~libvt.terminal.Terminal.committed_generation` advances (including
+  straddling `?2026l` … `?2026h` chunks), and expires unclosed `?2026` holds on
+  `EOF` and {meth}`~libvt.aio.AsyncTerminalStream.aclose`.
 - {func}`~libvt.aio.open_pty` spawns a child process attached to a
   controlling `pty.openpty()` terminal (`TIOCSCTTY`, `TIOCSWINSZ`,
-  default `SIGPIPE`, and selectable `tty_mode`), forwards terminal query
-  replies, and calls
+  default `SIGPIPE`, and selectable `tty_mode`), queues outbound user input and
+  auto-replies on a bounded FIFO drained via `loop.add_writer` and
+  {meth}`~libvt.aio.PtySession.drain`, flushes `?2048` replies on
+  {meth}`~libvt.aio.PtySession.resize`, and calls
   {meth}`~libvt.terminal.Terminal.notify_process_exit` on teardown.

@@ -1183,9 +1183,11 @@ def decode_tmux_capture(
     term._generation += 1
     term._cached_snapshot = None
     if meta.synchronized:
-        term.modes.set_mode(Mode.SYNCHRONIZED_OUTPUT, enabled=True)
+        term._modes._enabled.add(Mode.SYNCHRONIZED_OUTPUT)
         term._sync_generation = 1
         term._sync_hold_pending = True
+    else:
+        term._committed_generation += 1
 
     unexposed = set(_BASE_UNEXPOSED_FIELDS)
     if not exact_wraps:

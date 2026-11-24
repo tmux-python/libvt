@@ -1327,6 +1327,7 @@ class Terminal:
         self._event_bytes: int = 0
         self._terminal_id: int = _alloc_terminal_id()
         self._generation: int = 0
+        self._committed_generation: int = 0
         self._epoch: int = 0
         self._aux_revision: int = 0
         self._sync_generation: int = 0
@@ -1348,7 +1349,10 @@ class Terminal:
             max_image_dimension=limits.max_image_dimension,
             on_mutate=self._on_screen_mutate,
         )
-        self._modes = ModeState(on_mutate=self._before_mutate)
+        self._modes = ModeState(
+            on_mutate=self._before_mutate,
+            on_set_mode=self._intercept_mode_set,
+        )
         if newline_mode:
             self._modes._enabled.add(Mode.LNM)
         self._parser = Parser(
@@ -1556,6 +1560,11 @@ class Terminal:
     def sync_generation(self) -> int:
         """Return monotonic ``?2026`` synchronized-update batch counter."""
         return self._sync_generation
+
+    @property
+    def committed_generation(self) -> int:
+        """Return monotonic counter incremented whenever :attr:`committed` advances."""
+        return self._committed_generation
 
     @property
     def prompt_zones(self) -> tuple[PromptZone, ...]:
@@ -1933,12 +1942,13 @@ class Terminal:
             return False
         if sync_generation is not None and sync_generation != self._sync_generation:
             return False
-        self._modes.set_mode(Mode.SYNCHRONIZED_OUTPUT, enabled=False)
+        self._modes._enabled.discard(Mode.SYNCHRONIZED_OUTPUT)
         self._sync_hold_pending = False
         self._held_snapshot = None
         self._held_sync_token = None
         self._cached_snapshot = None
         self._generation += 1
+        self._committed_generation += 1
         self._emit_event(
             RenderHoldChanged(
                 active=False,
@@ -2007,6 +2017,9 @@ class Terminal:
         reflow: bool | None = None,
     ) -> None:
         """Resize terminal screens to ``(rows, cols)``."""
+        if isinstance(rows, bool) or isinstance(cols, bool) or rows < 1 or cols < 1:
+            msg = f"rows and cols must be >= 1, got ({rows!r}, {cols!r})"
+            raise ValueError(msg)
         eff_reflow = self._profile.reflow_on_resize if reflow is None else reflow
         self._before_mutate()
         self._clear_cluster_anchor()
@@ -2085,7 +2098,10 @@ class Terminal:
         self._single_shift = None
         was_sync = self.synchronized
         was_alt = self._screens.active_is_alt
-        self._modes = ModeState(on_mutate=self._before_mutate)
+        self._modes = ModeState(
+            on_mutate=self._before_mutate,
+            on_set_mode=self._intercept_mode_set,
+        )
         if self._newline_mode:
             self._modes._enabled.add(Mode.LNM)
         self._sync_hold_pending = False
@@ -2129,6 +2145,8 @@ class Terminal:
             )
         self._cached_snapshot = None
         self._generation += 1
+        if was_sync or not self.synchronized:
+            self._committed_generation += 1
         if was_sync:
             self._emit_event(
                 RenderHoldChanged(
@@ -2142,9 +2160,43 @@ class Terminal:
         if structural:
             self._epoch += 1
 
+    def _set_synchronized_output(self, enabled: bool) -> None:
+        was_set = self._modes.is_set(Mode.SYNCHRONIZED_OUTPUT)
+        if enabled == was_set:
+            return
+        self._invalidate_cache()
+        if enabled:
+            self._modes._enabled.add(Mode.SYNCHRONIZED_OUTPUT)
+            self._sync_generation += 1
+            self._sync_hold_pending = True
+            self._held_snapshot = None
+            self._held_sync_token = None
+            self._step_event |= StopOn.SYNC_START
+        else:
+            self._modes._enabled.discard(Mode.SYNCHRONIZED_OUTPUT)
+            self._sync_hold_pending = False
+            self._held_snapshot = None
+            self._held_sync_token = None
+            self._committed_generation += 1
+            self._step_event |= StopOn.SYNC_END
+        self._emit_event(
+            RenderHoldChanged(
+                active=enabled,
+                sync_generation=self._sync_generation,
+            ),
+        )
+
+    def _intercept_mode_set(self, mode: Mode, enabled: bool) -> bool:
+        if mode == Mode.SYNCHRONIZED_OUTPUT:
+            self._set_synchronized_output(enabled)
+            return True
+        return False
+
     def _before_mutate(self) -> None:
         if self._sync_hold_pending:
             self._ensure_sync_snapshot()
+        elif not self.synchronized:
+            self._committed_generation += 1
         self._invalidate_cache()
 
     def feed_str(self, text: str, /) -> None:
@@ -3112,30 +3164,9 @@ class Terminal:
             mode = Mode(raw)
         except ValueError:
             return
-        was_set = self._modes.is_set(mode)
 
         if mode == Mode.SYNCHRONIZED_OUTPUT:
-            if enabled == was_set:
-                return
-            self._invalidate_cache()
-            self._modes.set_mode(mode, enabled=enabled)
-            if enabled:
-                self._sync_generation += 1
-                self._sync_hold_pending = True
-                self._held_snapshot = None
-                self._held_sync_token = None
-                self._step_event |= StopOn.SYNC_START
-            else:
-                self._sync_hold_pending = False
-                self._held_snapshot = None
-                self._held_sync_token = None
-                self._step_event |= StopOn.SYNC_END
-            self._emit_event(
-                RenderHoldChanged(
-                    active=enabled,
-                    sync_generation=self._sync_generation,
-                ),
-            )
+            self._set_synchronized_output(enabled)
             return
 
         if mode in ALT_SCREEN_MODES:

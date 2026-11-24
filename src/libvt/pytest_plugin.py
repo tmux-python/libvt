@@ -55,6 +55,8 @@ class PtyFactory(t.Protocol):
         policy: Policy = ...,
         limits: Limits = ...,
         sync_timeout: float = 1.0,
+        write_high_water: int | None = None,
+        max_write_buffer: int = 16_777_216,
     ) -> contextlib.AbstractAsyncContextManager[PtySession]:
         """Open a POSIX PTY subprocess session."""
 
@@ -143,6 +145,8 @@ def vt_pty() -> PtyFactory:
         policy: Policy = DEFAULT_POLICY,
         limits: Limits = DEFAULT_LIMITS,
         sync_timeout: float = 1.0,
+        write_high_water: int | None = None,
+        max_write_buffer: int = 16_777_216,
     ) -> contextlib.AbstractAsyncContextManager[PtySession]:
         return open_pty(
             argv,
@@ -157,6 +161,8 @@ def vt_pty() -> PtyFactory:
             policy=policy,
             limits=limits,
             sync_timeout=sync_timeout,
+            write_high_water=write_high_water,
+            max_write_buffer=max_write_buffer,
         )
 
     return _spawn
