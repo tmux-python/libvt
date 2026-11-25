@@ -1,4 +1,4 @@
-"""Pure-Python virtual terminal emulator and streaming VT parser."""
+"""Headless terminal emulator and VT parser for Python."""
 
 from __future__ import annotations
 

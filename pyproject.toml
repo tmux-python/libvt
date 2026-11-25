@@ -1,7 +1,7 @@
 [project]
 name = "libvt"
 version = "0.0.1a0"
-description = "Pure-Python, zero-dependency, typed virtual terminal emulator and streaming VT parser."
+description = "Headless terminal emulator and VT parser for Python."
 requires-python = ">=3.12,<4.0"
 authors = [
   {name = "Tony Narlock", email = "tony@git-pull.com"}

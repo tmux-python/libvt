@@ -1,85 +1,50 @@
 # libvt
 
-`libvt` (`pip install libvt`, `import libvt`) is a pure-Python,
-zero-dependency, typed virtual terminal emulator and streaming VT parser
-(`py3-none-any.whl` — no C shared library required).
-
 [![tests](https://github.com/tmux-python/libvt/actions/workflows/tests.yml/badge.svg)](https://github.com/tmux-python/libvt/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue)](https://github.com/tmux-python/libvt/blob/master/LICENSE)
 
-## Highlights
+`libvt` is a headless terminal emulator and VT parser for Python. Feed it
+terminal output to inspect screen contents, cursor positions, and cell styles,
+or use it to test terminal programs.
 
-- **Sans-I/O core**: Zero runtime dependencies, zero I/O on `import libvt`,
-  and no `asyncio`, `pty`, or `pytest` imports until requested.
-- **Compact two-tier grid**: Lazy 64-bit inline viewport attributes plus
-  run-length-encoded scrollback rows and primary-screen soft-wrap resize
-  reflow.
-- **Unicode 17 clustering**: Bundled two-stage width and UAX #29 tables
-  handling CJK wide glyphs, ZWJ emoji, Regional Indicator flag pairs,
-  Indic conjuncts, and `VS15` / `VS16` under DEC `?2027`.
-- **Modern terminal protocols**: Rex `OSC 7501` Program Status (with
-  `OSC 9;4` fallback), `OSC 133` semantic prompt zones, `OSC 7` working
-  directory, `OSC 8` hyperlinks, `OSC 52` clipboard, `?2026`
-  synchronized-output stepping, `DECRQM`, `DECRQSS`, `XTGETTCAP`, and
-  `DCS tmux;` passthrough events.
-- **Mode-aware input & testing**: Outbound key/mouse/focus/paste
-  encoding (including Kitty `CSI u` and fail-closed bracketed paste),
-  `libvt.aio` stream and controlling-TTY POSIX PTY helpers, `vt_*`
-  pytest fixtures, and `assert_screen` / `assert_screen_box` diffs with
-  `FlightRecorder` disassembly.
-
-## Requirements
-
-- Python >= 3.12 (CPython and PyPy)
-- Zero runtime dependencies
+Requires Python 3.12 or later (CPython and PyPy). Written in Python, with type
+annotations and no runtime dependencies.
 
 ## Installation
 
 Install with `uv`:
 
 ```console
-$ uv add libvt
+$ uv add "libvt>=0.0.1a0,<0.1"
 ```
 
 Install with `pip`:
 
 ```console
-$ pip install libvt
+$ pip install "libvt>=0.0.1a0,<0.1"
 ```
 
-`libvt` is pre-1.0; pin a minor range in downstream projects
-(`libvt>=0.1,<0.2`).
+`libvt` is in pre-alpha (`0.0.1a0`). Minor and `0.0.x` releases may include
+breaking API changes; pin `libvt>=0.0.1a0,<0.1` while the package is pre-1.0.
 
 ## Quickstart
 
-One-liner helpers render, strip, or disassemble VT byte streams without
-managing an emulator instance:
+Each call to `feed()` updates the terminal's screen. Read the resulting text,
+cells, and cursor position:
 
 ```python
 >>> import libvt
->>> libvt.render(b"\x1b[1;32mready\x1b[0m\r\nitem 1", rows=4, cols=20)
-'ready\nitem 1'
->>> libvt.strip(b"\x1b[31merror:\x1b[0m failed")
-'error: failed'
+>>> term = libvt.Terminal(rows=2, cols=20)
+>>> term.feed(b"Loading 10%")
+>>> term.feed(b"\r\x1b[2KLoading 20%")
+>>> term.text
+'Loading 20%'
+>>> term.cursor.row, term.cursor.col
+(0, 11)
 ```
 
-Stateful emulation tracks zero-based `(row, col)` cells, SGR colon
-subparameters, query replies, and `OSC 7501` program status:
-
-```python
->>> term = libvt.Terminal(rows=4, cols=20)
->>> term.feed(b"\x1b[1;4:3;38:2::40:180:160mstatus\x1b[0m\x1b[6n")
->>> term[0, 0].style.underline
-<UnderlineStyle.CURLY: 3>
->>> term.drain_replies()
-b'\x1b[1;7R'
->>> term.feed(b"\x1b]7501;state=working:id=build:progress=60\x1b\\")
->>> term.program_status.value, term.program_status.progress
-('working', 60)
-```
-
-Boxed visual assertions verify CJK wide-character alignment and cursor
-coordinates in tests:
+`assert_screen_box()` checks screen contents, wide-character column alignment,
+and cursor coordinates in tests:
 
 ```python
 >>> from libvt.testing import assert_screen_box
@@ -96,6 +61,36 @@ coordinates in tests:
 ...     cursor=(1, 4),
 ... )
 ```
+
+`render()` returns screen text after processing terminal output. `strip()`
+removes control sequences without applying cursor movements. `explain()`
+identifies the sequences in a byte stream:
+
+```python
+>>> libvt.render(b"\x1b[1;32mready\x1b[0m\r\nitem 1", rows=4, cols=20)
+'ready\nitem 1'
+>>> libvt.strip(b"\x1b[31merror:\x1b[0m failed")
+'error: failed'
+>>> [s.mnemonic for s in libvt.explain(b"\x1b[31merror:\x1b[0m")]
+['SGR', 'TEXT', 'SGR']
+```
+
+## Features
+
+- Check screen contents and cursor positions in tests, with expected and actual
+  screens shown on failure.
+- Handle wide characters and emoji sequences using Unicode 17 width and
+  grapheme rules.
+- Keep scrollback and reflow wrapped lines when the primary screen is resized.
+- Inspect completed redraws from applications that use synchronized output
+  (`?2026`).
+- Encode keyboard, mouse, focus, and paste events according to the active
+  terminal modes.
+- Run terminal programs on POSIX PTYs or connect to `asyncio` streams.
+
+Read `tmux` captures as screen cells and decode control-mode output with
+[`libvt.tmux`](https://libvt.git-pull.com/api/tmux/). Full guides and API
+reference are at [libvt.git-pull.com](https://libvt.git-pull.com/).
 
 ## License
 

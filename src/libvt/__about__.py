@@ -5,10 +5,7 @@ from __future__ import annotations
 __title__ = "libvt"
 __package_name__ = "libvt"
 __version__ = "0.0.1a0"
-__description__ = (
-    "Pure-Python, zero-dependency, typed virtual terminal emulator"
-    " and streaming VT parser."
-)
+__description__ = "Headless terminal emulator and VT parser for Python."
 __author__ = "Tony Narlock"
 __email__ = "tony@git-pull.com"
 __github__ = "https://github.com/tmux-python/libvt"
