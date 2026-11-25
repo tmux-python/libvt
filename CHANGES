@@ -1,10 +1,22 @@
 # Changelog
 
-## libvt 0.0.1a1 (Yet to be released)
+## libvt 0.0.1a2 (Yet to be released)
 
 <!-- KEEP THIS PLACEHOLDER - DO NOT REMOVE OR MODIFY THIS LINE -->
 _Notes on the upcoming release will go here._
 <!-- END PLACEHOLDER - ADD NEW CHANGELOG ENTRIES BELOW THIS LINE -->
+
+## libvt 0.0.1a1 (2026-11-24)
+
+`libvt` 0.0.1a1 adds `OSC 4` and `OSC 10`–`12` palette and dynamic color
+queries, `XTMODKEYS` and `?1007` alternate-scroll input encoding,
+cell-calibrated `?1016` pixel mouse coordinates, and chained `tmux` capture
+bundles (`-N -T -F`). It also buffers outbound POSIX PTY writes above kernel
+`TTYHOG` limits, expires stalled `?2026` holds on `EOF` and close, retains
+`SIXEL` and Kitty graphics across `DECSTBM` scrolls and resize reflow, and
+isolates per-terminal {class}`~libvt.terminal.SyncToken` watermarks. See
+{doc}`topics/protocols-and-input`, {doc}`topics/sync-and-asyncio`, and
+{doc}`migration` for upgrade details.
 
 ### Breaking changes
 

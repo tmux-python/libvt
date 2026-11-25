@@ -41,15 +41,15 @@ Contributing, code style, releases, and Architecture Decision Records `0001`–`
 ## Install
 
 ```console
-$ uv add "libvt>=0.0.1a0,<0.1"
+$ uv add "libvt>=0.0.1a1,<0.1"
 ```
 
 ```console
-$ pip install "libvt>=0.0.1a0,<0.1"
+$ pip install "libvt>=0.0.1a1,<0.1"
 ```
 
-`libvt` is in pre-alpha (`0.0.1a0`). Minor and `0.0.x` releases may include
-breaking API changes; pin `libvt>=0.0.1a0,<0.1` while the package is pre-1.0.
+`libvt` is in pre-alpha (`0.0.1a1`). Minor and `0.0.x` releases may include
+breaking API changes; pin `libvt>=0.0.1a1,<0.1` while the package is pre-1.0.
 
 ## At a glance
 

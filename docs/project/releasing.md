@@ -4,7 +4,7 @@
 
 `libvt` is pre-1.0 (currently in `0.0.x` pre-alpha). Pre-`0.1` updates and
 `0.x` minor version bumps may include breaking API changes; downstream users
-should pin `libvt>=0.0.1a0,<0.1` (and `>=0.x,<0.y` once `0.1.0` ships).
+should pin `libvt>=0.0.1a1,<0.1` (and `>=0.x,<0.y` once `0.1.0` ships).
 
 ## Release Process
 

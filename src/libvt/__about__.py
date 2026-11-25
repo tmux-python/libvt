@@ -4,7 +4,7 @@ from __future__ import annotations
 
 __title__ = "libvt"
 __package_name__ = "libvt"
-__version__ = "0.0.1a0"
+__version__ = "0.0.1a1"
 __description__ = "Headless terminal emulator and VT parser for Python."
 __author__ = "Tony Narlock"
 __email__ = "tony@git-pull.com"

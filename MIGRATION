@@ -3,7 +3,7 @@
 Migration and deprecation notes for `libvt` are recorded here; see
 {ref}`changelog` as well.
 
-`libvt` is in pre-alpha (`0.0.1a0`) and pre-1.0; pin `libvt>=0.0.1a0,<0.1` in
+`libvt` is in pre-alpha (`0.0.1a1`) and pre-1.0; pin `libvt>=0.0.1a1,<0.1` in
 downstream projects (and `>=0.x,<0.y` once `0.1.0` is released).
 
 ---
@@ -13,6 +13,8 @@ downstream projects (and `>=0.x,<0.y` once `0.1.0` is released).
 <!-- KEEP THIS PLACEHOLDER - DO NOT REMOVE OR MODIFY THIS LINE -->
 _Detailed migration steps for the next version will be posted here._
 <!-- END PLACEHOLDER - ADD NEW MIGRATION ENTRIES BELOW THIS LINE -->
+
+## libvt 0.0.1a1 (2026-11-24)
 
 ### `MouseEvent.pixel_x` and `pixel_y` default to `None` (#26)
 

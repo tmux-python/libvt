@@ -10,14 +10,14 @@
 ## Installation
 
 ```console
-$ uv add "libvt>=0.0.1a0,<0.1"
+$ uv add "libvt>=0.0.1a1,<0.1"
 ```
 
 ```console
-$ pip install "libvt>=0.0.1a0,<0.1"
+$ pip install "libvt>=0.0.1a1,<0.1"
 ```
 
-`libvt` is in pre-alpha (`0.0.1a0`); pin `libvt>=0.0.1a0,<0.1` while the
+`libvt` is in pre-alpha (`0.0.1a1`); pin `libvt>=0.0.1a1,<0.1` while the
 package is pre-1.0.
 
 ## Reading screen state

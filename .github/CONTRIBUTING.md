@@ -145,7 +145,7 @@ pushes, because a tag triggers the publish workflow. See
 
 `libvt` is pre-1.0 (currently in `0.0.x` pre-alpha): `0.0.x` updates and `0.x`
 minor version bumps may include breaking API changes, so downstream projects
-should pin `libvt>=0.0.1a0,<0.1` (and `>=0.x,<0.y` from `0.1.0` onward).
+should pin `libvt>=0.0.1a1,<0.1` (and `>=0.x,<0.y` from `0.1.0` onward).
 
 1. Add the release's entries to `CHANGES`, following
    [The changelog](WRITING.md#the-changelog).
