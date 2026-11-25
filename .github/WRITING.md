@@ -30,8 +30,8 @@ what actually happens rather than that something is "supported".
 
 | Instead of                       | Prefer                            |
 | --------------------------------- | ---------------------------------- |
-| "We added…"                      | "`Pane.send_keys` now accepts…"   |
-| "New and improved"               | "`Server.sessions` now…"          |
+| "We added…"                      | "`Terminal.feed` now accepts…"    |
+| "New and improved"               | "`Screen.resize` now…"            |
 | "powerful", "seamless"           | state the capability              |
 | "easily", "simply", "just"       | omit                              |
 | "simple", "obvious", "intuitive" | omit                              |
@@ -64,8 +64,8 @@ comprehension tax for the advanced one.
 
 Rules that follow:
 
-- **Second person, present tense, active.** "You split the window", not
-  "A pane is created". Address the reader who is doing the thing.
+- **Second person, present tense, active.** "Feed bytes to the terminal", not
+  "Bytes are processed". Address the reader who is doing the thing.
 - **Concept before API surface.** Open by saying what the object or
   method *is* and what it does for the reader. The signature — the
   parameters, the flags — is the last detail they need, not the first. A
@@ -78,22 +78,24 @@ Rules that follow:
   when…", "for the rarer cases" — tell readers they're in the right
   place without implying they must read on.
 - **Progressive disclosure.** Order by how many readers need it: the
-  common call → the one argument a few will tune → the lower-level
-  primitive → querying tmux directly. Each step is for a smaller
-  audience than the last.
-- **Lean on the hierarchy.** The reader thinks Server → Session → Window
-  → Pane; reinforce that chain when you explain containment or
-  traversal. It is the mental model the whole library hangs on.
-- **Name the trade-off.** If a call costs something — an extra tmux
-  round-trip, a stale object needing `refresh()`, a polling wait — say
-  so, and say what it buys ("a busy wait, not an event, but reliable").
-  State it; don't sell it.
-- **Frame by concept, not by mechanism.** Don't headline a feature by
-  its tmux flag or format token in prose; that names the implementation
-  surface, which is the reader's last concern. Name the concept. The
-  mechanics vocabulary — a parameter table, a `#{format}` token, the
-  `-t` target — belongs in a reference table or the API docs, and only
-  there.
+  common call (`Terminal` / `render()`) → configuration (`Profile`,
+  `Policy`, `Limits`) → boundary stepping and incremental deltas
+  (`feed_until()`, `changes_since()`) → standalone `Parser`. Each step is
+  for a smaller audience than the last.
+- **Lean on the data flow.** The reader thinks bytes → `Terminal.feed()`
+  → `Screen` (`RowView` / `Cell`) + `drain_replies()` / `drain_events()`,
+  with `Snapshot` capturing immutable point-in-time state; reinforce that
+  flow when explaining emulation, queries, or transports.
+- **Name the trade-off.** If a choice costs something — allocating an
+  immutable `Snapshot` vs reading live `Screen` views, retaining a
+  `FlightRecorder` buffer, disabling `reflow` on resize — say so, and say
+  what it buys. State it; don't sell it.
+- **Frame by concept, not by mechanism.** Don't headline a feature solely
+  by an escape code or mode number without stating what it conveys or
+  changes for the caller. Name the behavior first; put exact `CSI` /
+  `OSC` parameter syntax in code blocks, tables, or API docs. Do not
+  promote routine Python library hygiene (such as side-effect-free
+  imports) or internal data structures into headline features.
 
 ## README
 
@@ -126,11 +128,12 @@ Document the semantic model, not the parameter list. A signature already
 enumerates parameters; what it cannot say is what the call mutates, what
 blocks, and what it raises.
 
-State defaults explicitly — defaults are API. State negative guarantees
-where they exist: "performs no network I/O", "never mutates a `Session`
-you didn't ask it to touch", "never writes outside the tmux socket it
-was given". They establish boundaries faster than any amount of
-description.
+State defaults explicitly — defaults are API. State operational
+boundaries where they distinguish caller-visible behavior: "`strip()`
+removes control sequences without applying cursor movements",
+"`Snapshot` values are immutable and safe to pass across threads",
+"`open_pty()` requires a POSIX platform". Omit assurances about ordinary
+Python library behavior (such as not performing I/O on `import`).
 
 Headings stay conventional and stable, because people deep-link them.
 Badges are few and load-bearing.
@@ -146,7 +149,7 @@ the root `conftest.py`, not assumed.
 written as
 
     ```python
-    server = Server()
+    term = Terminal(rows=2, cols=20)
     ```
 
 is prose that looks like a test. Nothing collects it, nothing runs it,
@@ -154,7 +157,7 @@ and it can be wrong for years. The same block written with prompts is a
 test:
 
     ```python
-    >>> server = Server()
+    >>> term = Terminal(rows=2, cols=20)
     ```
 
 This is the single most expensive mistake available when editing
@@ -186,51 +189,34 @@ A `.. code-block::` or an unprompted fence does not run. If an example
 cannot pass, fix the example or fix the code.
 
 **The `doctest_namespace` fixtures.** The root `conftest.py`'s
-`add_doctest_fixtures` fixture seeds `doctest_namespace` before any
-doctest in the suite runs, so a block never needs an import or a setup
-preamble to reach these names: `server`, `session`, `window`, `pane`,
-`Server`, `Session`, `Window`, `Pane`, `Client`, `ControlMode`,
-`control_mode`, `monkeypatch`, `request`. It only does this inside an
-actual doctest item and only when `tmux` is on `PATH` — a doctest that
-uses one of these names with no `tmux` binary available fails with a
-`NameError`, not a skip.
+`_seed_doctest_namespace` autouse fixture populates `doctest_namespace`
+before every doctest in the suite runs, making common entry points
+available without boilerplate: `libvt`, `Terminal`, `AnsiColor`,
+`assert_screen`, and `assert_screen_box`. Standalone documentation blocks
+should still show explicit imports when doing so makes the first example
+on a page clear to a reader copying it.
 
-**The `Server` trap.** `conftest.py` assigns `doctest_namespace["Server"]`
-twice: first to the real `libtmux.server.Server` class, then — a few
-lines later — to the `TestServer` fixture from
-`src/libvt/pytest_plugin.py`, a `functools.partial` that builds
-uniquely-socketed servers and registers their cleanup. The second
-assignment wins. A bare `Server(...)` in a doctest is therefore the test
-factory, not the real class. Import the class explicitly when an example
-needs class-level API:
-
-```python
->>> from libtmux.server import Server
-```
-
-**The `socket_path` trap.** Both the `server` fixture and the doctest
-`Server()` factory construct servers with a socket *name*, so their
-`socket_path` attribute is `None`. When an example needs the real path,
-ask tmux for it: `server.cmd("display-message", "-p",
-"#{socket_path}").stdout[0]`.
+**Cross-platform doctests.** `pytest` executes `README.md` and `docs/`
+doctests on Linux, macOS, and Windows in CI. Keep documentation doctests
+portable across all three platforms (for example, drive
+`AsyncTerminalStream` with an in-memory `asyncio.StreamReader` rather
+than calling POSIX-only `open_pty()` inside an unguarded doctest).
 
 **`# doctest: +HIDE`.** A `gp-libs` extension flag: it is a no-op for
 execution and checking — the line still runs and its output, if any, is
 still verified — but it tells the Sphinx-rendered docs to drop that line
-from the page. Use it to set up state (an env var, a queried socket
-path) a docstring's *Examples* section does not need to show:
+from the page. Use it to set up state a docstring's *Examples* section
+does not need to show:
 
 ```python
->>> from libtmux.server import Server as TmuxServer  # doctest: +HIDE
->>> socket_path = server.cmd(  # doctest: +HIDE
-...     "display-message", "-p", "-t", pane.pane_id, "#{socket_path}"
-... ).stdout[0]
+>>> term = Terminal(rows=2, cols=20)  # doctest: +HIDE
+>>> term.feed(b"ready")  # doctest: +HIDE
 ```
 
 **Every code block on a `docs/` page is an independent doctest.** Blocks
-do not share a session: each one gets a fresh copy of the namespace
-*and* a fresh tmux server. A later block cannot use a `pane` an earlier
-block created — the name is simply not defined there. Write every block
+do not share a session: each one gets a fresh copy of
+`doctest_namespace`. A later block cannot use a `term` an earlier block
+created — the name is not defined there. Write every block
 self-contained. Order is load-bearing for the reader's narrative, not
 for state — reorder, add, or drop a block as the prose demands, and keep
 the story coherent.
@@ -261,35 +247,34 @@ The friendly voice belongs in the sentences *around* a precise block,
 introducing it, not inside it paraphrasing it into vagueness.
 
 Link the first prose mention of any symbol that has a useful
-destination on that page — a Python object, a libtmux API, a tmux
-concept with a glossary entry, a topic or configuration page, an
-external tool or project. Use the most specific target available:
-`{class}`, `{meth}`, `{func}`, `{mod}`, `{exc}`, or `{attr}` for API
-objects; `{ref}`, `{doc}`, or `{term}` for documentation pages, section
-anchors, and glossary entries; a Markdown link for an external project.
-After the first linked mention on a page, later mentions can stay plain
-unless the distance or context makes another link useful. Do not rely
-on a later reference section to satisfy the first-mention rule — if the
-first occurrence would be a heading, grid-card teaser, or introductory
-sentence, link that occurrence or retitle the heading so the first
-prose mention can carry the link. Leave command examples, code blocks,
-and literal configuration values as code; link the surrounding prose
-instead.
+destination on that page — a Python object, a `libvt` API, a topic or
+configuration page, an external tool or project. Use the most specific
+target available: `{class}`, `{meth}`, `{func}`, `{mod}`, `{exc}`, or
+`{attr}` for API objects; `{ref}`, `{doc}`, or `{term}` for
+documentation pages, section anchors, and glossary entries; a Markdown
+link for an external project. After the first linked mention on a page,
+later mentions can stay plain unless the distance or context makes
+another link useful. Do not rely on a later reference section to satisfy
+the first-mention rule — if the first occurrence would be a heading,
+grid-card teaser, or introductory sentence, link that occurrence or
+retitle the heading so the first prose mention can carry the link. Leave
+command examples, code blocks, and literal configuration values as code;
+link the surrounding prose instead.
 
 A `{ref}` must match its target's anchor exactly. Anchors mix
-underscore and hyphen forms across pages (`context_managers`,
-`pane-interaction`) — copy the target's own `(label)=` line rather than
-guessing the form. `just build-docs` catches a broken cross-reference;
-the doctests do not, so build the docs before you commit.
+underscore and hyphen forms across pages (`topics-architecture`,
+`topics-sync-and-asyncio`) — copy the target's own `(label)=` line
+rather than guessing the form. `just build-docs` catches a broken
+cross-reference; the doctests do not, so build the docs before you
+commit.
 
-`docs/topics/pane_interaction.md` is the worked example: a
-concept-first intro that says what a `Pane` *is* and which two methods
-(`send_keys`, `capture_pane`) cover most uses before any signature, an
-explicit "you can stop after the first two sections" reassurance,
-sections ordered by shrinking audience, honest trade-offs (polling is a
-busy wait; a resize is a request, not a guarantee), methods named by
-what they do with `{meth}` cross-references, and precise capture-flag
-and format tables left exact. Read it before reshaping another page.
+`docs/topics/sync-and-asyncio.md` is the worked example: a concrete
+contract up front (`term.committed` retains the previous frame while
+`term.snapshot()` exposes live changes), independent self-contained
+doctests, separate headings for waiting, write queues, resizing, and
+cleanup, explicit platform and thread-ownership boundaries, and `{class}`
+/ `{meth}` / `{func}` cross-references on first mention. Read it before
+reshaping another page.
 
 ## The changelog
 
@@ -409,18 +394,18 @@ source of truth; the docstring carries what the annotation cannot.
 
 This is documentation debt wearing a docstring:
 
-    def get_id(pane: Pane) -> str:
-        """Get the pane's identifier.
+    def get_title(term: Terminal) -> str:
+        """Get the terminal's title.
 
         Parameters
         ----------
-        pane : Pane
-            The pane.
+        term : Terminal
+            The terminal.
 
         Returns
         -------
         str
-            The identifier.
+            The title.
         """
 
 Document instead the dimensions the type system cannot encode:
@@ -477,14 +462,14 @@ type
 field in an `Attributes` section:
 
 ```python
-@dataclasses.dataclass()
-class Pane(Obj, OptionsMixin, HooksMixin):
-    """:term:`tmux(1)` :term:`Pane`.
+@dataclass(frozen=True, slots=True)
+class FocusEvent:
+    """Terminal window focus-in / focus-out event (``?1004``).
 
     Attributes
     ----------
-    server : Server
-        Server the pane belongs to.
+    focused : bool
+        ``True`` on focus gain (``ESC [ I``); ``False`` on focus loss.
     """
 ```
 
@@ -559,14 +544,13 @@ external facts.
 Bad (Delete):
 
 ```python
-# There are 321 tests to complete for servers.
+# There are 321 tests to complete for screens.
 ```
 
 Good (Keep):
 
 ```python
-# tmux < 3.2 reports the pane ID only after the command completes,
-# so this query must stay separate.
+# tmux capture-pane -e emits SGR 5:3m for overline; live CSI 5:3m ignores it.
 ```
 
 ### Documentation exception
@@ -583,10 +567,10 @@ test.
 
 ## Terminology and capitalization
 
-Pick the domain noun and keep it. If the code calls something a
-session, do not call it a workspace in one paragraph and an environment
-in the next. If the method is `capture_pane`, write "capture"
-everywhere rather than alternating with "read", "grab", and "snapshot".
+Pick the domain noun and keep it. If the API calls past lines
+`history` / scrollback, do not alternate with "archive" and "transcript".
+If the method is `feed()`, write `feed()` rather than alternating with
+"push", "pump", and "ingest".
 
 Stable vocabulary is what makes search, deep links, and an agent's
 retrieval work at all.
@@ -690,13 +674,13 @@ Common types:
 Example:
 
 ```
-Pane(feat[send_keys]): Add support for a literal flag
+terminal(feat[resize]): Reflow wrapped lines on primary screen
 
-why: Send characters without tmux interpreting them.
+why: Preserve soft-wrapped logical lines when terminal width changes.
 
 what:
-- Add a literal parameter to send_keys
-- Pass -l when it is set
+- Add reflow parameter to Terminal.resize and Screen.resize
+- Rewrap primary-screen history and viewport rows across width changes
 ```
 
 For a multi-line message, use a heredoc so the formatting survives:
