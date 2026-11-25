@@ -1,5 +1,6 @@
 # libvt
 
+[![PyPI version](https://img.shields.io/pypi/v/libvt.svg)](https://pypi.org/project/libvt/)
 [![tests](https://github.com/tmux-python/libvt/actions/workflows/tests.yml/badge.svg)](https://github.com/tmux-python/libvt/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue)](https://github.com/tmux-python/libvt/blob/master/LICENSE)
 
