@@ -1,4 +1,4 @@
-"""Zero-dependency sans-I/O ``SIXEL`` and Kitty ``APC G`` placement tracker."""
+"""``SIXEL`` and Kitty ``APC G`` image metadata and grid placement tracker."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ class ZLayer(enum.StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ImageMeta:
-    """Stored sans-I/O image metadata without buffered pixel bitmaps.
+    """Image metadata stored without buffered pixel bitmaps.
 
     Attributes
     ----------
@@ -574,7 +574,7 @@ def _kitty_reply(
 
 
 class GraphicsTracker:
-    """Per-screen sans-I/O ``SIXEL`` and Kitty ``APC G`` state machine.
+    """Per-screen ``SIXEL`` and Kitty ``APC G`` placement tracker.
 
     Attributes
     ----------
@@ -1412,7 +1412,7 @@ class GraphicsTracker:
         Returns
         -------
         bytes | None
-            Sans-I/O ``APC G`` response packet, or ``None`` when silent.
+            Kitty ``APC G`` response packet, or ``None`` when silent.
         """
         explicit_action = control.get("a")
         more = _parse_int(control, "m", 0) == 1

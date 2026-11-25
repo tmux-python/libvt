@@ -220,8 +220,8 @@ class PasteEvent:
         Text to paste into the terminal.
     sanitize : bool
         When ``False`` (default), raise :exc:`~libvt.exc.UnsafePasteError` on
-        control or escape characters. When ``True``, strip control/escape
-        codepoints in a single character-level pass.
+        disallowed control characters. When ``True``, remove disallowed
+        characters.
     allow_unbracketed_newlines : bool
         Permit ``\r`` and ``\n`` when ``?2004`` bracketed paste is disabled.
     """
@@ -298,7 +298,14 @@ def encode_paste(
     sanitize: bool = False,
     allow_unbracketed_newlines: bool = False,
 ) -> bytes:
-    """Encode *text* for pasting, failing closed on escape/control injection."""
+    r"""Encode *text* for terminal paste, wrapping with ``?2004`` when *bracketed*.
+
+    By default, rejects ``ESC``, ``NUL``, ``DEL``, 8-bit ``C1`` controls, and
+    ``C0`` controls other than ``\t`` (and ``\n`` / ``\r`` when *bracketed* or
+    *allow_unbracketed_newlines* is ``True``) with
+    :exc:`~libvt.exc.UnsafePasteError`. Pass ``sanitize=True`` to remove
+    disallowed characters instead.
+    """
     if sanitize:
         cleaned: list[str] = []
         for ch in text:

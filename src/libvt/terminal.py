@@ -1,4 +1,4 @@
-"""Sans-I/O virtual terminal state machine, immutable snapshots, and formatters."""
+"""Virtual terminal emulator, immutable snapshots, and output formatters."""
 
 from __future__ import annotations
 
@@ -1389,7 +1389,7 @@ _TERMINFO_CAPS: dict[str, str] = {
 
 
 class Terminal:
-    """Sans-I/O virtual terminal emulator over a streaming VT500 parser.
+    """Headless terminal emulator over a streaming VT500 parser.
 
     Every method call and attribute read on a :class:`Terminal` instance
     (including capturing state via :meth:`snapshot` or :attr:`committed`)
@@ -2024,7 +2024,7 @@ class Terminal:
         return out
 
     def drain_replies(self) -> bytes:
-        """Return and clear buffered sans-I/O query reply bytes."""
+        """Return and clear buffered terminal reply bytes."""
         if not self._replies:
             return b""
         out = bytes(self._replies)

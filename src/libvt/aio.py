@@ -222,7 +222,7 @@ def _resolve_write_limits(
 
 
 class AsyncTerminalStream:
-    """Drive a sans-I/O :class:`~libvt.terminal.Terminal` from ``asyncio`` streams.
+    """Feed an ``asyncio`` stream reader into :class:`~libvt.terminal.Terminal`.
 
     Coalesces frame wakeups across DEC mode ``?2026`` synchronized-output
     batches (bounded by *sync_timeout* using generation-safe expiry), expires

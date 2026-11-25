@@ -46,7 +46,7 @@ def test_import_libvt_leaves_optional_subsystems_unloaded() -> None:
 
 
 def test_top_level_render_strip_and_unicode_helpers() -> None:
-    """Top-level progressive-disclosure helpers render, strip, and measure text."""
+    """Top-level helpers render, strip, and measure terminal text."""
     rendered = libvt.render(b"\x1b[1;32mok\x1b[0m\r\ndone", rows=4, cols=10)
     assert rendered == "ok\ndone"
 

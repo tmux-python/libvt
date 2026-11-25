@@ -1,4 +1,4 @@
-r"""Sans-I/O ``tmux`` ``capture-pane`` and control-mode (``-CC``) decoders."""
+r"""``tmux`` ``capture-pane`` and control-mode (``-CC``) decoders."""
 
 from __future__ import annotations
 
@@ -1228,7 +1228,7 @@ def decode_tmux_capture(
 
 @dataclass(frozen=True, slots=True)
 class TmuxCaptureCommand:
-    """Sans-I/O chained ``tmux`` capture command specification and bundle parser.
+    """Chained ``tmux`` capture command specification and bundle parser.
 
     Attributes
     ----------

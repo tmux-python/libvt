@@ -236,7 +236,8 @@ class Profile:
         )
 
 
-#: Default ``OSC 7`` ``file://`` hostnames accepted in sans-I/O mode.
+#: Default ``OSC 7`` ``file://`` hostnames accepted by
+#: :class:`~libvt.terminal.Terminal`.
 DEFAULT_OSC7_HOSTS: frozenset[str] = frozenset({"", "localhost"})
 
 
@@ -276,15 +277,15 @@ class Policy:
     osc7_hosts : frozenset[str] | None
         Lowercase hostnames in ``OSC 7`` ``file://<host>/...`` URIs permitted
         to update :attr:`~libvt.terminal.Terminal.cwd`. ``None`` (default)
-        uses ``{"", "localhost"}`` in sans-I/O :class:`~libvt.terminal.Terminal`
-        and automatically adds the local hostname in
+        uses ``{"", "localhost"}`` on :class:`~libvt.terminal.Terminal` and
+        automatically adds the local hostname in
         :func:`~libvt.aio.open_pty`.
     strict : bool
         Raise :exc:`~libvt.exc.ProtocolError` on unrecognized or overflowing
         escape sequences instead of ignoring or recording
         :class:`~libvt.events.UnhandledSequence` (default ``False``).
     track_graphics : bool
-        Track sans-I/O ``SIXEL`` and Kitty ``APC G`` image metadata and grid
+        Track ``SIXEL`` and Kitty ``APC G`` image metadata and grid
         placements (default ``True``).
     """
 
