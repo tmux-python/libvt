@@ -66,7 +66,7 @@ Zero-dependency `SIXEL` and Kitty `APC G` `ImageMeta` and `ImagePlacement`.
 :::{grid-item-card} `libvt.tmux`
 :link: tmux
 :link-type: doc
-`decode_tmux_capture`, `TmuxPaneMetadata`, and `-CC` `%output` unescaping.
+`build_tmux_capture_command`, `decode_tmux_capture`, and `-CC` unescaping.
 :::
 
 ::::

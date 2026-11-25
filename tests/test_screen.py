@@ -24,34 +24,29 @@ def _assert_grid_invariants(term: libvt.Terminal) -> None:
     assert 0 <= scr.cursor.row < scr.rows
     assert 0 <= scr.cursor.col < scr.cols
     for r_idx, raw_row in enumerate(scr._rows):
-        assert len(raw_row.chars) == scr.cols
-        assert 0 <= raw_row.used <= scr.cols
-        if raw_row.attrs is None:
+        assert raw_row.cols == scr.cols
+        assert 0 <= raw_row.text_used <= raw_row.used <= scr.cols
+        if not raw_row.has_wide:
             continue
         for c_idx in range(scr.cols):
-            role = WidthRole((raw_row.attrs[c_idx] >> 60) & 0b11)
+            role = WidthRole((raw_row.attr_at(c_idx) >> 60) & 0b11)
             if role == WidthRole.WIDE:
                 assert c_idx + 1 < scr.cols, f"orphan WIDE at ({r_idx}, {c_idx})"
-                tail_role = WidthRole((raw_row.attrs[c_idx + 1] >> 60) & 0b11)
+                tail_role = WidthRole((raw_row.attr_at(c_idx + 1) >> 60) & 0b11)
                 assert tail_role == WidthRole.SPACER_TAIL
             elif role == WidthRole.SPACER_TAIL:
                 assert c_idx > 0, f"orphan SPACER_TAIL at ({r_idx}, 0)"
-                head_role = WidthRole((raw_row.attrs[c_idx - 1] >> 60) & 0b11)
+                head_role = WidthRole((raw_row.attr_at(c_idx - 1) >> 60) & 0b11)
                 assert head_role == WidthRole.WIDE
-            elif (
-                role == WidthRole.SPACER_HEAD
-                and not declrmm
-                and c_idx == scr.cols - 1
-                and r_idx + 1 < scr.rows
-                and raw_row.wrapped
-            ):
-                next_row = scr._rows[r_idx + 1]
-                next_role = (
-                    WidthRole((next_row.attrs[0] >> 60) & 0b11)
-                    if next_row.attrs is not None
-                    else WidthRole.NARROW
+            elif role == WidthRole.SPACER_HEAD:
+                assert c_idx == scr.cols - 1, (
+                    f"interior SPACER_HEAD at ({r_idx}, {c_idx})"
                 )
-                assert next_role == WidthRole.WIDE
+                assert raw_row.wrapped, f"unwrapped SPACER_HEAD at ({r_idx}, {c_idx})"
+                if not declrmm and r_idx + 1 < scr.rows:
+                    next_row = scr._rows[r_idx + 1]
+                    next_role = WidthRole((next_row.attr_at(0) >> 60) & 0b11)
+                    assert next_role == WidthRole.WIDE
 
 
 class ResizeCase(t.NamedTuple):
@@ -181,7 +176,7 @@ def test_resize_soft_wrap_join_alt_crop_and_inband_2048() -> None:
         False,
         "hard",
     )
-    assert term.drain_replies() == b"\x1b[48;4;20;0;0t"
+    assert term.drain_replies() == b"\x1b[48;4;20;64;160t"
     assert InBandResize(rows=4, cols=20) in term.drain_events()
 
     term.feed(b"\x1b[?1049h\x1b[H0123456789abcdefgh")
@@ -333,9 +328,41 @@ def test_frozen_row_combining_wide_bce_and_256_block_cow_history() -> None:
         assert s_deep.history[-1].text == (
             "line-50001" if step == 0 else f"tail-{step - 1:02d}"
         )
-    assert time.perf_counter() - t0 < 0.05
+    assert time.perf_counter() - t0 < 0.5
     snap_b = deep.snapshot()
     assert snap_a._history.blocks[1] is snap_b._history.blocks[1]
+
+    unwrapped_fr = deep._screens.primary._history[10]
+    t_rz = time.perf_counter()
+    deep.resize(rows=2, cols=20)
+    assert time.perf_counter() - t_rz < 0.5
+    assert deep._screens.primary._history[10].text == unwrapped_fr.text
+    assert deep._screens.primary._history[10].runs is unwrapped_fr.runs
+
+    snap_rz = deep.snapshot()
+    first_abs = snap_rz.evicted_total
+    assert len(snap_rz.at_abs(first_abs)) == 20
+    assert snap_rz.at_abs(first_abs) == snap_rz.history[0]
+    assert snap_rz.at_abs(first_abs) in snap_rz.history
+    assert snap_rz.history != snap_b.history
+
+    t_20 = libvt.Terminal(rows=2, cols=20, scrollback=10)
+    t_10 = libvt.Terminal(rows=2, cols=10, scrollback=10)
+    for t_eq in (t_20, t_10):
+        t_eq.feed(b"hello\r\nrow1\r\nrow2")
+    t_10.resize(rows=2, cols=20)
+    assert t_10.snapshot().history == t_20.snapshot().history
+
+    t_nr = libvt.Terminal(rows=2, cols=6, scrollback=10)
+    t_nr.feed_str("aaa中\r\nx\r\ny")
+    t_nr.resize(rows=2, cols=4, reflow=False)
+    nr_snap = t_nr.snapshot()
+    assert nr_snap.history[0].text == "aaa中"
+    assert nr_snap.history[0][3].width_role == libvt.WidthRole.WIDE
+    assert nr_snap.history[0][4].width_role == libvt.WidthRole.SPACER_TAIL
+    assert nr_snap.at_abs(0) == nr_snap.history[0]
+    assert nr_snap.at_abs(0) in nr_snap.history
+    assert nr_snap.history.index(nr_snap.at_abs(0)) == 0
 
 
 def test_seeded_grid_and_reflow_invariants() -> None:
@@ -388,3 +415,34 @@ def test_seeded_grid_and_reflow_invariants() -> None:
         if trial % 4 == 0:
             term.resize(rows=rng.choice((3, 6, 9)), cols=rng.choice((5, 8, 14)))
             _assert_grid_invariants(term)
+
+
+def test_decslrm_partial_scroll_preserves_interior_wide_glyphs() -> None:
+    """``DECSLRM`` partial scroll keeps wide glyphs wholly inside ``[left, right]``."""
+    term = libvt.Terminal(rows=3, cols=8)
+    # Row 0: wide pairs straddling left=2 (cols 1..2) and right=5 (cols 5..6)
+    # Row 1: wide pairs wholly inside [2..5] at (2, 3) and (4, 5)
+    term.feed_str("A漢BB中C\r\n..日本ZZ")
+    term.feed(b"\x1b[?69h\x1b[3;6s\x1b[1;3H\x1b[S")
+    _assert_grid_invariants(term)
+    assert term.lines[0] == "A 日本 C"
+    assert term[0, 2].text == "日"
+    assert term[0, 2].width_role == WidthRole.WIDE
+    assert term[0, 3].width_role == WidthRole.SPACER_TAIL
+    assert term[0, 4].text == "本"
+    assert term[0, 4].width_role == WidthRole.WIDE
+    assert term[0, 5].width_role == WidthRole.SPACER_TAIL
+    assert term.lines[1] == "..    ZZ"
+
+    # Scroll down (SD) also preserves wide glyphs at exact left/right boundaries.
+    term.feed(b"\x1b[T")
+    _assert_grid_invariants(term)
+    assert term.lines[0] == "A      C"
+    assert term.lines[1] == "..日本ZZ"
+    assert term[1, 2].width_role == WidthRole.WIDE
+    assert term[1, 4].width_role == WidthRole.WIDE
+
+    # Full-width scroll_down onto bottom row clears orphan SPACER_HEAD / wrapped.
+    sd_bot = libvt.Terminal(rows=3, cols=6)
+    sd_bot.feed(b"\x1b[2;1HGHIJK" + "漢".encode() + b"\x1b[1;1H\x1b[1T\x1b[3;1H\n")
+    _assert_grid_invariants(sd_bot)

@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import pathlib
 
+import pytest
+
+if not (pathlib.Path(__file__).resolve().parent.parent / "scripts").is_dir():
+    pytest.skip("repository scripts/ directory required", allow_module_level=True)
+
+pytest.importorskip("pydantic")
+
 from scripts import bench_vt, benchmark
 
 

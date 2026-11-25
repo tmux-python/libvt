@@ -7,5 +7,5 @@
 ```
 
 ```{include} ../CHANGES
-
+:encoding: utf-8
 ```

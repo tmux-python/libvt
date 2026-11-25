@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import typing as t
 
 import pytest
@@ -171,3 +172,128 @@ def test_string_esc_abort_dcs_del_bel_and_payload_limits() -> None:
     term.feed(b"\x1b]2;" + (b"x" * 64) + b"\x07clean")
     assert (term.title, term.text) == ("", "clean")
     assert any(isinstance(ev, libvt.UnhandledSequence) for ev in term.drain_events())
+
+
+def test_bounded_ascii_ints_and_utf8_event_byte_cost() -> None:
+    """Bounded ASCII int parsers never raise on >4300 digits or malformed URIs."""
+    vt = libvt.Terminal(
+        rows=3,
+        cols=12,
+        limits=Limits(max_osc_bytes=16_384, max_event_bytes=512, max_events=4096),
+        record_events=True,
+    )
+    vt.feed(b"\x1b]" + b"9" * 4_500 + b";x\x07")
+    assert Parser().feed(b"\x1b]65536;x\x07") == [OscDispatch(-1, b"x", b"\x07")]
+    vt.feed(
+        "\x1b]9;4;²;²\x07\x1b]133;D;--5\x07\x1b]133;D;²\x07".encode()
+        + b"\x1b]7501;state=working:progress=+50\x07"
+        + b"\x1b]7501;state=working:progress=101\x07"
+        + b"\x1b]7;file://[\x07\x1b]7;file://[bad]/tmp\x07"
+        + "\x1b]7;file://\uff03/tmp\x07".encode()
+        + b"\x1b]9;9;file://[\x07"
+        + b"\x1b]10;#-f-f-f\x07\x1b]10;rgb:-fff/-fff/-fff\x07\x1b]10;?\x07"
+        + b"\x1b]133;D;-42\x07"
+    )
+    assert [z.exit_code for z in vt.prompt_zones] == [None, None, -42]
+    assert vt.program_status is None
+    assert b"-" not in vt.drain_replies()
+
+    raw_px = base64.b64encode(b"\xff" * (8 * 16 * 3))
+    vt.feed(b"\x1b_Ga=t,f=24,s=8,v=16,i=4294967295;" + raw_px + b"\x1b\\")
+    assert 4_294_967_295 in vt.images
+    vt.drain_replies()
+    vt.feed(
+        b"\x1b_Ga=t,f=24,s=8,v=16,i=4294967296;"
+        + raw_px
+        + b"\x1b\\"
+        + b"\x1b_Ga=p,i="
+        + b"9" * 5_000
+        + b"\x1b\\"
+    )
+    assert 4_294_967_296 not in vt.images
+    vt.drain_replies()
+
+    raw_2x2 = base64.b64encode(b"\xff" * 12)
+    vt.feed(b"\x1b_Ga=t,f=24,s=2,v=2,i=5,q=2,m=1;" + raw_2x2[:8] + b"\x1b\\")
+    vt.feed(b"\x1b_Gq=999999999999999,m=0;" + raw_2x2[8:] + b"\x1b\\")
+    assert vt.drain_replies() == b""
+
+    vt.feed(b"\x1b_Ga=t,f=24,s=2,v=2,i=6,m=1;" + raw_2x2[:8] + b"\x1b\\")
+    vt.feed(b"\x1b_GI=7,m=0;" + raw_2x2[8:] + b"\x1b\\")
+    assert 6 not in vt.images
+    assert b"EINVAL:cannot specify both i and I" in vt.drain_replies()
+
+    vt.feed(b"\x1b_Ga=T,f=24,s=2,v=2,i=8,m=1;" + raw_2x2[:8] + b"\x1b\\")
+    vt.feed(b"\x1b_Gp=4294967296,m=0;" + raw_2x2[8:] + b"\x1b\\")
+    assert vt.drain_replies() == b"\x1b_Gi=8;EINVAL:invalid uint32 p\x1b\\"
+
+    vt.feed("\x1b_Gi=9,t=é;\x1b\\".encode())
+    assert b"EINVAL:unsupported transmission medium" in vt.drain_replies()
+
+    vt.drain_events()
+    vt.feed(b"\x07\x07\x07")
+    vt.feed(b"\x1b]2;" + (b"x" * 600) + b"\x07")
+    assert len(vt.drain_events()) == 3
+
+    for i in range(20):
+        vt.feed_str(f"\x1b]2;{'🔥' * 30}-{i}\x07")
+    evs = vt.drain_events()
+    assert 1 <= len(evs) <= 3
+
+
+def test_parse_sgr_ignores_colon_5_3_outside_tmux_capture() -> None:
+    """Global ``parse_sgr`` and live ``Terminal`` ignore ``CSI 5:3 m``."""
+    vt = libvt.Terminal(rows=2, cols=8)
+    vt.feed(b"\x1b[5:3mA\x1b[53mB\x1b[55;5mC")
+    assert (vt[0, 0].style.overline, vt[0, 0].style.blink) == (False, False)
+    assert (vt[0, 1].style.overline, vt[0, 1].style.blink) == (True, False)
+    assert (vt[0, 2].style.overline, vt[0, 2].style.blink) == (False, True)
+
+
+def test_del_flushes_incomplete_utf8_and_colon_subparams_restricted() -> None:
+    """``0x7F`` flushes pending UTF-8; non-``m`` and non-``4/38/48/58`` colons drop."""
+    for byte_wise in (False, True):
+        vt = libvt.Terminal(rows=3, cols=8)
+        payload = b"\xe2\x7f\x82\xac"
+        if byte_wise:
+            for idx in range(len(payload)):
+                vt.feed(payload[idx : idx + 1])
+        else:
+            vt.feed(payload)
+        assert vt.lines[0] == "\ufffd\ufffd\ufffd"
+
+    step_vt = libvt.Terminal(rows=2, cols=8)
+    res1 = step_vt.feed_until(b"\xe2", stop=libvt.StopOn.GROUND)
+    assert res1.stopped_on == libvt.StopOn.EOF
+    res2 = step_vt.feed_until(b"\x7f", stop=libvt.StopOn.GROUND)
+    assert res2.stopped_on == libvt.StopOn.GROUND
+    assert step_vt.lines[0] == "\ufffd"
+
+    csi_vt = libvt.Terminal(rows=4, cols=8)
+    csi_vt.feed(b"\x1b[2;3HX\x1b[1:1H\x1b[2:2J\x1b[?25:0l\x1b[1:2;31:5;4:3;32mY")
+    assert (csi_vt.cursor.row, csi_vt.cursor.col, csi_vt.cursor.visible) == (1, 4, True)
+    assert csi_vt[1, 2].text == "X"
+    cell_y = csi_vt[1, 3]
+    assert cell_y.text == "Y"
+    assert cell_y.style.bold is False
+    assert cell_y.style.fg == libvt.AnsiColor.GREEN
+    assert cell_y.style.underline == libvt.UnderlineStyle.CURLY
+
+    # Omitted colon subparams (4:m, 38:5:m, 38:2:10:20:m) and >2 underline
+    # subparams (4:3:9m) are ignored; >= max_csi_params colons still drop/truncate.
+    omitted_vt = libvt.Terminal(rows=2, cols=8)
+    omitted_vt.feed(
+        b"\x1b[4:3;31m\x1b[4:m\x1b[38:5:mA\x1b[0m\x1b[4:3:9mB\x1b[38:2:10:20:mC"
+    )
+    assert omitted_vt[0, 0].style.underline == libvt.UnderlineStyle.CURLY
+    assert omitted_vt[0, 0].style.fg == libvt.AnsiColor.RED
+    assert omitted_vt[0, 1].style.underline == libvt.UnderlineStyle.NONE
+    assert omitted_vt[0, 2].style.fg is None
+
+    assert hasattr(libvt.Parser(), "_csi_overflow_idx")
+    for slow_pad in (b"1;" * 31, b"00000001;" * 35):
+        over_vt = libvt.Terminal(rows=4, cols=8)
+        over_vt.feed(b"\x1b[3;4H\x1b[" + slow_pad + b"1:2H")
+        assert (over_vt.cursor.row, over_vt.cursor.col) == (2, 3)
+        over_vt.feed(b"\x1b[" + (b"0;" * 31) + b"1:2mZ")
+        assert over_vt[2, 3].style.bold is False

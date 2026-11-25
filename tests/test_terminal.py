@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
+import pickle
+import random
 import time
 import typing as t
 
@@ -403,3 +407,490 @@ def test_changes_since_watermarks_and_replica_equivalence() -> None:
     assert term.changes_since(stale_same_epoch).resync_reason == (
         ResyncReason.HISTORY_EVICTED
     )
+
+    # SyncToken is opaque per Terminal; mutating another Terminal never bumps it.
+    other_term = libvt.Terminal(rows=2, cols=6)
+    tok_before_other = term.sync_token()
+    assert not dataclasses.is_dataclass(libvt.SyncToken)
+    assert not hasattr(tok_before_other, "terminal_id")
+    assert not hasattr(tok_before_other, "_terminal_id")
+    assert not hasattr(tok_before_other, "modes")
+    assert len(repr(tok_before_other)) < 80
+    assert hash(tok_before_other) == hash(term.sync_token())
+    assert copy.copy(tok_before_other) == tok_before_other
+    assert copy.deepcopy(tok_before_other) == tok_before_other
+    for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+        roundtrip = pickle.loads(pickle.dumps(tok_before_other, protocol=proto))
+        assert roundtrip == tok_before_other
+        assert (
+            other_term.changes_since(roundtrip).resync_reason
+            == ResyncReason.TERMINAL_MISMATCH
+        )
+    with pytest.raises(TypeError):
+        libvt.SyncToken()
+    with pytest.raises(AttributeError):
+        t.cast("t.Any", tok_before_other).extra = 1
+    with pytest.raises(TypeError):
+        term.changes_since(t.cast("t.Any", "bad"))
+    other_term.feed_str("hello world")
+    assert term.sync_token() == tok_before_other
+
+    # Direct Screen / ModeState mutators preserve ?2026 holds and replica sync.
+    direct_t = libvt.Terminal(rows=3, cols=6)
+    direct_t.feed(b"HELLO")
+    d0 = direct_t.changes_since(None)
+    dh: list[RowView] = []
+    dv: list[RowView] = []
+    d0.apply_rows(dh, dv)
+    direct_t.screen.reset()
+    d1 = direct_t.changes_since(d0.token)
+    d1.apply_rows(dh, dv)
+    direct_t.feed(b"\x1b[2;1HWORLD")
+    d2 = direct_t.changes_since(d1.token)
+    d2.apply_rows(dh, dv)
+    assert [r.text for r in dv] == list(d2.snapshot.lines)
+
+    hold_t = libvt.Terminal(rows=2, cols=6)
+    hold_t.feed(b"SAFE\x1b[?2026h")
+    hold_t.screen.reset()
+    assert hold_t.committed.text == "SAFE"
+
+    # DCH / ICH / SD / IL under DECLRMM & non-reflow resize preserve row invariants.
+    dch_lr = libvt.Terminal(rows=3, cols=6)
+    dch_lr.feed(b"ABCDEFG\x1b[?69h\x1b[3;6s\x1b[1;1H")
+    lr_tok = dch_lr.sync_token(view="working")
+    dch_lr.feed(b"\x1b[P\x1b[@")
+    lr_delta = dch_lr.changes_since(lr_tok, view="working")
+    assert dch_lr.snapshot()[0].wrapped is True
+    assert lr_delta.dirty_rows == ()
+
+    sd_lr = libvt.Terminal(rows=4, cols=6)
+    sd_lr.feed("ABCDE日12".encode() + b"\x1b[?69h\x1b[3;6s\x1b[1;1H\x1b[T\x1b[?69l")
+    assert sd_lr[1].wrapped is False
+    assert sd_lr[1, 5].width_role != libvt.WidthRole.SPACER_HEAD
+
+    il_lr = libvt.Terminal(rows=3, cols=6)
+    il_lr.feed("ABCDE日1234".encode() + b"\x1b[?69h\x1b[2;5s\x1b[2;2H\x1b[L")
+    assert not (il_lr[0].wrapped and il_lr[0, 5].text == " ")
+
+    ich_w = libvt.Terminal(rows=2, cols=6)
+    ich_w.feed("ABC日".encode() + b"\x1b[?69h\x1b[2;4s\x1b[1;2H\x1b[@")
+    ref_w = libvt.Terminal(rows=2, cols=6)
+    ref_w.feed(b"A BC")
+    assert ich_w.snapshot()[0].text == "A BC"
+    assert ich_w.snapshot()[0] == ref_w.snapshot()[0]
+
+    alt_rz = libvt.Terminal(rows=3, cols=4)
+    alt_rz.feed(b"\x1b[?1049h" + "ABC日".encode())
+    alt_rz.resize(rows=3, cols=6)
+    alt_rz.feed(b"\x1b[1;5HXY")
+    assert alt_rz[0, 3].width_role != libvt.WidthRole.SPACER_HEAD
+    assert alt_rz[0].text == "ABC XY"
+
+    # Seeded replica & _Row write-barrier fingerprint fuzzer.
+    rng = random.Random(20261123)
+    fuzz_tokens: tuple[bytes, ...] = (
+        b"ABCD",
+        "日本".encode(),
+        b"a\xcc\x81",
+        b"\r",
+        b"\n",
+        b"\x08",
+        b"\x1b[1;1H",
+        b"\x1b[2;3H",
+        b"\x1b[A",
+        b"\x1b[B",
+        b"\x1b[C",
+        b"\x1b[D",
+        b"\x1b[@",
+        b"\x1b[2@",
+        b"\x1b[P",
+        b"\x1b[2P",
+        b"\x1b[2X",
+        b"\x1b[K",
+        b"\x1b[1K",
+        b"\x1b[2K",
+        b"\x1b[J",
+        b"\x1b[2J",
+        b"\x1b[3J",
+        b"\x1b[L",
+        b"\x1b[M",
+        b"\x1b[S",
+        b"\x1b[T",
+        b"\x1b[1;3r",
+        b"\x1b[2;4r",
+        b"\x1b[r",
+        b"\x1b[?69h\x1b[3;5s",
+        b"\x1b[?69l",
+        b"\x1b[31;44m",
+        b"\x1b[0m",
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+        b"\x1b[?2026h",
+        b"\x1b[?2026l",
+    )
+    for trial in range(50):
+        ft = libvt.Terminal(rows=4, cols=6, scrollback=8)
+        w_tok = ft.sync_token(view="working")
+        c_tok2 = ft.sync_token(view="committed")
+        w_hist: list[RowView] = []
+        w_view: list[RowView] = [ft.snapshot()[i] for i in range(4)]
+        c_hist: list[RowView] = []
+        c_view: list[RowView] = [ft.committed[i] for i in range(4)]
+        prev_fps = [r.debug_fingerprint() for r in ft.screen._rows]
+
+        for step_i in range(24):
+            if step_i == 12 and trial % 5 == 0:
+                ft.resize(rows=rng.choice((3, 5)), cols=rng.choice((5, 8)))
+            else:
+                ft.feed(rng.choice(fuzz_tokens))
+
+            cur_fps = [r.debug_fingerprint() for r in ft.screen._rows]
+            dw = ft.changes_since(w_tok, view="working")
+            if dw.resync_reason is ResyncReason.NONE and dw.viewport_scroll_up == 0:
+                changed_idx = tuple(
+                    i for i in range(ft.rows) if cur_fps[i] != prev_fps[i]
+                )
+                for ci in changed_idx:
+                    assert ci in dw.dirty_rows
+            dw.apply_rows(w_hist, w_view)
+            ws = dw.snapshot
+            assert w_hist == list(ws.history)
+            assert w_view == [ws[i] for i in range(ws.rows)]
+            w_tok = dw.token
+            prev_fps = cur_fps
+
+            dc = ft.changes_since(c_tok2, view="committed")
+            dc.apply_rows(c_hist, c_view)
+            cs = dc.snapshot
+            assert c_hist == list(cs.history)
+            assert c_view == [cs[i] for i in range(cs.rows)]
+            c_tok2 = dc.token
+
+
+def test_bce_strips_hyperlink_su_history_and_vt_formatter_roundtrip() -> None:
+    """``BCE`` drops ``OSC 8``, ``SU`` scrolls to history, and ``VT`` round-trips."""
+    bce_t = libvt.Terminal(rows=3, cols=8)
+    bce_t.feed(
+        b"\x1b]8;id=1;https://example.com\x07\x1b[42m"
+        b"AB\x1b[K\r\n"
+        b"CD\x1b[2X\r\n"
+        b"EF\x1b[1;1H\x1b[1;2r\x1b[1L\x1b[r\x1b]8;;\x07"
+    )
+    assert bce_t[1, 0].hyperlink == libvt.Hyperlink(uri="https://example.com", id="1")
+    for r_i, c_i in ((0, 0), (0, 5), (1, 2), (1, 3)):
+        assert bce_t[r_i, c_i].style.bg == AnsiColor.GREEN
+        assert bce_t[r_i, c_i].hyperlink is None
+
+    su_t = libvt.Terminal(rows=3, cols=8, scrollback=10)
+    su_t.feed(b"\x1b]133;A\x07rowA\r\nrowB\r\n\x1b]133;A\x07rowC\x1b[1;2r\x1b[1S")
+    su_snap = su_t.snapshot()
+    assert [r.text for r in su_snap.history] == ["rowA"]
+    assert su_snap.lines == ("rowB", "", "rowC")
+    assert [su_snap.at_abs(z.abs_row).text for z in su_snap.prompt_zones] == [
+        "rowA",
+        "rowC",
+    ]
+    # Huge Ps in SU clamps to region height rather than flooding scrollback.
+    su_t.feed(b"\x1b[999S")
+    assert len(su_t.history) == 3
+
+    # Alt-screen SU and narrow-margin SU do not push to primary scrollback.
+    su_t.feed(b"\x1b[r\x1b[?1049hALT1\r\nALT2\x1b[1S\x1b[?1049l")
+    assert len(su_t.history) == 3
+
+    # Formatter(OutputFormat.VT) round-trips IRM / DECOM / DECLRMM / ?7l / ?25l /
+    # ?2027l / DECSCUSR and short wrapped=True rows from tmux -T.
+    src_t = libvt.Terminal.from_tmux_capture(
+        ["W ab", "- GH", "- "],
+        rows=3,
+        cols=6,
+        flagged=True,
+        trim_trailing=True,
+        profile=DEFAULT_PROFILE,
+    )
+    assert src_t.screen._rows[0].used == 2
+    src_t.feed(
+        b"\x1b[2;3H\x1b[42m\x1b[2X\x1b[0m"
+        b"\x1b[4h\x1b[?69h\x1b[2;5s\x1b[?6h\x1b[?7l\x1b[?25l\x1b[5 q\x1b[2;2H"
+    )
+    snap = src_t.snapshot()
+    vt_out = snap.format(OutputFormat.VT)
+    dst_t = libvt.Terminal(rows=3, cols=6)
+    dst_t.feed_str(vt_out)
+    dst_snap = dst_t.snapshot()
+    assert dst_snap[0].wrapped is True
+    assert dst_snap[0, 0].text == "a"
+    assert dst_snap[0, 1].text == "b"
+    assert dst_snap[1].text == "GH"
+    assert dst_snap[1, 2].style.bg == AnsiColor.GREEN
+    assert dst_snap.modes == snap.modes
+    assert dst_snap.cursor == snap.cursor
+
+    # ?2027l and ?25l across ?1049h round-trip through Formatter(OutputFormat.VT).
+    flag_t = libvt.Terminal(rows=2, cols=8)
+    flag_t.feed(b"\x1b[?25l\x1b[?1049h\x1b[?2027l" + "🇺🇸X".encode())
+    flag_dst = libvt.Terminal(rows=2, cols=8)
+    flag_dst.feed_str(flag_t.snapshot().format(OutputFormat.VT))
+    assert flag_dst.cursor.visible is False
+    assert (flag_dst[0, 1].text, flag_dst[0, 2].text) == ("🇸", "X")
+
+    # Bottom-row wrapped=True from tmux capture preserves penultimate wrap & BCE.
+    s_bot1 = libvt.Snapshot.from_tmux_capture(
+        ["W abcdef", "W "], rows=2, cols=6, flagged=True, trim_trailing=True
+    )
+    d_bot1 = libvt.Terminal(rows=2, cols=6)
+    d_bot1.feed_str(s_bot1.format(OutputFormat.VT))
+    assert d_bot1[0].wrapped is True
+
+    t_bot2 = libvt.Terminal.from_tmux_capture(
+        ["- abcdef", "W ab"], rows=2, cols=6, flagged=True, trim_trailing=True
+    )
+    t_bot2.feed(b"\x1b[2;3H\x1b[42m\x1b[3X\x1b[0m")
+    d_bot2 = libvt.Terminal(rows=2, cols=6)
+    d_bot2.feed_str(t_bot2.snapshot().format(OutputFormat.VT))
+    assert d_bot2[1, 2].style.bg == AnsiColor.GREEN
+
+
+def test_profile_decstr_decsc_declrmm_and_top_margin_history() -> None:
+    """``DEFAULT`` vs ``TMUX_PROFILE`` split ``DECSTR``, ``DECSC``, and ``?69``."""
+    # 1. DECSTR on DEFAULT / XTERM resets only VT510 soft-reset state.
+    for prof in (DEFAULT_PROFILE, libvt.XTERM_PROFILE):
+        dt = libvt.Terminal(rows=4, cols=8, profile=prof)
+        dt.feed(
+            b"\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[>1u"
+            b"\x1b[4h\x1b[?7l\x1b[?25l\x1b[?69h\x1b[2;4r\x1b[2;6s\x1b[?6h"
+            b"\x1b[31m\x1b]8;;https://example.com\x07\x1b[5 q\x1b)0\x0e"
+            b"\x1b[2;2H\x1b7\x1b[!p"
+        )
+        assert dt.modes.is_set(libvt.Mode.MOUSE_VT200) is True
+        assert dt.modes.is_set(libvt.Mode.MOUSE_SGR) is True
+        assert dt.modes.is_set(libvt.Mode.BRACKETED_PASTE) is True
+        assert int(dt.kitty_keyboard_flags) == 1
+        assert dt.modes.is_set(libvt.Mode.IRM) is False
+        assert dt.modes.is_set(libvt.Mode.DECOM) is False
+        assert dt.modes.is_set(libvt.Mode.DECAWM) is True
+        assert dt.modes.is_set(libvt.Mode.DECTCEM) is True
+        assert dt.modes.is_set(libvt.Mode.DECLRMM) is False
+        assert dt.cursor.visible is True
+        assert (dt.cursor.shape, dt.cursor.blinking) == (libvt.CursorShape.BLOCK, True)
+        assert dt.screen.scroll_region == libvt.ScrollRegion(0, 3, 0, 7)
+        dt.feed(b"l\x1b8")
+        assert dt[dt.cursor.row, 0].style.fg is None
+        assert (dt.cursor.row, dt.cursor.col) == (0, 0)
+
+    # 2. _single_shift saved/restored by DECSC; DEFAULT shares primary slot with ?1049h
+    #    while alt screen keeps its own DECSC slot; CSI 5;10 s with ?69 off is ignored.
+    ss_t = libvt.Terminal(rows=4, cols=8, profile=DEFAULT_PROFILE)
+    ss_t.feed(b"\x1b*0\x1bN\x1b7\x1b[2;2Hll\x1b8ll")
+    assert (ss_t[1, 1].text, ss_t[1, 2].text) == ("┌", "l")
+    assert (ss_t[0, 0].text, ss_t[0, 1].text) == ("┌", "l")
+
+    def_sc = libvt.Terminal(rows=4, cols=8, profile=DEFAULT_PROFILE)
+    def_sc.feed(b"\x1b[3;1H\x1b7\x1b[3;3H\x1b[5;10s\x1b8")
+    assert (def_sc.cursor.row, def_sc.cursor.col) == (2, 0)
+    def_sc.feed(b"\x1b[3;3H\x1b[?1049h\x1b[1;5H\x1b7\x1b[2;6H\x1b8\x1b[?1049l\x1b8")
+    assert (def_sc.cursor.row, def_sc.cursor.col) == (2, 2)
+
+    # 3. TMUX_PROFILE: separate DECSC vs ?1049h slots, ?69/?1048 off, CSI 5;10 s saves.
+    tm_sc = libvt.Terminal(rows=4, cols=8, profile=TMUX_PROFILE)
+    tm_sc.feed(
+        b"\x1b[3;1H\x1b7\x1b[1;5H\x1b[?1048h\x1b[?1048$p\x1b[3;3H\x1b[?1049h\x1b[?1049l\x1b8"
+    )
+    assert tm_sc.drain_replies() == b"\x1b[?1048;0$y"
+    assert (tm_sc.cursor.row, tm_sc.cursor.col) == (2, 0)
+    tm_sc.feed(b"\x1b[?69h\x1b[?69$p\x1b[2;5H\x1b[5;10s\x1b[4;7H\x1b[u")
+    assert tm_sc.modes.is_set(libvt.Mode.DECLRMM) is False
+    assert tm_sc.drain_replies() == b"\x1b[?69;0$y"
+    assert (tm_sc.cursor.row, tm_sc.cursor.col) == (1, 4)
+
+    # Pending SS2 does not leak onto fresh alternate screen on ?1049h.
+    ss_alt = libvt.Terminal(rows=2, cols=8, profile=DEFAULT_PROFILE)
+    ss_alt.feed(b"\x1b*0\x1bN\x1b[?1049hl")
+    assert ss_alt[0, 0].text == "l"
+
+    # 4. TMUX_PROFILE top > 0 DECSTBM scrollback + ScreenDelta + PromptZone + gfx.
+    tm_top = libvt.Terminal(rows=4, cols=8, scrollback=10, profile=TMUX_PROFILE)
+    tok = tm_top.sync_token()
+    rep_h: list[RowView] = []
+    rep_v: list[RowView] = [tm_top.snapshot()[i] for i in range(4)]
+    tm_top.feed(
+        b"\x1b]133;A\x07HDR\r\n"
+        b"\x1b]133;A\x07R1\r\n"
+        b"R2\r\n"
+        b"\x1b]133;A\x07FTR"
+        b"\x1b[2;3r\x1b[3;1H\nNEW2"
+    )
+    delta = tm_top.changes_since(tok)
+    delta.apply_rows(rep_h, rep_v)
+    snap_top = delta.snapshot
+    assert [r.text for r in snap_top.history] == ["R1"]
+    assert snap_top.lines == ("HDR", "R2", "NEW2", "FTR")
+    assert [r.text for r in rep_h] == ["R1"]
+    assert [r.text for r in rep_v] == ["HDR", "R2", "NEW2", "FTR"]
+    assert [snap_top.at_abs(z.abs_row).text for z in snap_top.prompt_zones] == [
+        "HDR",
+        "R1",
+        "FTR",
+    ]
+    # DL inside top > 0 does not push to history.
+    tm_top.feed(b"\x1b[2;1H\x1b[M")
+    assert [r.text for r in tm_top.history] == ["R1"]
+    assert tm_top.lines == ("HDR", "NEW2", "", "FTR")
+
+    # Wrapped row evicted from top > 0 DECSTBM or ED 2 does not glue onto viewport[0],
+    # and SIXEL inside top > 0 DECSTBM clips at top without covering HDR.
+    tm_wrap = libvt.Terminal(rows=4, cols=8, scrollback=10, profile=TMUX_PROFILE)
+    tm_wrap.feed(b"HEADER\r\n1234567890\r\nFOOTER\x1b[2;3r\x1b[3;1H\n")
+    assert tm_wrap.history[-1].wrapped is False
+    tm_wrap.resize(rows=4, cols=16, reflow=True)
+    assert tm_wrap.lines[0] == "HEADER"
+
+    tm_sx = libvt.Terminal(rows=4, cols=8, scrollback=10, profile=TMUX_PROFILE)
+    tm_sx.feed(
+        b'HEADER\r\nR1\r\nR2\r\nFOOTER\x1b[2;3r\x1b[3;1H\x1bP0;1;0q"1;1;16;48#0!16~\x1b\\'
+    )
+    sx_snap = tm_sx.snapshot()
+    assert sx_snap.placements[0].occupies_abs(sx_snap.scrolled_total, 0) is False
+
+    # DEFAULT_PROFILE keeps top > 0 DECSTBM scrolls out of history.
+    def_top = libvt.Terminal(rows=4, cols=8, scrollback=10, profile=DEFAULT_PROFILE)
+    def_top.feed(b"HDR\r\nR1\r\nR2\r\nFTR\x1b[2;3r\x1b[3;1H\nNEW2")
+    assert list(def_top.history) == []
+    assert def_top.lines == ("HDR", "R2", "NEW2", "FTR")
+
+
+def test_osc_palette_dynamic_colors_decrqm_xtsmgraphics_and_notifications() -> None:
+    """``OSC 4/104/10-12/112``, ``DECRQM``, ``XTSMGRAPHICS``, and ``OSC 9/99/777``."""
+    term = libvt.Terminal(
+        rows=4,
+        cols=10,
+        policy=Policy(strict=True),
+        record_events=True,
+    )
+    # Default OSC 4 query + multi-pair set/query + selective/full OSC 104 reset.
+    term.feed(b"\x1b]4;1;?\x07")
+    assert term.drain_replies() == b"\x1b]4;1;rgb:cdcd/0000/0000\x07"
+
+    term.feed(b"\x1b]4;1;#123456;2;rgb:aa/bb/cc;1;?;2;?\x1b\\")
+    assert term.drain_replies() == (
+        b"\x1b]4;1;rgb:1212/3434/5656\x1b\\\x1b]4;2;rgb:aaaa/bbbb/cccc\x1b\\"
+    )
+    term.feed(b"\x1b]104;1\x07\x1b]104;999\x07\x1b]4;1;?;2;?\x07")
+    assert term.drain_replies() == (
+        b"\x1b]4;1;rgb:cdcd/0000/0000\x07\x1b]4;2;rgb:aaaa/bbbb/cccc\x07"
+    )
+
+    # Semicolon-chained OSC 10;?;?;? + OSC 12 / OSC 112 + DECSTR palette reset.
+    term.feed(b"\x1b]12;#abcdef\x07\x1b]10;?;?;?\x07")
+    assert term.drain_replies() == (
+        b"\x1b]10;rgb:e5e5/e5e5/e5e5\x07"
+        b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"
+        b"\x1b]12;rgb:abab/cdcd/efef\x07"
+    )
+    # DECSTR resets OSC 4 palette overrides while keeping OSC 10-12 dynamic colors.
+    term.feed(b"\x1b[!p\x1b]4;2;?\x07\x1b]12;?\x07")
+    assert term.drain_replies() == (
+        b"\x1b]4;2;rgb:0000/cdcd/0000\x07\x1b]12;rgb:abab/cdcd/efef\x07"
+    )
+    term.feed(b"\x1b]112;extra\x07\x1b]12;?\x07\x1b]112\x07\x1b]12;?\x07")
+    assert term.drain_replies() == (
+        b"\x1b]12;rgb:abab/cdcd/efef\x07\x1b]12;rgb:e5e5/e5e5/e5e5\x07"
+    )
+
+    # DECRQM unknown modes return 0; XTSMGRAPHICS replies ?Pi;3S before DA1 sentinel.
+    term.feed(
+        b"\x1b[4$p\x1b[99$p\x1b[?2026$p\x1b[?9999$p"
+        b"\x1b[>1$p\x1b[?1;2$p"
+        b"\x1b[?1;1;0S\x1b[?2;3;800;600S\x1b[c"
+    )
+    assert term.drain_replies() == (
+        b"\x1b[4;2$y"
+        b"\x1b[99;0$y"
+        b"\x1b[?2026;2$y"
+        b"\x1b[?9999;0$y"
+        b"\x1b[?1;3S"
+        b"\x1b[?2;3S" + DEFAULT_PROFILE.da1
+    )
+
+    # Policy(allow_color_queries=False) suppresses OSC 4 and OSC 10-12 replies.
+    no_color = libvt.Terminal(rows=2, cols=8, policy=Policy(allow_color_queries=False))
+    no_color.feed(b"\x1b]4;1;?\x07\x1b]10;?;?;?\x07")
+    assert no_color.drain_replies() == b""
+
+    # Partial OSC 4 / 10-12 stops at first malformed pair; OSC 104 / 110 / RIS resets.
+    edge_t = libvt.Terminal(
+        rows=2,
+        cols=8,
+        profile=libvt.Profile(cursor_rgb=(1, 2, 3)),
+        limits=libvt.Limits(max_reply_bytes=64),
+    )
+    edge_t.feed(
+        b"\x1b]4;1;#112233;bad;#445566;2;#778899\x07"
+        b"\x1b]4;2;#223344;3;notacolor;4;#778899\x07"
+        b"\x1b]4;+1;#999999;256;#999999\x07"
+        b"\x1b]4;1;?;2;?;3;?;4;?\x07"
+    )
+    capped_rep = edge_t.drain_replies()
+    assert len(capped_rep) <= 64
+    assert capped_rep.startswith(
+        b"\x1b]4;1;rgb:1111/2222/3333\x07\x1b]4;2;rgb:2222/3333/4444\x07"
+    )
+    edge_t.feed(b"\x1b]4;3;?;4;?\x07")
+    assert edge_t.drain_replies() == (
+        b"\x1b]4;3;rgb:cdcd/cdcd/0000\x07\x1b]4;4;rgb:0000/0000/eeee\x07"
+    )
+    edge_t.feed(b"\x1b]104;;\x07\x1b]4;1;?\x07")
+    assert edge_t.drain_replies() == b"\x1b]4;1;rgb:cdcd/0000/0000\x07"
+
+    # 2000-pair OSC 4 query flood respects max_reply_bytes without dropping sets.
+    flood = b"\x1b]4;" + b"1;?;" * 2_000 + b"5;#abcdef\x07"
+    edge_t.feed(flood)
+    assert len(edge_t.drain_replies()) <= 64
+    edge_t.feed(b"\x1b]4;5;?\x07")
+    assert edge_t.drain_replies() == b"\x1b]4;5;rgb:abab/cdcd/efef\x07"
+    edge_t.feed(b"\x1b]104\x07\x1b]4;5;?\x07")
+    assert edge_t.drain_replies() == b"\x1b]4;5;rgb:cdcd/0000/cdcd\x07"
+
+    # Chained OSC 10 set/query stops past 12 or on bad spec; OSC 110/111 & RIS reset.
+    edge_t2 = libvt.Terminal(
+        rows=2, cols=8, profile=libvt.Profile(cursor_rgb=(1, 2, 3))
+    )
+    edge_t2.feed(b"\x1b]10;#112233;bad;#778899\x07\x1b]10;?;?;?;?\x07")
+    assert edge_t2.drain_replies() == (
+        b"\x1b]10;rgb:1111/2222/3333\x07"
+        b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"
+        b"\x1b]12;rgb:0101/0202/0303\x07"
+    )
+    edge_t2.feed(b"\x1b]110;extra\x07\x1b]10;?\x07\x1b]110\x07\x1b]10;?\x07")
+    assert edge_t2.drain_replies() == (
+        b"\x1b]10;rgb:1111/2222/3333\x07\x1b]10;rgb:e5e5/e5e5/e5e5\x07"
+    )
+    edge_t2.feed(b"\x1b]10;#112233;#445566;#778899\x07\x1bc\x1b]12;?\x07")
+    assert edge_t2.drain_replies() == b"\x1b]12;rgb:0101/0202/0303\x07"
+
+    # DEC_PRIVATE_MASK (32768) boundary: Ps >= 32768 never aliases DEC modes,
+    # and Formatter(OutputFormat.VT) round-trips ?1007l.
+    edge_t2.feed(b"\x1b[32769$p\x1b[33775$p\x1b[?32769$p\x1b[33817h\x1b[?1007l")
+    assert edge_t2.screens.active_is_alt is False
+    assert edge_t2.drain_replies() == b"\x1b[32769;0$y\x1b[33775;0$y\x1b[?32769;0$y"
+    vt_1007 = edge_t2.snapshot().format(libvt.OutputFormat.VT)
+    restored_1007 = libvt.Terminal(rows=2, cols=8)
+    restored_1007.feed(vt_1007.encode())
+    assert restored_1007.modes.is_set(libvt.Mode.ALTERNATE_SCROLL) is False
+    edge_t2.feed(b"\x1b]7;file://localhost/%ff\x07")
+    assert edge_t2.cwd != ""
+
+    # ?2048 resize reports pixel height and width from Profile cell dimensions.
+    term.feed(b"\x1b[?2048h")
+    term.resize(rows=10, cols=40)
+    assert term.drain_replies() == b"\x1b[48;10;40;160;320t"
+
+    # OSC 9 (text), OSC 99, and OSC 777 consume silently under Policy(strict=True).
+    term.drain_events()
+    term.feed(
+        b"\x1b]9;Desktop alert\x07"
+        b"\x1b]99;i=1:d=0;Hello\x1b\\"
+        b"\x1b]777;notify;Build;Done\x07"
+    )
+    assert term.drain_events() == ()

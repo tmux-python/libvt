@@ -146,6 +146,137 @@ def test_scroll_before_place_sixel_erase_policies_and_event_immutability() -> No
     assert (as_snap.placements[0].abs_row, as_snap.placements[0].rows) == (0, 3)
     assert as_snap.viewport_row(as_snap.placements[0].abs_row) == 0
 
+    decstbm_sx = libvt.Terminal(
+        rows=6, cols=10, scrollback=10, profile=Profile.tmux("next-3.9")
+    )
+    decstbm_sx.feed(b'\x1b[3;1H\x1bPq"1;1;20;64#0~\x1b\\\x1b[1;4r\x1b[4;1H\n\n')
+    ds_snap = decstbm_sx.snapshot()
+    assert len(ds_snap.placements) == 1
+    assert ds_snap.placements[0].occupies_abs(ds_snap.scrolled_total + 4, 0) is True
+    assert ds_snap.placements[0].occupies_abs(ds_snap.scrolled_total + 2, 0) is False
+
+    # Spanning scrollback + DECSTBM top==0 preserves viewport/history visibility.
+    span_sx = libvt.Terminal(
+        rows=6, cols=10, scrollback=10, profile=Profile.tmux("next-3.9")
+    )
+    span_sx.feed(b'\x1b[1;4r\x1b[4;1H\x1bPq"1;1;16;80#0!16~\x1b\\\n')
+    span_snap = span_sx.snapshot()
+    assert span_snap.placements[0].occupies_abs(span_snap.scrolled_total - 1, 0) is True
+    assert span_snap.placements[0].occupies_abs(span_snap.scrolled_total, 0) is True
+
+    # Placement inside DECSTBM 1;4r scrolls into scrollback instead of clipping.
+    hist_sx = libvt.Terminal(
+        rows=6, cols=10, scrollback=10, profile=Profile.tmux("next-3.9")
+    )
+    hist_sx.feed(
+        b'\x1b[1;4r\x1b[1;1HROW0\r\nROW1\x1b[1;1H\x1bPq"1;1;16;32#0!16~\x1b\\\x1b[4;1H\n\n'
+    )
+    assert len(hist_sx.snapshot().placements) == 1
+    assert hist_sx.snapshot().placements[0].abs_row == 0
+
+    rz_gfx = libvt.Terminal(rows=6, cols=10, scrollback=10)
+    rz_gfx.feed(b'\x1b[2;4r\x1b[1;1H\x1bPq"1;1;20;20#0~\x1b\\')
+    rz_gfx.resize(rows=6, cols=12)
+    assert (rz_gfx.screen.scroll_region.top, rz_gfx.screen.scroll_region.bottom) == (
+        0,
+        5,
+    )
+    assert len(rz_gfx.snapshot().placements) == 1
+    assert len(rz_gfx.snapshot().images) == 1
+    rz_gfx.feed(b"\x1b[6;1H" + b"\n" * 6)
+    rz_gfx.resize(rows=8, cols=12)
+    assert len(rz_gfx.snapshot().placements) == 1
+
+    pin_term = libvt.Terminal(rows=4, cols=6, scrollback=10)
+    raw_1cell = base64.b64encode(b"\xff" * (8 * 16 * 3))
+    pin_term.feed(
+        b"012345$"
+        b"\x1b]133;A\x07"
+        b"\x1b_Ga=T,f=24,s=8,v=16,i=42,p=1;" + raw_1cell + b"\x1b\\"
+        b"ok\x1b]133;B\x07"
+    )
+    assert (pin_term.prompt_zones[0].abs_row, pin_term.prompt_zones[0].col) == (1, 1)
+    assert (pin_term.prompt_zones[1].abs_row, pin_term.prompt_zones[1].col) == (1, 4)
+    assert (pin_term.placements[0].abs_row, pin_term.placements[0].col) == (1, 1)
+    pin_term.resize(rows=4, cols=12)
+    pin_snap = pin_term.snapshot()
+    assert pin_snap[0].text == "012345$ ok"
+    assert (pin_snap.prompt_zones[0].abs_row, pin_snap.prompt_zones[0].col) == (0, 7)
+    assert (pin_snap.prompt_zones[1].abs_row, pin_snap.prompt_zones[1].col) == (0, 10)
+    assert (pin_snap.placements[0].abs_row, pin_snap.placements[0].col) == (0, 7)
+
+    # Unnumbered relative children, out-of-order chains, and U=1 replacement.
+    rel_term = libvt.Terminal(rows=6, cols=6, scrollback=10)
+    rel_term.feed(
+        b"012345$"
+        b"\x1b_Ga=T,f=24,s=8,v=16,i=1,p=1;" + raw_1cell + b"\x1b\\"
+        b"\x1b_Ga=t,f=24,s=8,v=16,i=2;" + raw_1cell + b"\x1b\\"
+        b"\x1b_Ga=t,f=24,s=8,v=16,i=3;" + raw_1cell + b"\x1b\\"
+        b"\x1b_Ga=p,i=2,P=1,Q=1,H=1,V=0\x1b\\"
+        b"\x1b_Ga=p,i=2,P=1,Q=1,H=3,V=2\x1b\\"
+        b"\x1b_Ga=p,i=2,p=1,P=1,Q=1,H=1,V=1\x1b\\"
+        b"\x1b_Ga=p,i=3,p=1,P=2,Q=1,H=1,V=1\x1b\\"
+        b"\x1b_Ga=p,i=2,p=1,P=1,Q=1,H=1,V=1\x1b\\"
+    )
+    rel_term.resize(rows=6, cols=12)
+    coords = {
+        (p.image_id, p.placement_id, p.abs_row, p.col) for p in rel_term.placements
+    }
+    assert coords == {
+        (1, 1, 0, 7),
+        (2, 0, 0, 8),
+        (2, 0, 2, 10),
+        (2, 1, 1, 8),
+        (3, 1, 2, 9),
+    }
+    rel_term.feed(b"\x1b_Ga=p,U=1,i=1,p=1\x1b\\")
+    assert [p.virtual for p in rel_term.placements] == [True]
+
+    # Width shrink clips SIXEL cols/mask; height shrink clips bottom placements/zones.
+    shrink_sx = libvt.Terminal(rows=4, cols=10, profile=Profile.tmux("next-3.9"))
+    shrink_sx.feed(b'\x1bPq"1;1;48;16#0!48~\x1b\\')
+    shrink_sx.resize(rows=4, cols=3)
+    assert shrink_sx.placements[0].cols == 3
+    shrink_sx.feed(b"\x1b[1;1H\x1b[2K")
+    assert shrink_sx.placements == ()
+
+    bot_crop = libvt.Terminal(rows=6, cols=10, scrollback=10)
+    bot_crop.feed(
+        b"\x1b[5;1H\x1b]133;A\x07"
+        b"\x1b_Ga=T,f=24,s=8,v=16,i=9,p=1,C=1;" + raw_1cell + b"\x1b\\\x1b[1;1H"
+    )
+    bot_crop.resize(rows=2, cols=12)
+    assert bot_crop.placements == ()
+    assert bot_crop.prompt_zones == ()
+
+    tall_evict = libvt.Terminal(
+        rows=4, cols=6, scrollback=2, profile=Profile.tmux("next-3.9")
+    )
+    tall_evict.feed(
+        b'\x1b[1;1H\x1bPq"1;1;16;64#0!16~\x1b\\\x1b[1;1H0123456789AB\x1b[4;1H\n\n'
+    )
+    tall_evict.resize(rows=4, cols=2)
+    te_snap = tall_evict.snapshot()
+    assert len(te_snap.placements) == 1
+    assert te_snap.at_abs(te_snap.placements[0].abs_row) is not None
+
+    # ED 3 clips straddling placements at scrolled_total; Kitty P= rejects SIXEL IDs.
+    ed3_sx = libvt.Terminal(
+        rows=4, cols=6, scrollback=2, profile=Profile.tmux("next-3.9")
+    )
+    ed3_sx.feed(b'\x1b[1;1H\x1bPq"1;1;16;64#0!16~\x1b\\\x1b[4;1H\n\x1b[3J')
+    ed3_snap = ed3_sx.snapshot()
+    assert ed3_snap.placements[0].abs_row == ed3_snap.evicted_total
+    assert ed3_snap.placements[0].occupies_abs(0, 0) is False
+    assert ed3_snap.at_abs(ed3_snap.placements[0].abs_row) is not None
+    sx_auto_id = ed3_snap.placements[0].image_id
+    ed3_sx.feed(
+        b"\x1b_Ga=t,f=24,s=8,v=16,i=1;"
+        + raw_1cell
+        + f"\x1b\\\x1b_Ga=p,i=1,p=1,P={sx_auto_id},V=1\x1b\\".encode()
+    )
+    assert b"ENOPARENT" in ed3_sx.drain_replies()
+
     sixel_seq = b'\x1bP0;1;0q"1;1;16;32#0!16~-#0!16~-#0!16~-#0!16~-#0!16~\x1b\\'
     vt_sixel = libvt.Terminal(rows=6, cols=10, profile=Profile.tmux("next-3.9"))
     vt_sixel.feed(sixel_seq)

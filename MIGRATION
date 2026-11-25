@@ -13,3 +13,59 @@ Migration and deprecation notes for `libvt` are recorded here; see
 <!-- KEEP THIS PLACEHOLDER - DO NOT REMOVE OR MODIFY THIS LINE -->
 _Detailed migration steps for the next version will be posted here._
 <!-- END PLACEHOLDER - ADD NEW MIGRATION ENTRIES BELOW THIS LINE -->
+
+### `MouseEvent.pixel_x` and `pixel_y` default to `None` (#26)
+
+{attr}`~libvt.input.MouseEvent.pixel_x` and
+{attr}`~libvt.input.MouseEvent.pixel_y` now have type `int | None = None` so
+`?1016` SGR-Pixel encoding derives cell-center coordinates when omitted; pass
+`pixel_x=0, pixel_y=0` explicitly when origin `(0, 0)` pixels are intended:
+
+```python
+# Before
+ev = MouseEvent(button=MouseButton.LEFT, action=MouseAction.PRESS, row=2, col=3)
+
+# After (explicit origin pixels)
+ev = MouseEvent(
+    button=MouseButton.LEFT,
+    action=MouseAction.PRESS,
+    row=2,
+    col=3,
+    pixel_x=0,
+    pixel_y=0,
+)
+```
+
+### `CSI 5:3 m` overline scoped to `tmux` capture decoding (#18)
+
+{func}`~libvt.parser.parse_sgr` and live {meth}`~libvt.terminal.Terminal.feed`
+no longer treat `CSI 5:3 m` as overline (or blink); emit standard `CSI 53 m` on
+live VT streams and pass `tmux capture-pane -e` output through
+{func}`~libvt.tmux.decode_tmux_capture` or
+{meth}`~libvt.terminal.Terminal.from_tmux_capture`:
+
+```python
+# Before
+term.feed(b"\x1b[5:3moverline\x1b[0m")
+
+# After
+term.feed(b"\x1b[53moverline\x1b[0m")
+cap_term = Terminal.from_tmux_capture(["\x1b[5:3moverline\x1b[0m"])
+```
+
+### Opaque `SyncToken` watermarks (#22)
+
+{class}`~libvt.terminal.SyncToken` no longer exposes internal watermark fields
+or direct construction; obtain tokens from
+{meth}`~libvt.terminal.Terminal.sync_token` or
+{attr}`~libvt.terminal.ScreenDelta.token` and inspect terminal state via
+{attr}`~libvt.terminal.ScreenDelta.snapshot`:
+
+```python
+# Before
+cur = tok.cursor
+
+# After
+delta = term.changes_since(tok)
+cur = delta.snapshot.cursor
+```

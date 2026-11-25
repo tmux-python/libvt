@@ -12,14 +12,14 @@ from dataclasses import dataclass
 
 from libvt._grid import (
     _EMPTY_FROZEN_HISTORY,
-    _WIDTH_CLEAR_MASK,
+    _PEN_BASE_MASK,
     FrozenRow,
     RowLike,
     _CellExt,
     _FrozenHistory,
     _HistoryBuffer,
     _Row,
-    bump_row_gen,
+    _RowGenCounter,
     raw_width_bits,
     unpack_style,
     unpack_width_role,
@@ -165,7 +165,7 @@ class RowRun:
 
 
 def _materialize_cell(row: RowLike, col: int) -> Cell:
-    ch = row.chars[col] if isinstance(row, _Row) else row.char_at(col)
+    ch = row.char_at(col)
     word = row.attr_at(col)
     if word == 0 and ch == " ":
         return BLANK_CELL
@@ -355,11 +355,7 @@ class RowView(collections.abc.Sequence[Cell]):
         self._row = row
         self._screen = screen
         self._row_idx = row_idx
-        total_cols = (
-            screen.cols
-            if screen is not None
-            else (len(row.chars) if isinstance(row, _Row) else row.cols)
-        )
+        total_cols = screen.cols if screen is not None else row.cols
         self._col_range = range(total_cols) if col_range is None else col_range
 
     def _current_row(self) -> RowLike:
@@ -376,19 +372,18 @@ class RowView(collections.abc.Sequence[Cell]):
     def text(self) -> str:
         """Return right-trimmed rendered text for this row slice."""
         row = self._current_row()
-        total_cols = len(row.chars) if isinstance(row, _Row) else row.cols
-        if self._col_range.start == 0 and self._col_range.stop == total_cols:
-            return row.rstrip_text()
         row_t_used = (
             row.text_used
             if isinstance(row, _Row)
             else (len(row.cells) if row.cells is not None else len(row.text))
         )
+        if self._col_range.start == 0 and self._col_range.stop >= row_t_used:
+            return row.rstrip_text()
         limit = min(self._col_range.stop, row_t_used)
         if limit <= self._col_range.start:
             return ""
         if isinstance(row, _Row):
-            raw = "".join(row.chars[self._col_range.start : limit])
+            raw = row.slice_text(self._col_range.start, limit)
         else:
             raw = "".join(row.char_at(c) for c in range(self._col_range.start, limit))
         return raw.rstrip(" ")
@@ -418,7 +413,7 @@ class RowView(collections.abc.Sequence[Cell]):
             ext = row.ext_at(c)
             st = unpack_style(word, ext)
             lnk = ext.hyperlink if ext is not None else None
-            ch = row.chars[c] if isinstance(row, _Row) else row.char_at(c)
+            ch = row.char_at(c)
             if st != cur_style or lnk != cur_link:
                 out.append(
                     RowRun(
@@ -484,45 +479,73 @@ class RowView(collections.abc.Sequence[Cell]):
         r2 = other._current_row()
         if r1 is r2 and self._col_range == other._col_range:
             return True
-        c1 = len(r1.chars) if isinstance(r1, _Row) else r1.cols
-        c2 = len(r2.chars) if isinstance(r2, _Row) else r2.cols
         if (
-            self._col_range.start == 0
-            and self._col_range.stop == c1
-            and other._col_range.start == 0
-            and other._col_range.stop == c2
+            self._col_range == other._col_range
+            and self._col_range.start == 0
+            and self._col_range.step == 1
         ):
             f1 = r1.freeze() if isinstance(r1, _Row) else r1
             f2 = r2.freeze() if isinstance(r2, _Row) else r2
-            return f1 == f2
+            if self._col_range.stop >= max(f1.used, f2.used):
+                return _frozen_content_key(f1) == _frozen_content_key(f2)
         if r1.wrapped != r2.wrapped:
             return False
         return all(a == b for a, b in zip(self, other, strict=True))
 
 
-def _row_view_to_full_frozen(value: object) -> FrozenRow | None:
+def _frozen_content_key(
+    fr: FrozenRow,
+) -> tuple[
+    bool,
+    str,
+    tuple[tuple[int, int], ...],
+    tuple[tuple[int, _CellExt], ...],
+    tuple[str, ...] | None,
+]:
+    return (
+        fr.wrapped,
+        fr.text,
+        fr.runs,
+        fr.exts,
+        fr.cells,
+    )
+
+
+def _row_view_to_full_frozen(value: object) -> tuple[int, FrozenRow] | None:
     if not isinstance(value, RowView):
         return None
     r = value._current_row()
-    cols = len(r.chars) if isinstance(r, _Row) else r.cols
-    if value._col_range.start == 0 and value._col_range.stop == cols:
-        return r.freeze() if isinstance(r, _Row) else r
+    fr = r.freeze() if isinstance(r, _Row) else r
+    v_cols = len(value._col_range)
+    if value._col_range.start == 0 and value._col_range.step == 1 and v_cols >= fr.used:
+        return v_cols, fr
     return None
 
 
 class _HistoryView(collections.abc.Sequence[RowView]):
     """Lazy ``O(1)`` immutable sequence view over scrollback :class:`RowView` lines."""
 
-    __slots__ = ("_data", "_range")
+    __slots__ = ("_cols", "_data", "_range")
 
     def __init__(
         self,
         data: _FrozenHistory | None = None,
         index_range: range | None = None,
+        *,
+        cols: int | None = None,
     ) -> None:
         eff = _EMPTY_FROZEN_HISTORY if data is None else data
         self._data = eff
         self._range = range(len(eff)) if index_range is None else index_range
+        self._cols = cols
+
+    def _eff_cols(self, fr: FrozenRow) -> int:
+        if self._cols is None:
+            return fr.cols
+        return max(self._cols, fr.used)
+
+    def _wrap_row(self, fr: FrozenRow) -> RowView:
+        return RowView(fr, range(self._eff_cols(fr)))
 
     def __len__(self) -> int:
         """Return number of scrollback rows in this view."""
@@ -541,34 +564,65 @@ class _HistoryView(collections.abc.Sequence[RowView]):
     def __getitem__(self, index: int | slice) -> RowView | _HistoryView:
         """Index one :class:`RowView` in ``O(1)`` or slice a sub-view."""
         if isinstance(index, slice):
-            return _HistoryView(self._data, self._range[index])
+            return _HistoryView(self._data, self._range[index], cols=self._cols)
         if isinstance(index, bool) or not isinstance(index, int):
             msg = f"history indices must be int or slice, got {type(index).__name__}"
             raise TypeError(msg)
-        return RowView(self._data.at(self._range[index]))
+        return self._wrap_row(self._data.at(self._range[index]))
 
     def __contains__(self, value: object) -> bool:
         """Return ``True`` when *value* matches a scrollback :class:`RowView`."""
         if not isinstance(value, RowView):
             return False
-        target_fr = _row_view_to_full_frozen(value)
-        if target_fr is not None:
-            r = self._range
-            if r.start == 0 and r.stop == len(self._data) and r.step == 1:
-                return any(fr == target_fr for fr in self._data)
+        v_len = len(value)
+        if self._cols is not None and v_len < self._cols:
+            return False
+        full = _row_view_to_full_frozen(value)
+        r = self._range
+        if full is None:
             at = self._data.at
-            return any(at(idx) == target_fr for idx in r)
-        return any(item == value for item in self)
+            return any(
+                self._eff_cols(fr := at(idx)) == v_len and self._wrap_row(fr) == value
+                for idx in r
+            )
+        v_cols, target_fr = full
+        target_key = _frozen_content_key(target_fr)
+        if r.start == 0 and r.stop == len(self._data) and r.step == 1:
+            return any(
+                self._eff_cols(fr) == v_cols and _frozen_content_key(fr) == target_key
+                for fr in self._data
+            )
+        at = self._data.at
+        return any(
+            self._eff_cols(fr := at(idx)) == v_cols
+            and _frozen_content_key(fr) == target_key
+            for idx in r
+        )
 
     def count(self, value: object) -> int:
         """Return count of scrollback rows equal to *value*."""
         if not isinstance(value, RowView):
             return 0
-        target_fr = _row_view_to_full_frozen(value)
-        if target_fr is not None:
-            at = self._data.at
-            return sum(1 for idx in self._range if at(idx) == target_fr)
-        return sum(1 for item in self if item == value)
+        v_len = len(value)
+        if self._cols is not None and v_len < self._cols:
+            return 0
+        full = _row_view_to_full_frozen(value)
+        at = self._data.at
+        if full is None:
+            return sum(
+                1
+                for idx in self._range
+                if self._eff_cols(fr := at(idx)) == v_len
+                and self._wrap_row(fr) == value
+            )
+        v_cols, target_fr = full
+        target_key = _frozen_content_key(target_fr)
+        return sum(
+            1
+            for idx in self._range
+            if self._eff_cols(fr := at(idx)) == v_cols
+            and _frozen_content_key(fr) == target_key
+        )
 
     def index(
         self,
@@ -578,17 +632,26 @@ class _HistoryView(collections.abc.Sequence[RowView]):
     ) -> int:
         """Return first zero-based index of *value* in ``[start, stop)``."""
         if isinstance(value, RowView):
-            sub_indices = range(len(self._range))[start:stop]
-            target_fr = _row_view_to_full_frozen(value)
-            at = self._data.at
-            if target_fr is not None:
-                for pos in sub_indices:
-                    if at(self._range[pos]) == target_fr:
-                        return pos
-            else:
-                for pos in sub_indices:
-                    if RowView(at(self._range[pos])) == value:
-                        return pos
+            v_len = len(value)
+            if self._cols is None or v_len >= self._cols:
+                sub_indices = range(len(self._range))[start:stop]
+                full = _row_view_to_full_frozen(value)
+                at = self._data.at
+                if full is None:
+                    for pos in sub_indices:
+                        fr = at(self._range[pos])
+                        if self._eff_cols(fr) == v_len and self._wrap_row(fr) == value:
+                            return pos
+                else:
+                    v_cols, target_fr = full
+                    target_key = _frozen_content_key(target_fr)
+                    for pos in sub_indices:
+                        fr = at(self._range[pos])
+                        if (
+                            self._eff_cols(fr) == v_cols
+                            and _frozen_content_key(fr) == target_key
+                        ):
+                            return pos
         msg = "RowView is not in history"
         raise ValueError(msg)
 
@@ -599,30 +662,38 @@ class _HistoryView(collections.abc.Sequence[RowView]):
             return
         if r.start == 0 and r.stop == len(self._data) and r.step == 1:
             for fr in self._data:
-                yield RowView(fr)
+                yield self._wrap_row(fr)
             return
         at = self._data.at
         for idx in r:
-            yield RowView(at(idx))
+            yield self._wrap_row(at(idx))
 
     def __reversed__(self) -> collections.abc.Iterator[RowView]:
         """Yield :class:`RowView` items in reverse order."""
         at = self._data.at
         for idx in reversed(self._range):
-            yield RowView(at(idx))
+            yield self._wrap_row(at(idx))
 
     def __eq__(self, other: object) -> bool:
-        """Compare two :class:`_HistoryView` instances by underlying frozen rows."""
+        """Compare two :class:`_HistoryView` instances by view-width rows."""
         if self is other:
             return True
         if not isinstance(other, _HistoryView):
             return NotImplemented
         if len(self._range) != len(other._range):
             return False
-        if self._data is other._data and self._range == other._range:
+        if not self._range:
+            return True
+        if (
+            self._data is other._data
+            and self._range == other._range
+            and self._cols == other._cols
+        ):
             return True
         return all(
-            self._data.at(i) == other._data.at(j)
+            self._eff_cols(f1 := self._data.at(i))
+            == other._eff_cols(f2 := other._data.at(j))
+            and _frozen_content_key(f1) == _frozen_content_key(f2)
             for i, j in zip(self._range, other._range, strict=True)
         )
 
@@ -752,6 +823,7 @@ class Screen:
         "_cur_shape",
         "_cur_visible",
         "_evicted_total",
+        "_gen_counter",
         "_gfx",
         "_history",
         "_history_clear_at",
@@ -760,11 +832,14 @@ class Screen:
         "_max_image_dimension",
         "_max_images",
         "_max_placements",
+        "_modify_other_keys",
+        "_on_mutate",
         "_pending_wrap",
         "_rows",
         "_scrolled_total",
         "_tabstops",
         "_tabstops_sorted",
+        "_top_margin_scrolls_to_history",
         "keyboard_stack",
         "scroll_region",
     )
@@ -781,18 +856,27 @@ class Screen:
         max_placements: int = 1_024,
         max_image_dimension: int = 10_000,
         is_alt: bool = False,
+        top_margin_scrolls_to_history: bool = False,
+        on_mutate: collections.abc.Callable[[bool], None] | None = None,
     ) -> None:
         if rows < 1 or cols < 1:
             msg = f"rows and cols must be >= 1, got ({rows}, {cols})"
             raise ValueError(msg)
         self._cols = cols
-        self._rows: list[_Row] = [_Row(cols) for _ in range(rows)]
+        self._gen_counter: _RowGenCounter = _RowGenCounter()
+        self._on_mutate = on_mutate
+        self._rows: list[_Row] = [
+            _Row(cols, gen_counter=self._gen_counter) for _ in range(rows)
+        ]
         self._history: _HistoryBuffer = _HistoryBuffer(maxlen=max(0, scrollback))
         self._scrolled_total: int = 0
         self._evicted_total: int = 0
         self._history_clear_at: int = 0
         self._history_clear_seq: int = 0
         self._is_alt: bool = is_alt
+        self._top_margin_scrolls_to_history: bool = (
+            top_margin_scrolls_to_history and not is_alt
+        )
         self._cell_height_px: int = max(1, cell_height_px)
         self._max_images: int = max_images
         self._max_placements: int = max_placements
@@ -813,6 +897,12 @@ class Screen:
         self._tabstops: set[int] = set(range(8, cols, 8))
         self._tabstops_sorted: list[int] = sorted(self._tabstops)
         self.keyboard_stack = KittyKeyboardStack(max_depth=keyboard_stack_depth)
+        self._modify_other_keys: int = 0
+
+    def _bind_counter(self, counter: _RowGenCounter) -> None:
+        self._gen_counter = counter
+        for r in self._rows:
+            r.bind_counter(counter, stamp=False)
 
     @property
     def rows(self) -> int:
@@ -843,6 +933,8 @@ class Screen:
 
     @cursor.setter
     def cursor(self, value: Cursor) -> None:
+        if self._on_mutate is not None:
+            self._on_mutate(False)
         self._cur_row = value.row
         self._cur_col = value.col
         self._cur_visible = value.visible
@@ -853,12 +945,17 @@ class Screen:
     @property
     def history(self) -> collections.abc.Sequence[RowView]:
         """Return ``O(1)`` immutable :class:`RowView` sequence over scrollback."""
-        return _HistoryView(self._history.freeze())
+        return _HistoryView(self._history.freeze(), cols=self._cols)
 
     @property
     def tabstops(self) -> tuple[int, ...]:
         """Return sorted horizontal tabstop columns."""
         return tuple(self._tabstops_sorted)
+
+    @property
+    def modify_other_keys(self) -> int:
+        """Return ``XTMODKEYS`` ``modifyOtherKeys`` level (``0``, ``1``, or ``2``)."""
+        return self._modify_other_keys
 
     def add_tabstop(self, col: int) -> None:
         """Set a horizontal tabstop at *col* (``HTS``)."""
@@ -879,6 +976,8 @@ class Screen:
 
     def clear_history(self) -> None:
         """Clear all sealed scrollback rows (``ED 3``)."""
+        if self._on_mutate is not None:
+            self._on_mutate(False)
         self._evicted_total += len(self._history)
         self._history.clear()
         self._history_clear_at = self._scrolled_total
@@ -913,31 +1012,9 @@ class Screen:
             self._evicted_total += 1
 
     def _clear_row_spacer_head(self, row_obj: _Row) -> bool:
-        if not row_obj.has_wide or row_obj.attrs is None:
+        if self._cols <= 0:
             return False
-        last = self._cols - 1
-        if raw_width_bits(row_obj.attrs[last]) == int(WidthRole.SPACER_HEAD):
-            row_obj.chars[last] = " "
-            row_obj.attrs[last] &= _WIDTH_CLEAR_MASK
-            if row_obj.text_used == last + 1:
-                row_obj.text_used = last
-                while (
-                    row_obj.text_used > 0
-                    and row_obj.chars[row_obj.text_used - 1] == " "
-                    and row_obj.attr_at(row_obj.text_used - 1) == 0
-                    and row_obj.ext_at(row_obj.text_used - 1) is None
-                ):
-                    row_obj.text_used -= 1
-            while (
-                row_obj.used > 0
-                and row_obj.chars[row_obj.used - 1] == " "
-                and row_obj.attr_at(row_obj.used - 1) == 0
-                and row_obj.ext_at(row_obj.used - 1) is None
-            ):
-                row_obj.used -= 1
-            bump_row_gen(row_obj)
-            return True
-        return False
+        return row_obj.clear_spacer_head(self._cols - 1)
 
     def heal_before_edit(self, row: int, col_start: int, col_end: int) -> None:
         """Repair cross-row ``SPACER_HEAD`` pairs before mutating cells."""
@@ -960,7 +1037,7 @@ class Screen:
         if row <= 0 or row > len(self._rows):
             return
         prev = self._rows[row - 1]
-        if not prev.has_wide or prev.attrs is None:
+        if not prev.has_wide:
             return
         if row == len(self._rows) or not prev.wrapped:
             if self._clear_row_spacer_head(prev):
@@ -1017,7 +1094,6 @@ class Screen:
         right: int | None = None,
         save_history: bool = True,
         bce_word: int = 0,
-        bce_ext: _CellExt | None = None,
         is_line_op: bool = False,
     ) -> None:
         """Scroll region ``[top..bottom, left..right]`` upward by *count* lines."""
@@ -1026,22 +1102,25 @@ class Screen:
         r_col = (self._cols - 1) if right is None else right
         if count <= 0 or t_row > b_row:
             return
+        if self._on_mutate is not None:
+            self._on_mutate(False)
         shift = min(count, b_row - t_row + 1)
         full_width = left == 0 and r_col == self._cols - 1
         full_screen = full_width and t_row == 0 and b_row == len(self._rows) - 1
 
         if full_width:
             if t_row > 0:
-                if self._rows[t_row - 1].wrapped:
-                    self._rows[t_row - 1].wrapped = False
-                    bump_row_gen(self._rows[t_row - 1])
+                self._rows[t_row - 1].wrapped = False
                 self._clear_row_spacer_head(self._rows[t_row - 1])
             if b_row < len(self._rows) - 1:
-                if self._rows[b_row].wrapped:
-                    self._rows[b_row].wrapped = False
-                    bump_row_gen(self._rows[b_row])
+                self._rows[b_row].wrapped = False
                 self._clear_row_spacer_head(self._rows[b_row])
-            advances_abs = save_history and t_row == 0 and not self._is_alt
+            advances_abs = (
+                save_history
+                and not self._is_alt
+                and (t_row == 0 or self._top_margin_scrolls_to_history)
+            )
+            eff_count = count if full_screen else shift
             has_hist_cap = self._history.maxlen is not None and self._history.maxlen > 0
             hist_adv = shift if (advances_abs and not full_screen) else 0
             if self._gfx is not None and not (full_screen and advances_abs):
@@ -1050,24 +1129,25 @@ class Screen:
                     bottom=b_row,
                     left=left,
                     right=r_col,
-                    delta_rows=-count,
+                    delta_rows=-eff_count,
                     is_scroll=not is_line_op,
                     scrolled_total=self._scrolled_total,
                     cell_height_px=self._cell_height_px,
-                    history_advanced=(
-                        count if (advances_abs and not full_screen) else 0
-                    ),
+                    history_advanced=hist_adv,
                 )
             evicted = self._rows[t_row : t_row + shift]
             if advances_abs:
+                if t_row > 0 and evicted:
+                    evicted[-1].wrapped = False
+                    self._clear_row_spacer_head(evicted[-1])
                 if has_hist_cap:
                     for row_ev in evicted:
                         self._append_history(row_ev.freeze())
-                    extra = count - shift
+                    extra = eff_count - shift
                     if extra > 0:
                         maxlen = self._history.maxlen or 0
                         blank_row = _Row(self._cols)
-                        blank_row.reset_blank(self._cols, bce_word, bce_ext)
+                        blank_row.reset_blank(self._cols, bce_word)
                         blank_frozen = blank_row.freeze()
                         skip_evict = max(0, extra - maxlen)
                         if skip_evict > 0:
@@ -1076,20 +1156,21 @@ class Screen:
                         for _ in range(extra - skip_evict):
                             self._append_history(blank_frozen)
                 else:
-                    self._evicted_total += count
-                self._scrolled_total += count
+                    self._evicted_total += eff_count
+                self._scrolled_total += eff_count
                 if self._gfx is not None:
                     self._gfx.reap_evicted_history(
                         self._scrolled_total - len(self._history),
                     )
             del self._rows[t_row : t_row + shift]
             for row_ev in evicted:
-                row_ev.reset_blank(self._cols, bce_word, bce_ext)
+                row_ev.reset_blank(self._cols, bce_word)
             self._rows[b_row - shift + 1 : b_row - shift + 1] = evicted
             if not (full_screen and advances_abs):
+                stamp_start = 0 if hist_adv > 0 else t_row
                 stamp_end = len(self._rows) if hist_adv > 0 else (b_row + 1)
-                for idx_s in range(t_row, stamp_end):
-                    bump_row_gen(self._rows[idx_s])
+                for idx_s in range(stamp_start, stamp_end):
+                    self._rows[idx_s].stamp()
             return
 
         if self._gfx is not None:
@@ -1108,26 +1189,24 @@ class Screen:
             dst_row = self._rows[dst_r]
             dst_row.wrapped = False
             self._clear_row_spacer_head(dst_row)
-            if dst_r > 0 and left <= 1:
-                self._clear_row_spacer_head(self._rows[dst_r - 1])
-            dst_row._heal_wide_boundary(left)
-            dst_row._heal_wide_boundary(r_col)
-            src_row._heal_wide_boundary(left)
-            src_row._heal_wide_boundary(r_col)
-            for c in range(left, r_col + 1):
-                word = src_row.attr_at(c)
-                role = unpack_width_role(word)
-                base = word & _WIDTH_CLEAR_MASK
-                dst_row._set_raw(c, src_row.chars[c], base, role, src_row.ext_at(c))
-            _sync_partial_scroll_bounds(dst_row, src_row, left, r_col)
-            bump_row_gen(dst_row)
+            if (
+                dst_r > 0
+                and left <= 1
+                and self._clear_row_spacer_head(self._rows[dst_r - 1])
+            ):
+                self._rows[dst_r - 1].wrapped = False
+            dst_row.copy_region_from(src_row, left, r_col)
 
         for clr_r in range(b_row - shift + 1, b_row + 1):
             self._rows[clr_r].wrapped = False
             self._clear_row_spacer_head(self._rows[clr_r])
-            if clr_r > 0 and left <= 1:
-                self._clear_row_spacer_head(self._rows[clr_r - 1])
-            self._rows[clr_r].clear_range(left, r_col + 1, bce_word, bce_ext)
+            if (
+                clr_r > 0
+                and left <= 1
+                and self._clear_row_spacer_head(self._rows[clr_r - 1])
+            ):
+                self._rows[clr_r - 1].wrapped = False
+            self._rows[clr_r].clear_range(left, r_col + 1, bce_word, None)
 
     def scroll_down(
         self,
@@ -1138,7 +1217,6 @@ class Screen:
         left: int = 0,
         right: int | None = None,
         bce_word: int = 0,
-        bce_ext: _CellExt | None = None,
         is_line_op: bool = False,
     ) -> None:
         """Scroll region ``[top..bottom, left..right]`` downward by *count* lines."""
@@ -1147,6 +1225,8 @@ class Screen:
         r_col = (self._cols - 1) if right is None else right
         if count <= 0 or t_row > b_row:
             return
+        if self._on_mutate is not None:
+            self._on_mutate(False)
         shift = min(count, b_row - t_row + 1)
         full_width = left == 0 and r_col == self._cols - 1
 
@@ -1164,22 +1244,17 @@ class Screen:
 
         if full_width:
             if t_row > 0:
-                if self._rows[t_row - 1].wrapped:
-                    self._rows[t_row - 1].wrapped = False
-                    bump_row_gen(self._rows[t_row - 1])
+                self._rows[t_row - 1].wrapped = False
                 self._clear_row_spacer_head(self._rows[t_row - 1])
             recycled = self._rows[b_row - shift + 1 : b_row + 1]
             del self._rows[b_row - shift + 1 : b_row + 1]
             for row_ev in recycled:
-                row_ev.reset_blank(self._cols, bce_word, bce_ext)
+                row_ev.reset_blank(self._cols, bce_word)
             self._rows[t_row:t_row] = recycled
-            if b_row < len(self._rows) - 1:
-                if self._rows[b_row].wrapped:
-                    self._rows[b_row].wrapped = False
-                    bump_row_gen(self._rows[b_row])
-                self._clear_row_spacer_head(self._rows[b_row])
+            self._rows[b_row].wrapped = False
+            self._clear_row_spacer_head(self._rows[b_row])
             for idx_s in range(t_row, b_row + 1):
-                bump_row_gen(self._rows[idx_s])
+                self._rows[idx_s].stamp()
             return
 
         for dst_r in range(b_row, t_row + shift - 1, -1):
@@ -1187,35 +1262,34 @@ class Screen:
             dst_row = self._rows[dst_r]
             dst_row.wrapped = False
             self._clear_row_spacer_head(dst_row)
-            if dst_r > 0 and left <= 1:
-                self._clear_row_spacer_head(self._rows[dst_r - 1])
-            dst_row._heal_wide_boundary(left)
-            dst_row._heal_wide_boundary(r_col)
-            src_row._heal_wide_boundary(left)
-            src_row._heal_wide_boundary(r_col)
-            for c in range(left, r_col + 1):
-                word = src_row.attr_at(c)
-                role = unpack_width_role(word)
-                base = word & _WIDTH_CLEAR_MASK
-                dst_row._set_raw(c, src_row.chars[c], base, role, src_row.ext_at(c))
-            _sync_partial_scroll_bounds(dst_row, src_row, left, r_col)
-            bump_row_gen(dst_row)
+            if (
+                dst_r > 0
+                and left <= 1
+                and self._clear_row_spacer_head(self._rows[dst_r - 1])
+            ):
+                self._rows[dst_r - 1].wrapped = False
+            dst_row.copy_region_from(src_row, left, r_col)
 
         for clr_r in range(t_row, t_row + shift):
             self._rows[clr_r].wrapped = False
             self._clear_row_spacer_head(self._rows[clr_r])
-            if clr_r > 0 and left <= 1:
-                self._clear_row_spacer_head(self._rows[clr_r - 1])
-            self._rows[clr_r].clear_range(left, r_col + 1, bce_word, bce_ext)
+            if (
+                clr_r > 0
+                and left <= 1
+                and self._clear_row_spacer_head(self._rows[clr_r - 1])
+            ):
+                self._rows[clr_r - 1].wrapped = False
+            self._rows[clr_r].clear_range(left, r_col + 1, bce_word, None)
 
     def push_scrollback_and_clear(
         self,
         bce_word: int = 0,
-        bce_ext: _CellExt | None = None,
         *,
         include_cursor_row: bool = True,
     ) -> None:
         """Push active lines up to last non-blank row into history."""
+        if self._on_mutate is not None:
+            self._on_mutate(False)
         last_used = -1
         for idx in range(len(self._rows) - 1, -1, -1):
             has_img = self._gfx is not None and self._gfx.has_placement_on_row(
@@ -1230,6 +1304,8 @@ class Screen:
                 last_used = idx
                 break
         if last_used >= 0 and not self._is_alt:
+            self._rows[last_used].wrapped = False
+            self._clear_row_spacer_head(self._rows[last_used])
             if self._history.maxlen is not None and self._history.maxlen > 0:
                 for idx in range(last_used + 1):
                     self._append_history(self._rows[idx].freeze())
@@ -1243,75 +1319,176 @@ class Screen:
         elif self._gfx is not None:
             self._gfx.clear_active_screen(self._scrolled_total, len(self._rows))
         for r in self._rows:
-            r.reset_blank(self._cols, bce_word, bce_ext)
+            r.reset_blank(self._cols, bce_word)
 
-    def _reflow_primary(self, *, rows: int, cols: int) -> None:
-        hist_thawed = [fr.thaw() for fr in self._history]
-        hist_len = len(hist_thawed)
+    def _reflow_primary(
+        self,
+        *,
+        rows: int,
+        cols: int,
+        extra_pins: collections.abc.Sequence[tuple[int, int]] = (),
+    ) -> tuple[tuple[int, int], ...]:
+        hist_rows = list(self._history.freeze())
+        hist_len = len(hist_rows)
+        old_first_abs = self._scrolled_total - hist_len
 
-        # Trim trailing unwritten blank rows strictly below the cursor.
         last_active = self._cur_row
         for r_idx in range(len(self._rows) - 1, self._cur_row, -1):
             if self._rows[r_idx].used > 0 or self._rows[r_idx].wrapped:
                 last_active = r_idx
                 break
 
-        combined = hist_thawed + self._rows[: last_active + 1]
+        total = hist_len + last_active + 1
         cur_abs_idx = hist_len + self._cur_row
         eff_cur_col = self._cur_col + (1 if self._pending_wrap else 0)
 
-        new_all: list[_Row] = []
+        gfx_roots = self._gfx.root_placement_pins() if self._gfx is not None else []
+        n_extra = len(extra_pins)
+        all_pins: list[tuple[int, int]] = list(extra_pins)
+        for _, g_abs, g_col in gfx_roots:
+            all_pins.append((g_abs, g_col))
+
+        mapped_out: list[tuple[int, int] | None] = [None] * len(all_pins)
+        pins_by_row: dict[int, list[tuple[int, int]]] = {}
+        for p_idx, (p_abs, p_col) in enumerate(all_pins):
+            rel_in = p_abs - old_first_abs
+            if 0 <= rel_in < total:
+                pins_by_row.setdefault(rel_in, []).append((p_idx, p_col))
+
+        new_all: list[RowLike] = []
         new_cur_abs = 0
         new_cur_col = 0
         new_pending_wrap = False
         cursor_placed = False
 
         idx = 0
-        total = len(combined)
         while idx < total:
+            if idx < hist_len:
+                fr = hist_rows[idx]
+                if not fr.wrapped:
+                    fr_t_cols = len(fr.cells) if fr.cells is not None else len(fr.text)
+                    fr_used = (
+                        fr_t_cols
+                        if (not fr.runs and not fr.exts)
+                        else max(
+                            fr_t_cols,
+                            fr.runs[-1][0] if fr.runs else 0,
+                            (fr.exts[-1][0] + 1) if fr.exts else 0,
+                        )
+                    )
+                    if fr_used <= cols:
+                        out_idx = len(new_all)
+                        new_all.append(fr)
+                        if pins_by_row:
+                            row_ps = pins_by_row.get(idx)
+                            if row_ps is not None:
+                                for p_idx, p_col in row_ps:
+                                    mapped_out[p_idx] = (
+                                        out_idx,
+                                        min(cols - 1, max(0, p_col)),
+                                    )
+                        idx += 1
+                        continue
+
             group_start = idx
-            while idx + 1 < total and combined[idx].wrapped:
+            while idx + 1 < total:
+                cur_src = (
+                    hist_rows[idx] if idx < hist_len else self._rows[idx - hist_len]
+                )
+                if not cur_src.wrapped:
+                    break
                 idx += 1
             group_end = idx
             idx += 1
 
-            if group_start <= cur_abs_idx < group_end and eff_cur_col >= len(
-                combined[cur_abs_idx].chars
-            ):
-                cur_abs_idx += 1
-                eff_cur_col = 0
+            if group_start <= cur_abs_idx < group_end:
+                cur_r_src = (
+                    hist_rows[cur_abs_idx]
+                    if cur_abs_idx < hist_len
+                    else self._rows[cur_abs_idx - hist_len]
+                )
+                cur_r_cols = cur_r_src.cols
+                if eff_cur_col >= cur_r_cols:
+                    cur_abs_idx += 1
+                    eff_cur_col = 0
 
-            # Extract real logical cells across [group_start .. group_end].
             cells: list[tuple[str, int, int, _CellExt | None, int]] = []
+            cell_pins: dict[int, list[tuple[int, int]]] = {}
+            carried_pins: list[int] = []
+            after_group_pins: list[tuple[int, int]] = []
             cur_after_extra: int | None = None
             carry_cur = False
+
             for r_i in range(group_start, group_end + 1):
-                src = combined[r_i]
+                src = hist_rows[r_i] if r_i < hist_len else self._rows[r_i - hist_len]
                 is_last = r_i == group_end
-                src_t_used = src.text_used if isinstance(src, _Row) else len(src.text)
-                row_limit = len(src.chars) if not is_last else src_t_used
+                src_cols = src.cols
+                src_t_used = (
+                    src.text_used
+                    if isinstance(src, _Row)
+                    else (len(src.cells) if src.cells is not None else len(src.text))
+                )
+                row_limit = src_cols if not is_last else src_t_used
                 if r_i == cur_abs_idx and eff_cur_col >= row_limit:
                     cur_after_extra = eff_cur_col - row_limit
+
+                row_ps = pins_by_row.get(r_i)
+                col_pins_map: dict[int, list[int]] | None = None
+                if row_ps is not None:
+                    col_pins_map = {}
+                    for p_idx, p_col in row_ps:
+                        eff_pc = max(0, p_col)
+                        if eff_pc >= row_limit:
+                            if is_last:
+                                after_group_pins.append((p_idx, eff_pc - row_limit))
+                            else:
+                                carried_pins.append(p_idx)
+                        else:
+                            col_pins_map.setdefault(eff_pc, []).append(p_idx)
+
                 for c_i in range(row_limit):
                     word = src.attr_at(c_i)
                     rb = raw_width_bits(word)
                     is_cur = r_i == cur_abs_idx and c_i == eff_cur_col
+                    here_pins = (
+                        col_pins_map.get(c_i) if col_pins_map is not None else None
+                    )
                     if rb == int(WidthRole.SPACER_HEAD):
                         if is_cur:
                             carry_cur = True
+                        if here_pins:
+                            carried_pins.extend(here_pins)
                         continue
                     if rb == int(WidthRole.SPACER_TAIL):
                         if is_cur and cells:
                             p_ch, p_w, p_cw, p_ext, _ = cells[-1]
                             cells[-1] = (p_ch, p_w, p_cw, p_ext, 1)
+                        if here_pins:
+                            if cells:
+                                prev_k = len(cells) - 1
+                                tgt = cell_pins.setdefault(prev_k, [])
+                                for p_idx in here_pins:
+                                    tgt.append((p_idx, 1))
+                            else:
+                                carried_pins.extend(here_pins)
                         continue
                     cw = 2 if rb == int(WidthRole.WIDE) else 1
-                    base_word = word & _WIDTH_CLEAR_MASK
+                    base_word = word & _PEN_BASE_MASK
                     cur_off = 0 if (is_cur or carry_cur) else -1
                     carry_cur = False
+                    cell_k = len(cells)
+                    if carried_pins or here_pins:
+                        tgt = cell_pins.setdefault(cell_k, [])
+                        for p_idx in carried_pins:
+                            tgt.append((p_idx, 0))
+                        carried_pins.clear()
+                        if here_pins:
+                            for p_idx in here_pins:
+                                tgt.append((p_idx, 0))
+                    ch_val = src.char_at(c_i)
                     cells.append(
                         (
-                            src.chars[c_i],
+                            ch_val,
                             base_word,
                             cw,
                             src.ext_at(c_i),
@@ -1320,20 +1497,25 @@ class Screen:
                     )
 
             if not cells:
-                empty_row = _Row(cols)
+                empty_row = _Row(cols, gen_counter=self._gen_counter)
                 new_all.append(empty_row)
+                out_idx = len(new_all) - 1
                 if group_start <= cur_abs_idx <= group_end and not cursor_placed:
                     extra = 0 if cur_after_extra is None else cur_after_extra
-                    new_cur_abs = len(new_all) - 1
+                    new_cur_abs = out_idx
                     new_cur_col = min(cols - 1, extra)
                     new_pending_wrap = False
                     cursor_placed = True
+                for p_idx in carried_pins:
+                    mapped_out[p_idx] = (out_idx, 0)
+                for p_idx, p_extra in after_group_pins:
+                    mapped_out[p_idx] = (out_idx, min(cols - 1, p_extra))
                 continue
 
-            cur_out = _Row(cols)
+            cur_out = _Row(cols, gen_counter=self._gen_counter)
             new_all.append(cur_out)
             out_col = 0
-            for ch, base_w, cw, ce, cur_off in cells:
+            for cell_k, (ch, base_w, cw, ce, cur_off) in enumerate(cells):
                 eff_cw = cw
                 eff_ch = ch
                 if eff_cw == 2 and cols == 1:
@@ -1344,15 +1526,24 @@ class Screen:
                     if out_col < cols:
                         cur_out.write_spacer_head(out_col, 0, None)
                     cur_out.wrapped = True
-                    cur_out = _Row(cols)
+                    cur_out = _Row(cols, gen_counter=self._gen_counter)
                     new_all.append(cur_out)
                     out_col = 0
 
+                out_idx = len(new_all) - 1
                 if cur_off >= 0 and not cursor_placed:
-                    new_cur_abs = len(new_all) - 1
+                    new_cur_abs = out_idx
                     new_cur_col = min(cols - 1, out_col + cur_off)
                     new_pending_wrap = False
                     cursor_placed = True
+
+                c_ps = cell_pins.get(cell_k)
+                if c_ps is not None:
+                    for p_idx, p_off in c_ps:
+                        mapped_out[p_idx] = (
+                            out_idx,
+                            min(cols - 1, out_col + p_off),
+                        )
 
                 if eff_cw == 2:
                     cur_out.write_wide(out_col, eff_ch, base_w, ce)
@@ -1361,9 +1552,18 @@ class Screen:
                     cur_out.write_narrow(out_col, eff_ch, base_w, ce)
                     out_col += 1
 
+            last_out_idx = len(new_all) - 1
+            for p_idx in carried_pins:
+                mapped_out[p_idx] = (last_out_idx, min(cols - 1, out_col))
+            for p_idx, p_extra in after_group_pins:
+                mapped_out[p_idx] = (
+                    last_out_idx,
+                    min(cols - 1, out_col + p_extra),
+                )
+
             if (cur_after_extra is not None or carry_cur) and not cursor_placed:
                 extra = 0 if cur_after_extra is None else cur_after_extra
-                new_cur_abs = len(new_all) - 1
+                new_cur_abs = last_out_idx
                 if extra == 0 and out_col == cols:
                     new_cur_col = cols - 1
                     new_pending_wrap = True
@@ -1373,51 +1573,111 @@ class Screen:
                 cursor_placed = True
 
         if not new_all:
-            new_all.append(_Row(cols))
+            new_all.append(_Row(cols, gen_counter=self._gen_counter))
+
+        last_in_abs = old_first_abs + total - 1
+        last_out_base = len(new_all) - 1
+        for p_idx, (p_abs, p_col) in enumerate(all_pins):
+            if p_abs > last_in_abs:
+                mapped_out[p_idx] = (
+                    last_out_base + (p_abs - last_in_abs),
+                    min(cols - 1, max(0, p_col)),
+                )
 
         hist_cut = max(0, len(new_all) - rows)
         hist_cut = min(hist_cut, new_cur_abs)
 
         prev_scrolled = self._scrolled_total
         prev_evicted = self._evicted_total
-        self._history.clear()
-        self._evicted_total = 0
-        if self._history.maxlen is not None and self._history.maxlen > 0:
-            for r_h in new_all[:hist_cut]:
-                self._append_history(r_h.freeze())
-        hist_len = len(self._history)
+        evicted_in_reflow = self._history.replace_all(new_all[:hist_cut])
+        new_hist_len = len(self._history)
         new_evicted = max(
-            prev_evicted + (hist_cut - hist_len),
-            prev_scrolled - hist_len,
+            prev_evicted + evicted_in_reflow,
+            prev_scrolled - new_hist_len,
         )
         self._evicted_total = new_evicted
-        self._scrolled_total = new_evicted + hist_len
+        self._scrolled_total = new_evicted + new_hist_len
 
-        viewport = new_all[hist_cut : hist_cut + rows]
+        viewport: list[_Row] = [
+            (
+                r_v.thaw(cols, gen_counter=self._gen_counter)
+                if isinstance(r_v, FrozenRow)
+                else r_v
+            )
+            for r_v in new_all[hist_cut : hist_cut + rows]
+        ]
         while len(viewport) < rows:
-            viewport.append(_Row(cols))
+            viewport.append(_Row(cols, gen_counter=self._gen_counter))
         for r_v in viewport:
-            bump_row_gen(r_v)
+            r_v.bind_counter(self._gen_counter)
         self._rows = viewport
-        if self._gfx is not None:
-            self._gfx.reset()
         self._cols = cols
         self._cur_row = max(0, min(rows - 1, new_cur_abs - hist_cut))
         self._cur_col = max(0, min(cols - 1, new_cur_col))
         self._pending_wrap = new_pending_wrap
 
-    def resize(self, *, rows: int, cols: int, reflow: bool = True) -> None:
-        """Resize screen to ``(rows, cols)``, optionally reflowing soft wraps."""
+        if not all_pins:
+            if self._gfx is not None:
+                self._gfx.apply_reflow_pins(
+                    (),
+                    new_cols=cols,
+                    min_retained_abs_row=self._evicted_total,
+                    max_abs=self._scrolled_total + rows,
+                )
+            return ()
+
+        final_pins: list[tuple[int, int]] = []
+        new_first_abs = self._scrolled_total - hist_cut
+        for p_idx, (old_abs, old_col) in enumerate(all_pins):
+            m_pair = mapped_out[p_idx]
+            if m_pair is None:
+                if old_abs < old_first_abs:
+                    mapped_abs = new_first_abs + (old_abs - old_first_abs)
+                else:
+                    mapped_abs = old_abs
+                final_pins.append((mapped_abs, min(cols - 1, max(0, old_col))))
+            else:
+                out_r, new_c = m_pair
+                final_pins.append((new_first_abs + out_r, new_c))
+
+        if self._gfx is not None:
+            remapped_gfx = [
+                (gfx_idx, final_pins[n_extra + k][0], final_pins[n_extra + k][1])
+                for k, (gfx_idx, _, _) in enumerate(gfx_roots)
+            ]
+            self._gfx.apply_reflow_pins(
+                remapped_gfx,
+                new_cols=cols,
+                min_retained_abs_row=self._evicted_total,
+                max_abs=self._scrolled_total + rows,
+            )
+
+        return tuple(final_pins[:n_extra])
+
+    def _resize_with_pins(
+        self,
+        *,
+        rows: int,
+        cols: int,
+        reflow: bool = True,
+        extra_pins: collections.abc.Sequence[tuple[int, int]] = (),
+    ) -> tuple[tuple[int, int], ...]:
         if rows < 1 or cols < 1:
             msg = f"rows and cols must be >= 1, got ({rows}, {cols})"
             raise ValueError(msg)
 
         old_cols = self._cols
         if rows == len(self._rows) and cols == old_cols:
-            return
+            return tuple(extra_pins)
+        if self._on_mutate is not None:
+            self._on_mutate(True)
 
         if reflow and cols != old_cols:
-            self._reflow_primary(rows=rows, cols=cols)
+            remapped = self._reflow_primary(
+                rows=rows,
+                cols=cols,
+                extra_pins=extra_pins,
+            )
         else:
             old_cur_col = self._cur_col
             if cols != old_cols:
@@ -1429,15 +1689,11 @@ class Screen:
             top_drop_no_hist = 0
             if rows < cur_rows:
                 drop_needed = cur_rows - rows
-                # Keep cursor visible by scrolling excess top rows into history first.
                 top_excess = max(0, self._cur_row - (rows - 1))
                 top_drop = min(drop_needed, top_excess)
                 if top_drop > 0:
                     if not self._is_alt:
-                        if (
-                            self._history.maxlen is not None
-                            and self._history.maxlen > 0
-                        ):
+                        if self._history.maxlen > 0:
                             for r_ev in self._rows[:top_drop]:
                                 self._append_history(r_ev.freeze())
                         else:
@@ -1454,7 +1710,10 @@ class Screen:
                 if len(self._rows) > rows:
                     del self._rows[rows:]
             elif rows > cur_rows:
-                self._rows.extend(_Row(cols) for _ in range(rows - cur_rows))
+                self._rows.extend(
+                    _Row(cols, gen_counter=self._gen_counter)
+                    for _ in range(rows - cur_rows)
+                )
 
             if self._gfx is not None:
                 self._gfx.on_non_reflow_resize(
@@ -1462,14 +1721,22 @@ class Screen:
                     new_rows=rows,
                     new_cols=cols,
                     scrolled_total=self._scrolled_total,
+                    min_retained_abs_row=self._evicted_total,
                 )
 
             for r_v in self._rows:
-                bump_row_gen(r_v)
+                r_v.bind_counter(self._gen_counter)
 
             self._cur_row = min(self._cur_row, rows - 1)
             self._cur_col = min(self._cur_col, cols - 1)
             self._pending_wrap = self._pending_wrap and old_cur_col < cols
+            remapped = (
+                tuple(
+                    (p_abs, min(cols - 1, max(0, p_col))) for p_abs, p_col in extra_pins
+                )
+                if extra_pins
+                else ()
+            )
 
         self.scroll_region = ScrollRegion(
             top=0,
@@ -1483,9 +1750,22 @@ class Screen:
         else:
             self._tabstops = {t for t in self._tabstops if t < cols}
         self._tabstops_sorted = sorted(self._tabstops)
+        return remapped
+
+    def resize(
+        self,
+        *,
+        rows: int,
+        cols: int,
+        reflow: bool = True,
+    ) -> None:
+        """Resize screen to ``(rows, cols)``, optionally reflowing soft wraps."""
+        self._resize_with_pins(rows=rows, cols=cols, reflow=reflow)
 
     def reset(self) -> None:
         """Clear all visible rows, margins, cursor, keyboard stack, and tabstops."""
+        if self._on_mutate is not None:
+            self._on_mutate(True)
         rows = len(self._rows)
         for r in self._rows:
             r.reset_blank(self._cols)
@@ -1504,48 +1784,15 @@ class Screen:
         self._tabstops = set(range(8, self._cols, 8))
         self._tabstops_sorted = sorted(self._tabstops)
         self.keyboard_stack.reset()
+        self._modify_other_keys = 0
         if self._gfx is not None:
             self._gfx.reset()
-
-
-def _sync_partial_scroll_bounds(
-    dst_row: _Row,
-    src_row: _Row,
-    left: int,
-    r_col: int,
-) -> None:
-    limit = r_col + 1
-    if dst_row.text_used <= limit:
-        cand_t = (
-            min(src_row.text_used, limit)
-            if src_row.text_used > left
-            else min(dst_row.text_used, left)
-        )
-        if src_row.text_used > limit:
-            floor_t = min(dst_row.text_used, left)
-            while cand_t > floor_t and dst_row.chars[cand_t - 1] == " ":
-                cand_t -= 1
-        dst_row.text_used = cand_t
-    if dst_row.used <= limit:
-        cand_u = (
-            min(src_row.used, limit) if src_row.used > left else min(dst_row.used, left)
-        )
-        floor_u = max(min(dst_row.used, left), dst_row.text_used)
-        if src_row.used > limit:
-            while (
-                cand_u > floor_u
-                and dst_row.chars[cand_u - 1] == " "
-                and dst_row.attr_at(cand_u - 1) == 0
-                and dst_row.ext_at(cand_u - 1) is None
-            ):
-                cand_u -= 1
-        dst_row.used = max(cand_u, dst_row.text_used)
 
 
 class ScreenSet:
     """Dual primary and alternate (``?1049``) screen pair."""
 
-    __slots__ = ("active_is_alt", "alternate", "primary")
+    __slots__ = ("_active_is_alt", "_gen_counter", "_on_mutate", "alternate", "primary")
 
     def __init__(
         self,
@@ -1558,7 +1805,12 @@ class ScreenSet:
         max_images: int = 256,
         max_placements: int = 1_024,
         max_image_dimension: int = 10_000,
+        top_margin_scrolls_to_history: bool = False,
+        on_mutate: collections.abc.Callable[[bool], None] | None = None,
     ) -> None:
+        counter = _RowGenCounter()
+        self._gen_counter = counter
+        self._on_mutate = on_mutate
         self.primary = Screen(
             rows=rows,
             cols=cols,
@@ -1568,7 +1820,10 @@ class ScreenSet:
             max_images=max_images,
             max_placements=max_placements,
             max_image_dimension=max_image_dimension,
+            top_margin_scrolls_to_history=top_margin_scrolls_to_history,
+            on_mutate=on_mutate,
         )
+        self.primary._bind_counter(counter)
         self.alternate = Screen(
             rows=rows,
             cols=cols,
@@ -1579,18 +1834,58 @@ class ScreenSet:
             max_placements=max_placements,
             max_image_dimension=max_image_dimension,
             is_alt=True,
+            on_mutate=on_mutate,
         )
-        self.active_is_alt: bool = False
+        self.alternate._bind_counter(counter)
+        self._active_is_alt: bool = False
+
+    @property
+    def active_is_alt(self) -> bool:
+        """Return ``True`` when the alternate screen is active."""
+        return self._active_is_alt
+
+    @active_is_alt.setter
+    def active_is_alt(self, value: bool) -> None:
+        if self._active_is_alt != value:
+            if self._on_mutate is not None:
+                self._on_mutate(True)
+            self._active_is_alt = value
+
+    @property
+    def _row_gen(self) -> int:
+        return self._gen_counter.value
 
     @property
     def active(self) -> Screen:
         """Return the currently active :class:`Screen`."""
         return self.alternate if self.active_is_alt else self.primary
 
-    def resize(self, *, rows: int, cols: int, reflow: bool = True) -> None:
+    def _resize_with_pins(
+        self,
+        *,
+        rows: int,
+        cols: int,
+        reflow: bool = True,
+        primary_pins: collections.abc.Sequence[tuple[int, int]] = (),
+    ) -> tuple[tuple[int, int], ...]:
+        remapped = self.primary._resize_with_pins(
+            rows=rows,
+            cols=cols,
+            reflow=reflow,
+            extra_pins=primary_pins,
+        )
+        self.alternate._resize_with_pins(rows=rows, cols=cols, reflow=False)
+        return remapped
+
+    def resize(
+        self,
+        *,
+        rows: int,
+        cols: int,
+        reflow: bool = True,
+    ) -> None:
         """Resize both screens (reflowing primary when *reflow* is ``True``)."""
-        self.primary.resize(rows=rows, cols=cols, reflow=reflow)
-        self.alternate.resize(rows=rows, cols=cols, reflow=False)
+        self._resize_with_pins(rows=rows, cols=cols, reflow=reflow)
 
 
 __all__ = [

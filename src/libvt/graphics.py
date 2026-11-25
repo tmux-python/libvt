@@ -12,6 +12,8 @@ import typing as t
 import zlib
 from dataclasses import dataclass
 
+from libvt.parser import _parse_ascii_uint
+
 if t.TYPE_CHECKING:
     from libvt.config import SixelErasePolicy
 
@@ -346,6 +348,131 @@ class _MutablePlacement:
         )
 
 
+def _trim_masked_sixel_rows(p: _MutablePlacement) -> bool:
+    """Trim completely zeroed leading or trailing ``SIXEL`` mask rows in place."""
+    if p.protocol != GraphicsProtocol.SIXEL or p.visible_mask is None:
+        return False
+    if p.rows <= 0 or p.cols <= 0 or p.visible_mask <= 0:
+        p.rows = 0
+        p.visible_mask = 0
+        return True
+    cols = p.cols
+    mask = p.visible_mask
+    row_full = (1 << cols) - 1
+    top_trim = 0
+    while top_trim < p.rows and ((mask >> (top_trim * cols)) & row_full) == 0:
+        top_trim += 1
+    bot_trim = 0
+    while (
+        top_trim + bot_trim < p.rows
+        and ((mask >> ((p.rows - 1 - bot_trim) * cols)) & row_full) == 0
+    ):
+        bot_trim += 1
+    if top_trim == 0 and bot_trim == 0:
+        if mask == (1 << (p.rows * cols)) - 1:
+            p.visible_mask = None
+            return True
+        return False
+    if top_trim + bot_trim >= p.rows:
+        p.rows = 0
+        p.visible_mask = 0
+        return True
+    if top_trim > 0:
+        if p.source_height > 0:
+            crop_top = (p.source_height * top_trim) // p.rows
+            p.source_y += crop_top
+            p.source_height = max(1, p.source_height - crop_top)
+        p.abs_row += top_trim
+        p.rows -= top_trim
+        mask >>= top_trim * cols
+    if bot_trim > 0:
+        if p.source_height > 0 and p.rows > 0:
+            crop_bot = (p.source_height * bot_trim) // p.rows
+            p.source_height = max(1, p.source_height - crop_bot)
+        p.rows -= bot_trim
+        mask &= (1 << (p.rows * cols)) - 1
+    p.visible_mask = None if mask == (1 << (p.rows * cols)) - 1 else mask
+    return True
+
+
+def _clip_placement_bounds(
+    p: _MutablePlacement,
+    *,
+    min_abs: int,
+    max_abs: int | None,
+    new_cols: int | None,
+) -> tuple[bool, bool]:
+    """Clip *p* to ``[min_abs, max_abs)`` and *new_cols*; return ``(mutated, keep)``."""
+    mutated = False
+    if p.rows <= 0 or p.cols <= 0:
+        return True, False
+    if new_cols is not None:
+        if p.col >= new_cols:
+            return True, False
+        if p.protocol == GraphicsProtocol.SIXEL and p.col + p.cols > new_cols:
+            keep_cols = new_cols - p.col
+            if keep_cols <= 0:
+                return True, False
+            old_cols = p.cols
+            if p.visible_mask is not None and p.rows * old_cols <= _MAX_MASK_CELLS:
+                row_keep = (1 << keep_cols) - 1
+                new_mask = 0
+                for rr in range(p.rows):
+                    row_bits = (p.visible_mask >> (rr * old_cols)) & row_keep
+                    new_mask |= row_bits << (rr * keep_cols)
+                if new_mask == 0:
+                    return True, False
+                full_new = (1 << (p.rows * keep_cols)) - 1
+                p.visible_mask = None if new_mask == full_new else new_mask
+            if p.source_width > 0:
+                p.source_width = max(1, (p.source_width * keep_cols) // old_cols)
+            p.cols = keep_cols
+            mutated = True
+
+    if p.abs_row < min_abs:
+        clip_top = min_abs - p.abs_row
+        if clip_top >= p.rows:
+            return True, False
+        if p.source_height > 0:
+            crop_px = (p.source_height * clip_top) // p.rows
+            p.source_y += crop_px
+            p.source_height = max(1, p.source_height - crop_px)
+        keep_rows = p.rows - clip_top
+        if p.visible_mask is not None and p.rows * p.cols <= _MAX_MASK_CELLS:
+            shifted = p.visible_mask >> (clip_top * p.cols)
+            full_m = (1 << (keep_rows * p.cols)) - 1
+            shifted &= full_m
+            if shifted == 0:
+                return True, False
+            p.visible_mask = None if shifted == full_m else shifted
+        p.rows = keep_rows
+        p.abs_row = min_abs
+        mutated = True
+
+    if max_abs is not None and p.abs_row + p.rows > max_abs:
+        if p.abs_row >= max_abs:
+            return True, False
+        keep_rows = max_abs - p.abs_row
+        clip_bot = p.rows - keep_rows
+        if p.source_height > 0:
+            crop_px = (p.source_height * clip_bot) // p.rows
+            p.source_height = max(1, p.source_height - crop_px)
+        if p.visible_mask is not None and keep_rows * p.cols <= _MAX_MASK_CELLS:
+            full_m = (1 << (keep_rows * p.cols)) - 1
+            masked = p.visible_mask & full_m
+            if masked == 0:
+                return True, False
+            p.visible_mask = None if masked == full_m else masked
+        p.rows = keep_rows
+        mutated = True
+
+    if _trim_masked_sixel_rows(p):
+        mutated = True
+        if p.rows <= 0:
+            return True, False
+    return mutated, True
+
+
 class _Decompressor(t.Protocol):
     @property
     def eof(self) -> bool: ...
@@ -372,14 +499,51 @@ class _PendingKittyUpload:
     failed_error: str | None = None
 
 
+_KITTY_UINT32_MAX = 0xFFFF_FFFF
+_KITTY_INT32_MIN = -2_147_483_648
+_KITTY_INT32_MAX = 2_147_483_647
+
+
+def _parse_uint32(control: dict[str, str], key: str, default: int = 0) -> int:
+    raw = control.get(key)
+    if raw is None or not raw:
+        return default
+    val = _parse_ascii_uint(raw, max_val=_KITTY_UINT32_MAX)
+    return default if val is None else val
+
+
 def _parse_int(control: dict[str, str], key: str, default: int = 0) -> int:
     raw = control.get(key)
     if raw is None or not raw:
         return default
-    try:
-        return int(raw)
-    except ValueError:
+    neg = False
+    start = 0
+    first = raw[0]
+    if first == "-":
+        neg = True
+        start = 1
+    elif first == "+":
+        start = 1
+    if start >= len(raw):
         return default
+    limit = -_KITTY_INT32_MIN if neg else _KITTY_UINT32_MAX
+    acc = 0
+    for idx in range(start, len(raw)):
+        code = ord(raw[idx])
+        if not (0x30 <= code <= 0x39):
+            return default
+        if acc < limit:
+            acc = min(limit, acc * 10 + (code - 0x30))
+    return -acc if neg else acc
+
+
+def _valid_quiet(control: dict[str, str]) -> int:
+    raw = control.get("q")
+    if raw == "2":
+        return 2
+    if raw == "1":
+        return 1
+    return 0
 
 
 def _kitty_reply(
@@ -389,15 +553,15 @@ def _kitty_reply(
     is_error: bool,
     reply_image_id: int | None = None,
 ) -> bytes | None:
-    quiet = _parse_int(control, "q", 0)
+    quiet = _valid_quiet(control)
     if quiet == 2 or (quiet == 1 and not is_error):
         return None
-    client_id = _parse_int(control, "i", 0)
-    client_num = _parse_int(control, "I", 0)
+    client_id = _parse_uint32(control, "i", 0)
+    client_num = _parse_uint32(control, "I", 0)
     if client_id <= 0 and client_num <= 0:
         return None
     img_id = reply_image_id if reply_image_id is not None else client_id
-    pid = _parse_int(control, "p", 0)
+    pid = _parse_uint32(control, "p", 0)
     tokens: list[str] = []
     if img_id > 0:
         tokens.append(f"i={img_id}")
@@ -535,7 +699,9 @@ class GraphicsTracker:
             self._bump()
 
     def _append_placement(self, pl: _MutablePlacement) -> None:
+        replaced = False
         if pl.protocol == GraphicsProtocol.KITTY and pl.placement_id > 0:
+            before = len(self._placements)
             self._placements = [
                 p
                 for p in self._placements
@@ -545,9 +711,13 @@ class GraphicsTracker:
                     and p.placement_id == pl.placement_id
                 )
             ]
+            replaced = len(self._placements) != before
         self._placements.append(pl)
+        need_prune = replaced
         if len(self._placements) > self._max_placements:
             del self._placements[: len(self._placements) - self._max_placements]
+            need_prune = True
+        if need_prune:
             self._prune_orphans()
         self._bump()
 
@@ -577,31 +747,134 @@ class GraphicsTracker:
             self._bump()
 
     def clear_history(self, scrolled_total: int) -> None:
-        """Delete placements located completely inside scrollback (``ED 3``)."""
+        """Clip or delete placements intersecting cleared scrollback (``ED 3``)."""
+        self.reap_evicted_history(scrolled_total)
+
+    def reap_evicted_history(self, min_retained_abs_row: int) -> None:
+        """Clip or reap non-virtual placements scrolled past *min_retained_abs_row*."""
         if not self._placements:
             return
-        kept = [
-            p
-            for p in self._placements
-            if p.virtual or p.abs_row + p.rows > scrolled_total
-        ]
-        if len(kept) != len(self._placements):
+        changed = False
+        kept: list[_MutablePlacement] = []
+        for p in self._placements:
+            if p.virtual:
+                kept.append(p)
+                continue
+            mutated, keep = _clip_placement_bounds(
+                p,
+                min_abs=min_retained_abs_row,
+                max_abs=None,
+                new_cols=None,
+            )
+            if mutated:
+                changed = True
+            if keep:
+                kept.append(p)
+            else:
+                changed = True
+        if changed:
             self._placements = kept
             self._prune_orphans()
             self._bump()
 
-    def reap_evicted_history(self, min_retained_abs_row: int) -> None:
-        """Reap non-virtual placements scrolled past *min_retained_abs_row*."""
+    def root_placement_pins(self) -> list[tuple[int, int, int]]:
+        """Return ``(index, abs_row, col)`` for non-virtual root placements."""
+        return [
+            (idx, p.abs_row, p.col)
+            for idx, p in enumerate(self._placements)
+            if not p.virtual and p.parent_image_id == 0
+        ]
+
+    def apply_reflow_pins(
+        self,
+        remapped_roots: collections.abc.Sequence[tuple[int, int, int]],
+        *,
+        new_cols: int,
+        min_retained_abs_row: int,
+        max_abs: int,
+    ) -> None:
+        """Apply reflowed ``(index, abs_row, col)`` pins and clip screen bounds."""
         if not self._placements:
             return
-        kept = [
-            p
-            for p in self._placements
-            if p.virtual or p.abs_row + p.rows > min_retained_abs_row
+        n_pl = len(self._placements)
+        old_coords: list[tuple[int, int]] = [
+            (p.abs_row, p.col) for p in self._placements
         ]
-        if len(kept) != len(self._placements):
+        last_by_key: dict[tuple[int, int], int] = {}
+        last_by_img: dict[int, int] = {}
+        for idx, p in enumerate(self._placements):
+            if not p.virtual:
+                last_by_img[p.image_id] = idx
+                if p.placement_id > 0:
+                    last_by_key[(p.image_id, p.placement_id)] = idx
+
+        resolved: list[bool] = [
+            p.virtual or p.parent_image_id <= 0 for p in self._placements
+        ]
+        changed = False
+        for idx, new_abs, new_col in remapped_roots:
+            p = self._placements[idx]
+            clamped_abs = max(0, new_abs)
+            clamped_col = max(0, min(new_cols - 1, new_col))
+            if p.abs_row != clamped_abs or p.col != clamped_col:
+                p.abs_row = clamped_abs
+                p.col = clamped_col
+                changed = True
+
+        def _resolve_child(idx: int, depth: int) -> None:
+            nonlocal changed
+            if resolved[idx] or depth > _MAX_PARENT_DEPTH:
+                resolved[idx] = True
+                return
+            p = self._placements[idx]
+            p_idx = (
+                last_by_key.get((p.parent_image_id, p.parent_placement_id))
+                if p.parent_placement_id > 0
+                else last_by_img.get(p.parent_image_id)
+            )
+            if p_idx is None or p_idx == idx:
+                resolved[idx] = True
+                return
+            if not resolved[p_idx]:
+                _resolve_child(p_idx, depth + 1)
+            parent_pl = self._placements[p_idx]
+            rel_v = old_coords[idx][0] - old_coords[p_idx][0]
+            rel_h = old_coords[idx][1] - old_coords[p_idx][1]
+            new_abs = max(0, parent_pl.abs_row + rel_v)
+            new_col = max(0, min(new_cols - 1, parent_pl.col + rel_h))
+            if p.abs_row != new_abs or p.col != new_col:
+                p.abs_row = new_abs
+                p.col = new_col
+                changed = True
+            resolved[idx] = True
+
+        for idx in range(n_pl):
+            if not resolved[idx]:
+                _resolve_child(idx, 0)
+
+        kept: list[_MutablePlacement] = []
+        dropped_any = False
+        for p in self._placements:
+            if p.virtual:
+                kept.append(p)
+                continue
+            mutated, keep = _clip_placement_bounds(
+                p,
+                min_abs=min_retained_abs_row,
+                max_abs=max_abs,
+                new_cols=new_cols,
+            )
+            if mutated:
+                changed = True
+            if keep:
+                kept.append(p)
+            else:
+                changed = True
+                dropped_any = True
+        if dropped_any:
             self._placements = kept
             self._prune_orphans()
+        if changed:
             self._bump()
 
     def on_non_reflow_resize(
@@ -611,53 +884,43 @@ class GraphicsTracker:
         new_rows: int,
         new_cols: int,
         scrolled_total: int,
+        min_retained_abs_row: int = 0,
     ) -> None:
         """Adjust placements when a non-reflow ``resize()`` drops or clips rows."""
         if not self._placements:
             return
         changed = False
         kept: list[_MutablePlacement] = []
+        dropped_any = False
         max_abs = scrolled_total + new_rows
         for p in self._placements:
             if p.virtual:
                 kept.append(p)
                 continue
             if top_drop_without_history > 0:
-                new_abs = p.abs_row - top_drop_without_history
-                if new_abs < scrolled_total:
-                    clip_top = scrolled_total - new_abs
-                    if clip_top >= p.rows:
-                        changed = True
-                        continue
-                    keep_rows = p.rows - clip_top
-                    if p.source_height > 0:
-                        crop_px = (p.source_height * clip_top) // p.rows
-                        p.source_y += crop_px
-                        p.source_height = max(1, p.source_height - crop_px)
-                    if (
-                        p.visible_mask is not None
-                        and keep_rows * p.cols <= _MAX_MASK_CELLS
-                    ):
-                        shifted = p.visible_mask >> (clip_top * p.cols)
-                        p.visible_mask = shifted & ((1 << (keep_rows * p.cols)) - 1)
-                        if p.visible_mask == 0:
-                            changed = True
-                            continue
-                    p.rows = keep_rows
-                    p.abs_row = scrolled_total
-                else:
-                    p.abs_row = new_abs
+                p.abs_row -= top_drop_without_history
                 changed = True
-            if p.abs_row + p.rows <= scrolled_total or p.abs_row >= max_abs:
+            eff_min = max(
+                min_retained_abs_row,
+                scrolled_total if top_drop_without_history > 0 else 0,
+            )
+            mutated, keep = _clip_placement_bounds(
+                p,
+                min_abs=eff_min,
+                max_abs=max_abs,
+                new_cols=new_cols,
+            )
+            if mutated:
                 changed = True
-                continue
-            if p.col >= new_cols:
+            if keep:
+                kept.append(p)
+            else:
                 changed = True
-                continue
-            kept.append(p)
-        if changed:
+                dropped_any = True
+        if dropped_any:
             self._placements = kept
             self._prune_orphans()
+        if changed:
             self._bump()
 
     def erase_sixel_rect(
@@ -711,10 +974,15 @@ class GraphicsTracker:
                 continue
             if mask != prev_mask:
                 p.visible_mask = mask
+                _trim_masked_sixel_rows(p)
                 changed = True
+                if p.rows <= 0:
+                    continue
             kept.append(p)
         if changed:
-            self._placements = kept
+            if len(kept) != len(self._placements):
+                self._placements = kept
+                self._prune_orphans()
             self._bump()
 
     def on_region_scroll(
@@ -746,6 +1014,70 @@ class GraphicsTracker:
             p_bot = p.abs_row + p.rows - 1
             p_left = p.col
             p_right = p.col + p.cols - 1
+
+            if history_advanced > 0:
+                if top == 0:
+                    if p_bot <= abs_bot:
+                        kept.append(p)
+                        continue
+                    if p_top > abs_bot:
+                        p.abs_row += history_advanced
+                        changed = True
+                        kept.append(p)
+                        continue
+                else:
+                    if p_bot < scrolled_total:
+                        kept.append(p)
+                        continue
+                    if p_top < scrolled_total <= p_bot:
+                        keep_hist_rows = scrolled_total - p_top
+                        crop_bot = p.rows - keep_hist_rows
+                        if (
+                            p.protocol == GraphicsProtocol.KITTY
+                            or p.parent_image_id > 0
+                        ):
+                            if p.source_height > 0 and p.rows > 0:
+                                crop_px = (p.source_height * crop_bot) // p.rows
+                                p.source_height = max(0, p.source_height - crop_px)
+                                if p.source_height <= 0:
+                                    changed = True
+                                    continue
+                            p.rows = keep_hist_rows
+                        else:
+                            if (
+                                p.visible_mask is not None
+                                and keep_hist_rows * p.cols <= _MAX_MASK_CELLS
+                            ):
+                                p.visible_mask &= (1 << (keep_hist_rows * p.cols)) - 1
+                                if p.visible_mask == 0:
+                                    changed = True
+                                    continue
+                            p.rows = keep_hist_rows
+                            _trim_masked_sixel_rows(p)
+                            if p.rows <= 0:
+                                changed = True
+                                continue
+                        changed = True
+                        kept.append(p)
+                        continue
+                    if p_top >= scrolled_total and p_bot < abs_top:
+                        p.abs_row += history_advanced
+                        changed = True
+                        kept.append(p)
+                        continue
+                    if p_top >= abs_top and p_bot < abs_top + history_advanced:
+                        p.abs_row -= top
+                        changed = True
+                        kept.append(p)
+                        continue
+                    if p_top >= abs_top + history_advanced and p_bot <= abs_bot:
+                        kept.append(p)
+                        continue
+                    if p_top > abs_bot:
+                        p.abs_row += history_advanced
+                        changed = True
+                        kept.append(p)
+                        continue
 
             inside = (
                 p_top >= abs_top
@@ -810,7 +1142,8 @@ class GraphicsTracker:
                     kept.append(p)
                     continue
                 if not inside:
-                    if history_advanced > 0 and p_top >= scrolled_total:
+                    anchored_below = history_advanced > 0 and p_top >= scrolled_total
+                    if anchored_below:
                         p.abs_row += history_advanced
                         changed = True
                     if p.rows * p.cols <= _MAX_MASK_CELLS:
@@ -819,8 +1152,12 @@ class GraphicsTracker:
                             if p.visible_mask is None
                             else p.visible_mask
                         )
-                        ir0 = max(p_top, abs_top + history_advanced) - p.abs_row
-                        ir1 = min(p_bot, abs_bot + history_advanced) - p.abs_row + 1
+                        if history_advanced > 0 and not anchored_below:
+                            ir0 = max(0, abs_bot + 1 - p_top)
+                            ir1 = p.rows
+                        else:
+                            ir0 = max(p_top, abs_top) - p_top
+                            ir1 = min(p_bot, abs_bot) - p_top + 1
                         ic0 = max(p_left, left) - p_left
                         ic1 = min(p_right, right) - p_left + 1
                         if ir0 < ir1 and ic0 < ic1:
@@ -833,7 +1170,10 @@ class GraphicsTracker:
                                 continue
                             if mask != prev_mask:
                                 p.visible_mask = mask
+                                _trim_masked_sixel_rows(p)
                                 changed = True
+                                if p.rows <= 0:
+                                    continue
                     kept.append(p)
                     continue
 
@@ -1082,14 +1422,21 @@ class GraphicsTracker:
             else scrolled_total
         )
 
-        if _parse_int(control, "i", 0) > 0 and _parse_int(control, "I", 0) > 0:
-            self._pending = None
-            return _kitty_reply(
-                control, "EINVAL:cannot specify both i and I", is_error=True
-            )
-
         if explicit_action == "d":
             self._pending = None
+            for id_key in ("i", "I", "p", "P", "Q"):
+                raw_id = control.get(id_key)
+                if (
+                    raw_id is not None
+                    and raw_id != ""
+                    and _parse_ascii_uint(raw_id, max_val=_KITTY_UINT32_MAX) is None
+                ):
+                    return None
+            if (
+                _parse_uint32(control, "i", 0) > 0
+                and _parse_uint32(control, "I", 0) > 0
+            ):
+                return None
             self._handle_kitty_delete(
                 control,
                 cursor_row=cursor_row,
@@ -1099,23 +1446,63 @@ class GraphicsTracker:
             )
             return None
 
+        reply_ctx = control
         if self._pending is not None:
             up = self._pending
-            in_id = _parse_int(control, "i", 0)
-            up_id = _parse_int(up.control, "i", 0)
+            raw_in_i = control.get("i")
+            in_i_valid = (
+                _parse_ascii_uint(raw_in_i, max_val=_KITTY_UINT32_MAX)
+                if (raw_in_i is not None and raw_in_i != "")
+                else 0
+            )
+            up_id = _parse_uint32(up.control, "i", 0)
             stale = (
                 explicit_action in ("q", "p")
                 or ("t" in control and control.get("t", "d") != "d")
-                or (in_id > 0 and up_id > 0 and in_id != up_id)
+                or (
+                    in_i_valid is not None
+                    and in_i_valid > 0
+                    and up_id > 0
+                    and in_i_valid != up_id
+                )
             )
             if stale:
                 self._pending = None
             elif explicit_action in (None, "t", "T"):
-                if _parse_int(control, "q", 0) >= 1:
-                    up.control["q"] = control["q"]
+                merged_q = max(_valid_quiet(up.control), _valid_quiet(control))
+                merged_ctrl = dict(up.control)
                 for k, v in control.items():
                     if k not in ("m", "q"):
-                        up.control.setdefault(k, v)
+                        merged_ctrl.setdefault(k, v)
+                if merged_q > 0:
+                    merged_ctrl["q"] = str(merged_q)
+                reply_ctx = merged_ctrl
+
+                for id_key in ("i", "I", "p", "P", "Q"):
+                    raw_id = control.get(id_key)
+                    if (
+                        raw_id is not None
+                        and raw_id != ""
+                        and _parse_ascii_uint(raw_id, max_val=_KITTY_UINT32_MAX) is None
+                    ):
+                        self._pending = None
+                        return _kitty_reply(
+                            reply_ctx,
+                            f"EINVAL:invalid uint32 {id_key}",
+                            is_error=True,
+                        )
+                if (
+                    _parse_uint32(merged_ctrl, "i", 0) > 0
+                    and _parse_uint32(merged_ctrl, "I", 0) > 0
+                ):
+                    self._pending = None
+                    return _kitty_reply(
+                        reply_ctx,
+                        "EINVAL:cannot specify both i and I",
+                        is_error=True,
+                    )
+
+                up.control = merged_ctrl
                 up.chunks += 1
                 if up.chunks > _MAX_UPLOAD_CHUNKS:
                     self._pending = None
@@ -1140,10 +1527,30 @@ class GraphicsTracker:
                     advance_cursor=advance_cursor,
                 )
 
+        for id_key in ("i", "I", "p", "P", "Q"):
+            raw_id = control.get(id_key)
+            if (
+                raw_id is not None
+                and raw_id != ""
+                and _parse_ascii_uint(raw_id, max_val=_KITTY_UINT32_MAX) is None
+            ):
+                self._pending = None
+                return _kitty_reply(
+                    reply_ctx,
+                    f"EINVAL:invalid uint32 {id_key}",
+                    is_error=True,
+                )
+
+        if _parse_uint32(control, "i", 0) > 0 and _parse_uint32(control, "I", 0) > 0:
+            self._pending = None
+            return _kitty_reply(
+                reply_ctx, "EINVAL:cannot specify both i and I", is_error=True
+            )
+
         action = explicit_action or "t"
         if action in ("t", "T", "q"):
-            if action == "q" and _parse_int(control, "i", 0) <= 0:
-                if _parse_int(control, "I", 0) > 0:
+            if action == "q" and _parse_uint32(control, "i", 0) <= 0:
+                if _parse_uint32(control, "I", 0) > 0:
                     return _kitty_reply(
                         control, "EINVAL:image ID required for query", is_error=True
                     )
@@ -1153,14 +1560,14 @@ class GraphicsTracker:
                 self._pending = None
                 return _kitty_reply(
                     control,
-                    f"EINVAL:unsupported transmission medium {medium!r}",
+                    f"EINVAL:unsupported transmission medium {medium!a}",
                     is_error=True,
                 )
             comp = control.get("o", "")
             if comp not in ("", "z"):
                 return _kitty_reply(
                     control,
-                    f"EINVAL:unsupported compression {comp!r}",
+                    f"EINVAL:unsupported compression {comp!a}",
                     is_error=True,
                 )
             fmt = _parse_int(control, "f", 32)
@@ -1315,11 +1722,19 @@ class GraphicsTracker:
     def _resolve_kitty_image(self, control: dict[str, str]) -> ImageMeta | None:
         img_id = _parse_int(control, "i", 0)
         if img_id > 0:
-            return self._images.get(img_id)
+            meta = self._images.get(img_id)
+            return (
+                meta
+                if meta is not None and meta.protocol == GraphicsProtocol.KITTY
+                else None
+            )
         img_num = _parse_int(control, "I", 0)
         if img_num > 0:
             for meta in reversed(self._images.values()):
-                if meta.image_number == img_num:
+                if (
+                    meta.protocol == GraphicsProtocol.KITTY
+                    and meta.image_number == img_num
+                ):
                     return meta
         return None
 
@@ -1329,8 +1744,10 @@ class GraphicsTracker:
         parent_pid: int,
     ) -> _MutablePlacement | None:
         for p in reversed(self._placements):
-            if p.image_id == parent_id and (
-                parent_pid == 0 or p.placement_id == parent_pid
+            if (
+                p.protocol == GraphicsProtocol.KITTY
+                and p.image_id == parent_id
+                and (parent_pid == 0 or p.placement_id == parent_pid)
             ):
                 return p
         return None
@@ -1399,7 +1816,8 @@ class GraphicsTracker:
 
         parent_pl: _MutablePlacement | None = None
         if parent_id > 0:
-            if parent_id not in self._images:
+            parent_meta = self._images.get(parent_id)
+            if parent_meta is None or parent_meta.protocol != GraphicsProtocol.KITTY:
                 return _kitty_reply(
                     control, "ENOPARENT:parent image not found", is_error=True
                 )
@@ -1449,7 +1867,9 @@ class GraphicsTracker:
 
         cols = min(max(1, screen_cols * 4), cols)
         rows = min(max(1, self._max_dim), rows)
-        z_idx = _parse_int(control, "z", 0)
+        z_idx = max(
+            _KITTY_INT32_MIN, min(_KITTY_INT32_MAX, _parse_int(control, "z", 0))
+        )
         move_cursor = (
             not virtual and parent_id == 0 and _parse_int(control, "C", 0) == 0
         )
@@ -1459,16 +1879,25 @@ class GraphicsTracker:
             if target_meta is not None
             else (
                 meta.image_id
-                if (_parse_int(control, "i", 0) > 0 or _parse_int(control, "I", 0) > 0)
+                if (
+                    _parse_uint32(control, "i", 0) > 0
+                    or _parse_uint32(control, "I", 0) > 0
+                )
                 else None
             )
         )
 
         if parent_pl is not None:
-            abs_r = parent_pl.abs_row + _parse_int(control, "V", 0)
-            col_pos = max(
-                0, min(screen_cols - 1, parent_pl.col + _parse_int(control, "H", 0))
+            rel_v = max(
+                -self._max_dim,
+                min(self._max_dim, _parse_int(control, "V", 0)),
             )
+            rel_h = max(
+                -self._max_dim,
+                min(self._max_dim, _parse_int(control, "H", 0)),
+            )
+            abs_r = parent_pl.abs_row + rel_v
+            col_pos = max(0, min(screen_cols - 1, parent_pl.col + rel_h))
             min_abs = 0
         else:
             anchor_r = cursor_row
@@ -1482,7 +1911,9 @@ class GraphicsTracker:
             abs_r = post_scrolled + anchor_r
             col_pos = cursor_col
             min_abs = (
-                (post_scrolled + min_row) if post_scrolled == scrolled_total else 0
+                (post_scrolled + min_row)
+                if (min_row > 0 or post_scrolled == scrolled_total)
+                else 0
             )
 
         if not virtual and abs_r < min_abs:
@@ -1532,7 +1963,8 @@ class GraphicsTracker:
         for idx, p in enumerate(self._placements):
             if p.parent_image_id <= 0:
                 reachable[idx] = True
-                queue.append(idx)
+                if not p.virtual:
+                    queue.append(idx)
             elif p.parent_placement_id > 0:
                 children_by_key.setdefault(
                     (p.parent_image_id, p.parent_placement_id), []

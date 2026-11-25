@@ -9,9 +9,9 @@
 
 ## Platforms
 
-| Platform | Status |
-|----------|--------|
-| Linux | Supported |
-| macOS | Supported |
-| WSL / WSL2 | Supported |
-| Windows | Supported (sans-I/O core and `asyncio` stream adapter) |
+| Platform | Scope |
+|----------|-------|
+| Linux | Full suite including {func}`~libvt.aio.open_pty` |
+| macOS | Full suite including {func}`~libvt.aio.open_pty` |
+| WSL / WSL2 | Full suite including {func}`~libvt.aio.open_pty` |
+| Windows | Sans-I/O core, {class}`~libvt.aio.AsyncTerminalStream`, and `pytest` plugin |

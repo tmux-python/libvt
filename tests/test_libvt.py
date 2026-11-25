@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.metadata
 import inspect
+import pathlib
 import pkgutil
 import re
 import subprocess
 import sys
+import tomllib
 
 import libvt
 
@@ -77,3 +80,33 @@ def test_public_dataclass_attributes_documented() -> None:
                 if not re.search(rf"^\s*{re.escape(fld.name)}\s*:", doc, re.MULTILINE):
                     missing.append(f"{modinfo.name}.{cls_name}.{fld.name}")
     assert missing == []
+
+
+def test_cross_platform_classifiers_and_ci_workflows() -> None:
+    """Dist metadata, ``pyproject.toml``, and CI declare Linux, macOS, and Windows."""
+    expected_os = {
+        "Operating System :: POSIX",
+        "Operating System :: MacOS :: MacOS X",
+        "Operating System :: Microsoft :: Windows",
+    }
+    dist_classifiers = set(
+        importlib.metadata.metadata("libvt").get_all("Classifier") or [],
+    )
+    assert expected_os <= dist_classifiers
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    pyproject_path = repo_root / "pyproject.toml"
+    if pyproject_path.is_file():
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        assert expected_os <= set(data["project"]["classifiers"])
+
+    if (repo_root / ".github").is_dir():
+        tests_wf = repo_root / ".github" / "workflows" / "tests.yml"
+        docs_wf = repo_root / ".github" / "workflows" / "docs.yml"
+        assert tests_wf.is_file()
+        assert docs_wf.is_file()
+        tests_txt = tests_wf.read_text(encoding="utf-8")
+        docs_txt = docs_wf.read_text(encoding="utf-8")
+        assert "macos-latest" in tests_txt
+        assert "windows-latest" in tests_txt
+        assert '--paths "/*"' in docs_txt

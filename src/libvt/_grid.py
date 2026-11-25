@@ -39,21 +39,19 @@ _HISTORY_BLOCK_SHIFT = 8
 _HISTORY_BLOCK_SIZE = 1 << _HISTORY_BLOCK_SHIFT
 _HISTORY_BLOCK_MASK = _HISTORY_BLOCK_SIZE - 1
 
-_GLOBAL_ROW_GEN: int = 0
 
+class _RowGenCounter:
+    """Per-screen-set monotonic row-mutation counter."""
 
-def bump_row_gen(row: _Row) -> int:
-    """Stamp *row* with the next strictly monotonic mutation generation."""
-    global _GLOBAL_ROW_GEN
-    _GLOBAL_ROW_GEN += 1
-    row.content_gen = _GLOBAL_ROW_GEN
-    row._frozen = None
-    return _GLOBAL_ROW_GEN
+    __slots__ = ("value",)
 
+    def __init__(self, initial: int = 0) -> None:
+        self.value: int = initial
 
-def current_row_gen() -> int:
-    """Return the latest global row mutation generation without advancing it."""
-    return _GLOBAL_ROW_GEN
+    def next(self) -> int:
+        """Advance and return the next strictly monotonic generation."""
+        self.value += 1
+        return self.value
 
 
 _COLOR_MASK = (1 << 25) - 1
@@ -243,7 +241,7 @@ class FrozenRow:
 
     def char_at(self, col: int) -> str:
         """Return cell string at *col*."""
-        if col < 0 or col >= self.cols:
+        if col < 0:
             return " "
         if self.cells is not None:
             return self.cells[col] if col < len(self.cells) else " "
@@ -273,16 +271,23 @@ class FrozenRow:
             return exts[idx][1]
         return None
 
-    def thaw(self, target_cols: int | None = None) -> _Row:
+    def thaw(
+        self,
+        target_cols: int | None = None,
+        *,
+        gen_counter: _RowGenCounter | None = None,
+    ) -> _Row:
         """Materialize a mutable :class:`_Row` from this sealed line."""
         width = self.cols if target_cols is None else target_cols
-        row = _Row(width)
-        row.wrapped = self.wrapped
+        row = _Row(width, gen_counter=gen_counter)
+        row._wrapped = self.wrapped if width == self.cols else False
         limit = min(self.used, width)
         if limit == 0 and not self.runs:
+            row.stamp()
             return row
         for c in range(limit):
-            row.chars[c] = self.char_at(c)
+            row._chars[c] = self.char_at(c)
+        truncated_wide = False
         if self.runs:
             attrs = row._ensure_attrs()
             start = 0
@@ -291,49 +296,93 @@ class FrozenRow:
                 for c in range(start, stop):
                     attrs[c] = word
                     if raw_width_bits(word) != 0:
-                        row.has_wide = True
+                        row._has_wide = True
                 start = stop
                 if start >= width:
                     break
             if width > 0 and raw_width_bits(attrs[width - 1]) == int(WidthRole.WIDE):
-                row.chars[width - 1] = " "
+                row._chars[width - 1] = " "
                 attrs[width - 1] &= _WIDTH_CLEAR_MASK
+                truncated_wide = True
         if self.exts:
-            row.ext = {c: ce for c, ce in self.exts if c < width}
-        row.used = limit
-        row.text_used = min(
-            len(self.cells) if self.cells is not None else len(self.text), width
-        )
+            row._ext = {c: ce for c, ce in self.exts if c < width}
+        t_raw = len(self.cells) if self.cells is not None else len(self.text)
+        row._used = limit
+        row._text_used = min(t_raw, width - 1 if truncated_wide else width)
+        if (
+            truncated_wide
+            and row._used == width
+            and row.attr_at(width - 1) == 0
+            and row.ext_at(width - 1) is None
+        ):
+            row._used = max(row._text_used, width - 1)
+        if width != self.cols and 0 < self.cols <= width:
+            row.clear_spacer_head(self.cols - 1)
+        row.stamp()
         return row
 
 
 class _Row:
-    """Mutable viewport row with lazy 64-bit ``array('Q')`` promotion."""
+    """Mutable viewport row guarded by write barriers on every cell/wrap edit."""
 
     __slots__ = (
+        "_attrs",
+        "_chars",
+        "_content_gen",
+        "_ext",
         "_frozen",
+        "_gen_counter",
+        "_has_wide",
+        "_text_used",
+        "_uniform_attr",
+        "_used",
         "_wrapped",
-        "attrs",
-        "chars",
-        "content_gen",
-        "ext",
-        "has_wide",
-        "text_used",
-        "uniform_attr",
-        "used",
     )
 
-    def __init__(self, cols: int) -> None:
-        self.chars: list[str] = [" "] * cols
-        self.attrs: array.array[int] | None = None
-        self.uniform_attr: int = 0
-        self.has_wide: bool = False
-        self.ext: dict[int, _CellExt] | None = None
-        self.used: int = 0
-        self.text_used: int = 0
+    def __init__(
+        self,
+        cols: int,
+        *,
+        gen_counter: _RowGenCounter | None = None,
+    ) -> None:
+        self._chars: list[str] = [" "] * cols
+        self._attrs: array.array[int] | None = None
+        self._uniform_attr: int = 0
+        self._has_wide: bool = False
+        self._ext: dict[int, _CellExt] | None = None
+        self._used: int = 0
+        self._text_used: int = 0
         self._wrapped: bool = False
-        self.content_gen: int = 0
+        self._gen_counter: _RowGenCounter = (
+            _RowGenCounter() if gen_counter is None else gen_counter
+        )
+        self._content_gen: int = 0
         self._frozen: FrozenRow | None = None
+
+    @property
+    def cols(self) -> int:
+        """Return cell capacity of this row."""
+        return len(self._chars)
+
+    @property
+    def used(self) -> int:
+        """Return non-default cell high-water mark."""
+        return self._used
+
+    @property
+    def text_used(self) -> int:
+        """Return written-text column high-water mark."""
+        return self._text_used
+
+    @property
+    def has_wide(self) -> bool:
+        """Return ``True`` if this row may hold wide or spacer cells."""
+        return self._has_wide
+
+    @property
+    def content_gen(self) -> int:
+        """Return monotonic mutation stamp on this row's counter."""
+        return self._content_gen
 
     @property
     def wrapped(self) -> bool:
@@ -344,28 +393,48 @@ class _Row:
     def wrapped(self, value: bool) -> None:
         if self._wrapped != value:
             self._wrapped = value
-            self._frozen = None
+            self.stamp()
+
+    def stamp(self) -> int:
+        """Advance ``content_gen`` on the owning counter and clear ``_frozen``."""
+        self._content_gen = self._gen_counter.next()
+        self._frozen = None
+        return self._content_gen
+
+    def bind_counter(self, counter: _RowGenCounter, *, stamp: bool = True) -> None:
+        """Attach *counter* to this row and optionally stamp a fresh generation."""
+        self._gen_counter = counter
+        if stamp:
+            self.stamp()
 
     def _ensure_attrs(self) -> array.array[int]:
-        if self.attrs is None:
-            self.attrs = array.array("Q", [self.uniform_attr]) * len(self.chars)
-        return self.attrs
+        if self._attrs is None:
+            self._attrs = array.array("Q", [self._uniform_attr]) * len(self._chars)
+        return self._attrs
+
+    def char_at(self, col: int) -> str:
+        """Return grapheme string at *col*."""
+        return self._chars[col]
+
+    def slice_text(self, start: int, stop: int) -> str:
+        """Concatenate cell strings across ``[start, stop)``."""
+        return "".join(self._chars[start:stop])
 
     def attr_at(self, col: int) -> int:
         """Return 64-bit attribute word at *col*."""
-        if self.attrs is None:
-            return self.uniform_attr
-        return self.attrs[col]
+        if self._attrs is None:
+            return self._uniform_attr
+        return self._attrs[col]
 
     def ext_at(self, col: int) -> _CellExt | None:
         """Return sparse :class:`_CellExt` at *col*, if any."""
-        return self.ext.get(col) if self.ext is not None else None
+        return self._ext.get(col) if self._ext is not None else None
 
     def is_protected(self, col: int) -> bool:
         """Return ``True`` when cell *col* carries ``DECSCA`` protection."""
-        if self.ext is None:
+        if self._ext is None:
             return False
-        ce = self.ext.get(col)
+        ce = self._ext.get(col)
         return bool(ce is not None and ce.protected)
 
     def reset_blank(
@@ -375,23 +444,23 @@ class _Row:
         bce_ext: _CellExt | None = None,
     ) -> None:
         """Reset this row in place for zero-allocation scroll recycling."""
-        if len(self.chars) != cols:
-            self.chars = [" "] * cols
+        if len(self._chars) != cols:
+            self._chars = [" "] * cols
         else:
-            self.chars[:] = [" "] * cols
-        self.attrs = None
-        self.uniform_attr = bce_word | (_HAS_EXT_BIT if bce_ext is not None else 0)
-        self.has_wide = False
+            self._chars[:] = [" "] * cols
+        self._attrs = None
+        self._uniform_attr = bce_word | (_HAS_EXT_BIT if bce_ext is not None else 0)
+        self._has_wide = False
         if bce_ext is not None:
-            self.ext = dict.fromkeys(range(cols), bce_ext)
-            self.used = cols
+            self._ext = dict.fromkeys(range(cols), bce_ext)
+            self._used = cols
         else:
-            if self.ext is not None:
-                self.ext.clear()
-            self.used = cols if bce_word != 0 else 0
-        self.text_used = 0
+            if self._ext is not None:
+                self._ext.clear()
+            self._used = cols if bce_word != 0 else 0
+        self._text_used = 0
         self._wrapped = False
-        bump_row_gen(self)
+        self.stamp()
 
     def _set_raw(
         self,
@@ -404,57 +473,159 @@ class _Row:
         word = pen_word | (int(role) << _WIDTH_SHIFT)
         if cell_ext is not None:
             word |= _HAS_EXT_BIT
-            if self.ext is None:
-                self.ext = {col: cell_ext}
+            if self._ext is None:
+                self._ext = {col: cell_ext}
             else:
-                self.ext[col] = cell_ext
-        elif self.ext is not None:
-            self.ext.pop(col, None)
+                self._ext[col] = cell_ext
+        elif self._ext is not None:
+            self._ext.pop(col, None)
         if role != WidthRole.NARROW:
-            self.has_wide = True
-        self.chars[col] = ch
-        if self.attrs is None:
-            if word == self.uniform_attr:
+            self._has_wide = True
+        self._chars[col] = ch
+        if self._attrs is None:
+            if word == self._uniform_attr:
                 return
             self._ensure_attrs()[col] = word
         else:
-            self.attrs[col] = word
+            self._attrs[col] = word
 
     def _heal_wide_boundary(self, col: int) -> None:
         """Clear both halves when an edit or margin boundary splits a wide glyph."""
-        if not self.has_wide or self.attrs is None:
+        if not self._has_wide or self._attrs is None:
             return
-        cols = len(self.chars)
+        cols = len(self._chars)
         if col < 0 or col >= cols:
             return
-        role = raw_width_bits(self.attrs[col])
+        role = raw_width_bits(self._attrs[col])
         healed_pair_end = -1
         if role == int(WidthRole.WIDE):
-            self.chars[col] = " "
-            self.attrs[col] &= _WIDTH_CLEAR_MASK
+            self._chars[col] = " "
+            self._attrs[col] &= _WIDTH_CLEAR_MASK
             healed_pair_end = col + 1
             if col + 1 < cols:
-                self.chars[col + 1] = " "
-                self.attrs[col + 1] &= _WIDTH_CLEAR_MASK
+                self._chars[col + 1] = " "
+                self._attrs[col + 1] &= _WIDTH_CLEAR_MASK
                 healed_pair_end = col + 2
         elif role == int(WidthRole.SPACER_TAIL):
-            self.chars[col] = " "
-            self.attrs[col] &= _WIDTH_CLEAR_MASK
+            self._chars[col] = " "
+            self._attrs[col] &= _WIDTH_CLEAR_MASK
             healed_pair_end = col + 1
             if col - 1 >= 0:
-                self.chars[col - 1] = " "
-                self.attrs[col - 1] &= _WIDTH_CLEAR_MASK
+                self._chars[col - 1] = " "
+                self._attrs[col - 1] &= _WIDTH_CLEAR_MASK
         if healed_pair_end != -1:
-            if self.text_used == healed_pair_end:
-                pair_lo = max(0, healed_pair_end - 2)
-                self.text_used = pair_lo
-                if (
-                    self.used == healed_pair_end
-                    and self.attr_at(healed_pair_end - 1) == 0
-                    and self.ext_at(healed_pair_end - 1) is None
+            if self._text_used == healed_pair_end:
+                while self._text_used > 0 and self._chars[self._text_used - 1] == " ":
+                    self._text_used -= 1
+                while (
+                    self._used > self._text_used
+                    and self._chars[self._used - 1] == " "
+                    and self.attr_at(self._used - 1) == 0
+                    and self.ext_at(self._used - 1) is None
                 ):
-                    self.used = pair_lo
-            bump_row_gen(self)
+                    self._used -= 1
+            self._used = max(self._used, self._text_used)
+            self.stamp()
+
+    def clear_spacer_head(self, col: int) -> bool:
+        """Clear ``SPACER_HEAD`` at *col* and tighten trailing default blanks."""
+        if not self._has_wide or self._attrs is None:
+            return False
+        if not (0 <= col < len(self._chars)):
+            return False
+        if raw_width_bits(self._attrs[col]) != int(WidthRole.SPACER_HEAD):
+            return False
+        self._chars[col] = " "
+        self._attrs[col] &= _WIDTH_CLEAR_MASK
+        if self._text_used == col + 1:
+            self._text_used = col
+            while (
+                self._text_used > 0
+                and self._chars[self._text_used - 1] == " "
+                and self.attr_at(self._text_used - 1) == 0
+                and self.ext_at(self._text_used - 1) is None
+            ):
+                self._text_used -= 1
+        while (
+            self._used > 0
+            and self._chars[self._used - 1] == " "
+            and self.attr_at(self._used - 1) == 0
+            and self.ext_at(self._used - 1) is None
+        ):
+            self._used -= 1
+        self.stamp()
+        return True
+
+    def trim_trailing_blanks(self) -> None:
+        """Trim unwrapped trailing space padding from ``text_used`` and ``used``."""
+        orig_t = self._text_used
+        orig_u = self._used
+        while self._text_used > 0 and self._chars[self._text_used - 1] == " ":
+            self._text_used -= 1
+        while (
+            self._used > self._text_used
+            and self._chars[self._used - 1] == " "
+            and self.attr_at(self._used - 1) == 0
+            and self.ext_at(self._used - 1) is None
+        ):
+            self._used -= 1
+        if self._text_used != orig_t or self._used != orig_u:
+            self.stamp()
+
+    def copy_region_from(self, src_row: _Row, left: int, right: int) -> None:
+        """Copy cells ``[left..right]`` from *src_row* during partial scroll."""
+        if right == len(src_row._chars) - 1 and src_row.clear_spacer_head(right):
+            src_row.wrapped = False
+        if self._has_wide and self._attrs is not None:
+            if raw_width_bits(self._attrs[left]) == int(WidthRole.SPACER_TAIL):
+                self._heal_wide_boundary(left)
+            if raw_width_bits(self._attrs[right]) == int(WidthRole.WIDE):
+                self._heal_wide_boundary(right)
+        if src_row._has_wide and src_row._attrs is not None:
+            if raw_width_bits(src_row._attrs[left]) == int(WidthRole.SPACER_TAIL):
+                src_row._heal_wide_boundary(left)
+            if raw_width_bits(src_row._attrs[right]) == int(WidthRole.WIDE):
+                src_row._heal_wide_boundary(right)
+        for c in range(left, right + 1):
+            word = src_row.attr_at(c)
+            role = unpack_width_role(word)
+            ch = src_row._chars[c]
+            if role == WidthRole.SPACER_HEAD and not self._wrapped:
+                role = WidthRole.NARROW
+                ch = " "
+            base = word & _WIDTH_CLEAR_MASK
+            self._set_raw(c, ch, base, role, src_row.ext_at(c))
+        limit = right + 1
+        if self._text_used <= limit:
+            cand_t = (
+                min(src_row._text_used, limit)
+                if src_row._text_used > left
+                else min(self._text_used, left)
+            )
+            if src_row._text_used > limit:
+                floor_t = min(self._text_used, left)
+                while cand_t > floor_t and self._chars[cand_t - 1] == " ":
+                    cand_t -= 1
+            self._text_used = cand_t
+        if self._used <= limit:
+            cand_u = (
+                min(src_row._used, limit)
+                if src_row._used > left
+                else min(self._used, left)
+            )
+            floor_u = max(min(self._used, left), self._text_used)
+            if src_row._used > limit:
+                while (
+                    cand_u > floor_u
+                    and self._chars[cand_u - 1] == " "
+                    and self.attr_at(cand_u - 1) == 0
+                    and self.ext_at(cand_u - 1) is None
+                ):
+                    cand_u -= 1
+            self._used = max(cand_u, self._text_used)
+        else:
+            self._used = max(self._used, self._text_used)
+        self.stamp()
 
     def write_narrow(
         self,
@@ -466,9 +637,9 @@ class _Row:
         """Write a 1-column glyph at *col*, healing any split wide cell."""
         self._heal_wide_boundary(col)
         self._set_raw(col, ch, pen_word, WidthRole.NARROW, cell_ext)
-        self.used = max(self.used, col + 1)
-        self.text_used = max(self.text_used, col + 1)
-        bump_row_gen(self)
+        self._used = max(self._used, col + 1)
+        self._text_used = max(self._text_used, col + 1)
+        self.stamp()
 
     def write_spacer_head(
         self,
@@ -479,9 +650,9 @@ class _Row:
         """Write ``WidthRole.SPACER_HEAD`` padding at right margin before wide wrap."""
         self._heal_wide_boundary(col)
         self._set_raw(col, "", bce_word, WidthRole.SPACER_HEAD, bce_ext)
-        self.used = max(self.used, col + 1)
-        self.text_used = max(self.text_used, col + 1)
-        bump_row_gen(self)
+        self._used = max(self._used, col + 1)
+        self._text_used = max(self._text_used, col + 1)
+        self.stamp()
 
     def write_ascii_slice(
         self,
@@ -493,40 +664,33 @@ class _Row:
         """Fast-path bulk write of 1-column printable ASCII characters."""
         n = len(text)
         end = col + n
-        if self.has_wide and self.attrs is not None:
-            self._heal_wide_boundary(col)
-            if end - 1 > col:
+        if self._has_wide and self._attrs is not None:
+            if raw_width_bits(self._attrs[col]) == int(WidthRole.SPACER_TAIL):
+                self._heal_wide_boundary(col)
+            if raw_width_bits(self._attrs[end - 1]) == int(WidthRole.WIDE):
                 self._heal_wide_boundary(end - 1)
-            for idx in range(col, end):
-                if (
-                    raw_width_bits(self.attrs[idx]) == int(WidthRole.WIDE)
-                    and idx + 1 >= end
-                    and idx + 1 < len(self.chars)
-                ):
-                    self.chars[idx + 1] = " "
-                    self.attrs[idx + 1] &= _WIDTH_CLEAR_MASK
 
-        self.chars[col:end] = list(text)
+        self._chars[col:end] = list(text)
         word = pen_word | (_HAS_EXT_BIT if cell_ext is not None else 0)
-        if self.attrs is None:
-            if word != self.uniform_attr:
+        if self._attrs is None:
+            if word != self._uniform_attr:
                 attrs = self._ensure_attrs()
                 attrs[col:end] = array.array("Q", [word]) * n
         else:
-            self.attrs[col:end] = array.array("Q", [word]) * n
+            self._attrs[col:end] = array.array("Q", [word]) * n
 
         if cell_ext is not None:
-            if self.ext is None:
-                self.ext = {}
+            if self._ext is None:
+                self._ext = {}
             for idx in range(col, end):
-                self.ext[idx] = cell_ext
-        elif self.ext:
+                self._ext[idx] = cell_ext
+        elif self._ext:
             for idx in range(col, end):
-                self.ext.pop(idx, None)
+                self._ext.pop(idx, None)
 
-        self.used = max(self.used, end)
-        self.text_used = max(self.text_used, end)
-        bump_row_gen(self)
+        self._used = max(self._used, end)
+        self._text_used = max(self._text_used, end)
+        self.stamp()
 
     def write_wide(
         self,
@@ -540,9 +704,9 @@ class _Row:
         self._heal_wide_boundary(col + 1)
         self._set_raw(col, ch, pen_word, WidthRole.WIDE, cell_ext)
         self._set_raw(col + 1, "", pen_word, WidthRole.SPACER_TAIL, cell_ext)
-        self.used = max(self.used, col + 2)
-        self.text_used = max(self.text_used, col + 2)
-        bump_row_gen(self)
+        self._used = max(self._used, col + 2)
+        self._text_used = max(self._text_used, col + 2)
+        self.stamp()
 
     def append_grapheme(
         self,
@@ -553,19 +717,19 @@ class _Row:
         bce_word: int = 0,
     ) -> None:
         """Append zero-width or cluster-extending *ch* onto cell *col*."""
-        cols = len(self.chars)
+        cols = len(self._chars)
         if col < 0 or col >= cols:
             return
         target = col
         if (
-            self.has_wide
-            and self.attrs is not None
-            and raw_width_bits(self.attrs[col]) == int(WidthRole.SPACER_TAIL)
+            self._has_wide
+            and self._attrs is not None
+            and raw_width_bits(self._attrs[col]) == int(WidthRole.SPACER_TAIL)
             and col > 0
         ):
             target = col - 1
-        self.chars[target] = self.chars[target] + ch
-        cur_role = raw_width_bits(self.attrs[target]) if self.attrs is not None else 0
+        self._chars[target] = self._chars[target] + ch
+        cur_role = raw_width_bits(self._attrs[target]) if self._attrs is not None else 0
         if (
             width_override == 2
             and cur_role == int(WidthRole.NARROW)
@@ -575,11 +739,11 @@ class _Row:
             base_ext = self.ext_at(target)
             self._heal_wide_boundary(target + 1)
             self._set_raw(
-                target, self.chars[target], base_pen, WidthRole.WIDE, base_ext
+                target, self._chars[target], base_pen, WidthRole.WIDE, base_ext
             )
             self._set_raw(target + 1, "", base_pen, WidthRole.SPACER_TAIL, base_ext)
-            self.used = max(self.used, target + 2)
-            self.text_used = max(self.text_used, target + 2)
+            self._used = max(self._used, target + 2)
+            self._text_used = max(self._text_used, target + 2)
         elif (
             width_override == 1
             and cur_role == int(WidthRole.WIDE)
@@ -588,11 +752,11 @@ class _Row:
             attrs = self._ensure_attrs()
             attrs[target] &= _WIDTH_CLEAR_MASK
             self._set_raw(target + 1, " ", bce_word, WidthRole.NARROW, None)
-            if self.text_used == target + 2:
-                self.text_used = target + 1
-                if self.used == target + 2 and bce_word == 0:
-                    self.used = target + 1
-        bump_row_gen(self)
+            if self._text_used == target + 2:
+                self._text_used = target + 1
+                if self._used == target + 2 and bce_word == 0:
+                    self._used = target + 1
+        self.stamp()
 
     def clear_range(
         self,
@@ -604,70 +768,75 @@ class _Row:
         selective: bool = False,
     ) -> None:
         """Erase cells in ``[start, end)`` using background color erase (*bce*)."""
-        cols = len(self.chars)
+        cols = len(self._chars)
         lo = max(0, start)
         hi = min(cols, end)
         if lo >= hi:
             return
 
-        if selective and self.ext:
+        if selective and self._ext:
             for c in range(lo, hi):
                 if self.is_protected(c):
                     continue
                 self._heal_wide_boundary(c)
                 self._set_raw(c, " ", bce_word, WidthRole.NARROW, bce_ext)
             if bce_word != 0 or bce_ext is not None:
-                self.used = max(self.used, hi)
-            elif hi >= self.used:
+                self._used = max(self._used, hi)
+            elif hi >= self._used:
                 while (
-                    self.used > lo
-                    and self.chars[self.used - 1] == " "
-                    and self.attr_at(self.used - 1) == 0
-                    and self.ext_at(self.used - 1) is None
+                    self._used > lo
+                    and self._chars[self._used - 1] == " "
+                    and self.attr_at(self._used - 1) == 0
+                    and self.ext_at(self._used - 1) is None
                 ):
-                    self.used -= 1
-            if hi >= self.text_used:
-                while self.text_used > lo and not self.is_protected(self.text_used - 1):
-                    self.text_used -= 1
-            bump_row_gen(self)
+                    self._used -= 1
+            if hi >= self._text_used:
+                while self._text_used > lo and not self.is_protected(
+                    self._text_used - 1
+                ):
+                    self._text_used -= 1
+            self.stamp()
             return
 
         if lo == 0 and hi == cols:
             self.reset_blank(cols, bce_word, bce_ext)
             return
 
-        if self.has_wide:
-            self._heal_wide_boundary(lo)
-            self._heal_wide_boundary(hi - 1)
+        if self._has_wide and self._attrs is not None:
+            if raw_width_bits(self._attrs[lo]) == int(WidthRole.SPACER_TAIL):
+                self._heal_wide_boundary(lo)
+            if raw_width_bits(self._attrs[hi - 1]) == int(WidthRole.WIDE):
+                self._heal_wide_boundary(hi - 1)
 
         n = hi - lo
-        self.chars[lo:hi] = [" "] * n
+        self._chars[lo:hi] = [" "] * n
         word = bce_word | (_HAS_EXT_BIT if bce_ext is not None else 0)
-        if self.attrs is None:
-            if word != self.uniform_attr:
+        if self._attrs is None:
+            if word != self._uniform_attr:
                 attrs = self._ensure_attrs()
                 attrs[lo:hi] = array.array("Q", [word]) * n
         else:
-            self.attrs[lo:hi] = array.array("Q", [word]) * n
+            self._attrs[lo:hi] = array.array("Q", [word]) * n
 
         if bce_ext is not None:
-            if self.ext is None:
-                self.ext = {}
+            if self._ext is None:
+                self._ext = {}
             for c in range(lo, hi):
-                self.ext[c] = bce_ext
-            self.used = max(self.used, hi)
+                self._ext[c] = bce_ext
+            self._used = max(self._used, hi)
         else:
-            if self.ext:
+            if self._ext:
                 for c in range(lo, hi):
-                    self.ext.pop(c, None)
+                    self._ext.pop(c, None)
             if bce_word != 0:
-                self.used = max(self.used, hi)
-            elif hi >= self.used:
+                self._used = max(self._used, hi)
+            elif hi >= self._used:
                 # Clamp used to lo without erasing explicit spaces left of lo.
-                self.used = min(self.used, lo)
-        if hi >= self.text_used:
-            self.text_used = min(self.text_used, lo)
-        bump_row_gen(self)
+                self._used = min(self._used, lo)
+        if hi >= self._text_used:
+            self._text_used = min(self._text_used, lo)
+        self._used = max(self._used, self._text_used)
+        self.stamp()
 
     def insert_blanks(
         self,
@@ -684,66 +853,65 @@ class _Row:
             return
         shift = min(count, right - col + 1)
 
-        # Splitting a SPACER_TAIL at col orphans its WIDE head at col - 1.
-        if (
-            self.has_wide
-            and self.attrs is not None
-            and raw_width_bits(self.attrs[col]) == int(WidthRole.SPACER_TAIL)
-        ):
-            if col > 0:
-                self.chars[col - 1] = " "
-                self.attrs[col - 1] &= _WIDTH_CLEAR_MASK
-            self.chars[col] = " "
-            self.attrs[col] &= _WIDTH_CLEAR_MASK
-
-        # Discarding a WIDE head at right orphans its SPACER_TAIL at right + 1.
-        if (
-            self.has_wide
-            and self.attrs is not None
-            and right + 1 < len(self.chars)
-            and raw_width_bits(self.attrs[right + 1]) == int(WidthRole.SPACER_TAIL)
-        ):
-            self.chars[right + 1] = " "
-            self.attrs[right + 1] &= _WIDTH_CLEAR_MASK
+        if self._has_wide and self._attrs is not None:
+            if raw_width_bits(self._attrs[col]) == int(WidthRole.SPACER_TAIL):
+                self._heal_wide_boundary(col)
+            if raw_width_bits(self._attrs[right]) == int(WidthRole.WIDE):
+                self._heal_wide_boundary(right)
 
         attrs = (
             self._ensure_attrs()
             if (
-                self.attrs is not None
-                or bce_word != self.uniform_attr
+                self._attrs is not None
+                or bce_word != self._uniform_attr
                 or bce_ext is not None
             )
             else None
         )
         for dst in range(right, col + shift - 1, -1):
             src = dst - shift
-            self.chars[dst] = self.chars[src]
+            self._chars[dst] = self._chars[src]
             if attrs is not None:
                 attrs[dst] = attrs[src]
-            if self.ext is not None:
-                if src in self.ext:
-                    self.ext[dst] = self.ext[src]
+            if self._ext is not None:
+                if src in self._ext:
+                    self._ext[dst] = self._ext[src]
                 else:
-                    self.ext.pop(dst, None)
+                    self._ext.pop(dst, None)
 
         # Clear right when shifting pushes a WIDE head onto right without its tail.
+        cleared_right_head = False
         if (
-            self.has_wide
+            self._has_wide
             and attrs is not None
             and raw_width_bits(attrs[right]) == int(WidthRole.WIDE)
         ):
-            self.chars[right] = " "
+            self._chars[right] = " "
             attrs[right] &= _WIDTH_CLEAR_MASK
+            cleared_right_head = True
 
         for c in range(col, col + shift):
             self._set_raw(c, " ", bce_word, WidthRole.NARROW, bce_ext)
-        if self.used <= right + 1 and (
-            bce_word != 0 or bce_ext is not None or self.used > col
+        t_cap = right if cleared_right_head else right + 1
+        if self._text_used <= right + 1 and self._text_used > col:
+            self._text_used = min(t_cap, self._text_used + shift)
+        if self._used <= right + 1 and (
+            bce_word != 0 or bce_ext is not None or self._used > col
         ):
-            self.used = min(right + 1, max(self.used + shift, col + shift))
-        if self.text_used <= right + 1 and self.text_used > col:
-            self.text_used = min(right + 1, self.text_used + shift)
-        bump_row_gen(self)
+            u_cap = (
+                right
+                if (
+                    cleared_right_head
+                    and self.attr_at(right) == 0
+                    and self.ext_at(right) is None
+                )
+                else right + 1
+            )
+            self._used = max(
+                self._text_used,
+                min(u_cap, max(self._used + shift, col + shift)),
+            )
+        self.stamp()
 
     def delete_cells(
         self,
@@ -760,130 +928,146 @@ class _Row:
             return
         shift = min(count, right - col + 1)
 
-        if self.has_wide and self.attrs is not None:
-            # 1. Deleting SPACER_TAIL at col orphans WIDE head at col - 1.
-            if (
-                raw_width_bits(self.attrs[col]) == int(WidthRole.SPACER_TAIL)
-                and col > 0
-            ):
-                self.chars[col - 1] = " "
-                self.attrs[col - 1] &= _WIDTH_CLEAR_MASK
-            # First surviving cell at col + shift lost its WIDE head if SPACER_TAIL.
-            if col + shift <= right and raw_width_bits(self.attrs[col + shift]) == int(
+        if self._has_wide and self._attrs is not None:
+            if raw_width_bits(self._attrs[col]) == int(WidthRole.SPACER_TAIL):
+                self._heal_wide_boundary(col)
+            if col + shift <= right and raw_width_bits(self._attrs[col + shift]) == int(
                 WidthRole.SPACER_TAIL
             ):
-                self.chars[col + shift] = " "
-                self.attrs[col + shift] &= _WIDTH_CLEAR_MASK
-            # Shifting WIDE head at right leftwards splits (right, right + 1).
-            if right + 1 < len(self.chars) and raw_width_bits(
-                self.attrs[right + 1]
-            ) == int(WidthRole.SPACER_TAIL):
-                self.chars[right] = " "
-                self.attrs[right] &= _WIDTH_CLEAR_MASK
-                self.chars[right + 1] = " "
-                self.attrs[right + 1] &= _WIDTH_CLEAR_MASK
+                self._heal_wide_boundary(col + shift)
+            if raw_width_bits(self._attrs[right]) == int(WidthRole.WIDE):
+                self._heal_wide_boundary(right)
 
         attrs = (
             self._ensure_attrs()
             if (
-                self.attrs is not None
-                or bce_word != self.uniform_attr
+                self._attrs is not None
+                or bce_word != self._uniform_attr
                 or bce_ext is not None
             )
             else None
         )
         for dst in range(col, right - shift + 1):
             src = dst + shift
-            self.chars[dst] = self.chars[src]
+            self._chars[dst] = self._chars[src]
             if attrs is not None:
                 attrs[dst] = attrs[src]
-            if self.ext is not None:
-                if src in self.ext:
-                    self.ext[dst] = self.ext[src]
+            if self._ext is not None:
+                if src in self._ext:
+                    self._ext[dst] = self._ext[src]
                 else:
-                    self.ext.pop(dst, None)
+                    self._ext.pop(dst, None)
 
         for c in range(right - shift + 1, right + 1):
             self._set_raw(c, " ", bce_word, WidthRole.NARROW, bce_ext)
-        if self.used <= right + 1:
+        if self._used <= right + 1:
             if bce_word != 0 or bce_ext is not None:
-                self.used = max(self.used, right + 1)
-            elif self.used > col:
-                self.used = max(col, self.used - shift)
-        if self.text_used <= right + 1 and self.text_used > col:
-            self.text_used = max(col, self.text_used - shift)
-        bump_row_gen(self)
+                self._used = max(self._used, right + 1)
+            elif self._used > col:
+                self._used = max(col, self._used - shift)
+        if self._text_used <= right + 1 and self._text_used > col:
+            self._text_used = max(col, self._text_used - shift)
+        self._used = max(self._used, self._text_used)
+        self.stamp()
 
     def resize(self, cols: int) -> None:
         """Resize row in place to *cols* columns (non-reflow path)."""
-        cur = len(self.chars)
+        cur = len(self._chars)
         if cols == cur:
             return
+        self._wrapped = False
         if cols < cur:
+            healed_edge = False
             if (
                 cols > 0
-                and self.has_wide
-                and self.attrs is not None
-                and raw_width_bits(self.attrs[cols - 1]) == int(WidthRole.WIDE)
+                and self._has_wide
+                and self._attrs is not None
+                and raw_width_bits(self._attrs[cols - 1])
+                in (int(WidthRole.WIDE), int(WidthRole.SPACER_HEAD))
             ):
-                self.chars[cols - 1] = " "
-                self.attrs[cols - 1] &= _WIDTH_CLEAR_MASK
-            del self.chars[cols:]
-            if self.attrs is not None:
-                del self.attrs[cols:]
-            self.used = min(self.used, cols)
-            self.text_used = min(self.text_used, cols)
-            if self.ext:
-                for k in [k for k in self.ext if k >= cols]:
-                    del self.ext[k]
+                self._chars[cols - 1] = " "
+                self._attrs[cols - 1] &= _WIDTH_CLEAR_MASK
+                healed_edge = True
+            del self._chars[cols:]
+            if self._attrs is not None:
+                del self._attrs[cols:]
+            if self._ext:
+                for k in [k for k in self._ext if k >= cols]:
+                    del self._ext[k]
+            t_lim = cols - 1 if healed_edge else cols
+            self._text_used = min(self._text_used, t_lim)
+            u_lim = (
+                cols - 1
+                if (
+                    healed_edge
+                    and self.attr_at(cols - 1) == 0
+                    and self.ext_at(cols - 1) is None
+                )
+                else cols
+            )
+            self._used = max(self._text_used, min(self._used, u_lim))
         else:
+            if cur > 0:
+                self.clear_spacer_head(cur - 1)
             pad = cols - cur
-            self.chars.extend([" "] * pad)
-            if self.attrs is not None:
-                self.attrs.extend([0] * pad)
-            elif self.uniform_attr != 0:
-                attrs = array.array("Q", [self.uniform_attr]) * cur
+            self._chars.extend([" "] * pad)
+            if self._attrs is not None:
+                self._attrs.extend([0] * pad)
+            elif self._uniform_attr != 0:
+                attrs = array.array("Q", [self._uniform_attr]) * cur
                 attrs.extend([0] * pad)
-                self.attrs = attrs
-        bump_row_gen(self)
+                self._attrs = attrs
+        self.stamp()
 
     def clone(self) -> _Row:
-        """Return an independent copy of this row."""
+        """Return an independent snapshot copy isolated from live counters."""
         dup = _Row.__new__(_Row)
-        dup.chars = self.chars.copy()
-        dup.attrs = array.array("Q", self.attrs) if self.attrs is not None else None
-        dup.uniform_attr = self.uniform_attr
-        dup.has_wide = self.has_wide
-        dup.ext = self.ext.copy() if self.ext else None
-        dup.used = self.used
-        dup.text_used = self.text_used
+        dup._chars = self._chars.copy()
+        dup._attrs = array.array("Q", self._attrs) if self._attrs is not None else None
+        dup._uniform_attr = self._uniform_attr
+        dup._has_wide = self._has_wide
+        dup._ext = self._ext.copy() if self._ext else None
+        dup._used = self._used
+        dup._text_used = self._text_used
         dup._wrapped = self._wrapped
-        dup.content_gen = self.content_gen
+        dup._gen_counter = _RowGenCounter(self._content_gen)
+        dup._content_gen = self._content_gen
         dup._frozen = self._frozen
         return dup
+
+    def debug_fingerprint(self) -> tuple[object, ...]:
+        """Return complete structural state tuple for write-barrier verification."""
+        return (
+            self._wrapped,
+            tuple(self._chars),
+            tuple(self._attrs) if self._attrs is not None else self._uniform_attr,
+            tuple(sorted(self._ext.items())) if self._ext else (),
+            self._used,
+            self._text_used,
+        )
 
     def freeze(self) -> FrozenRow:
         """Seal this row into a compact run-length-encoded :class:`FrozenRow`."""
         if self._frozen is not None:
             return self._frozen
-        cols = len(self.chars)
-        t_used = self.text_used
-        text = "".join(self.chars[:t_used])
+        cols = len(self._chars)
+        t_used = self._text_used
+        text = "".join(self._chars[:t_used])
         cells: tuple[str, ...] | None = None
-        if len(text) != t_used or "" in self.chars[:t_used]:
-            cells = tuple(self.chars[:t_used])
+        if len(text) != t_used or "" in self._chars[:t_used]:
+            cells = tuple(self._chars[:t_used])
 
-        u = min(cols, max(self.used, t_used))
+        u = min(cols, max(self._used, t_used))
         runs: tuple[tuple[int, int], ...]
         if u == 0:
             runs = ()
-        elif self.attrs is None:
-            runs = () if self.uniform_attr == 0 else ((u, self.uniform_attr),)
+        elif self._attrs is None:
+            runs = () if self._uniform_attr == 0 else ((u, self._uniform_attr),)
         else:
             run_list: list[tuple[int, int]] = []
-            cur_word = self.attrs[0]
+            cur_word = self._attrs[0]
             for c in range(1, u):
-                w = self.attrs[c]
+                w = self._attrs[c]
                 if w != cur_word:
                     run_list.append((c, cur_word))
                     cur_word = w
@@ -891,7 +1075,7 @@ class _Row:
                 run_list.append((u, cur_word))
             runs = tuple(run_list)
 
-        exts = tuple(sorted(self.ext.items())) if self.ext else ()
+        exts = tuple(sorted(self._ext.items())) if self._ext else ()
         fr = FrozenRow(
             text=text,
             cols=cols,
@@ -905,7 +1089,7 @@ class _Row:
 
     def rstrip_text(self) -> str:
         """Return row text up to ``text_used`` written columns."""
-        return "".join(self.chars[: self.text_used])
+        return "".join(self._chars[: self._text_used])
 
 
 @dataclass(frozen=True, slots=True)
@@ -1054,6 +1238,33 @@ class _HistoryBuffer:
             return True
         self._len += 1
         return False
+
+    def replace_all(self, rows: collections.abc.Sequence[RowLike]) -> int:
+        """Replace buffer with trailing ``maxlen`` frozen rows; return evicted."""
+        self.clear()
+        n = len(rows)
+        if self._maxlen <= 0 or n == 0:
+            return n
+        evicted = max(0, n - self._maxlen)
+        kept_len = n - evicted
+        full_blocks = kept_len >> _HISTORY_BLOCK_SHIFT
+        blocks: list[tuple[FrozenRow, ...]] = []
+        pos = evicted
+        for _ in range(full_blocks):
+            nxt = pos + _HISTORY_BLOCK_SIZE
+            chunk = rows[pos:nxt]
+            blocks.append(
+                tuple(r if isinstance(r, FrozenRow) else r.freeze() for r in chunk)
+            )
+            pos = nxt
+        self._blocks = blocks
+        self._tail = [
+            r if isinstance(r, FrozenRow) else r.freeze() for r in rows[pos:n]
+        ]
+        self._head_offset = 0
+        self._len = kept_len
+        self._snapshot = None
+        return evicted
 
     def freeze(self) -> _FrozenHistory:
         """Capture an ``O(1)`` CoW :class:`_FrozenHistory` snapshot."""

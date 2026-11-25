@@ -39,7 +39,7 @@ def _format_row_cells(snap: Snapshot, row_idx: int, width: int) -> str:
             parts.append(" ")
             cols_used += 1
             break
-        parts.append(sanitize_terminal_text(row.chars[c]))
+        parts.append(sanitize_terminal_text(row.char_at(c)))
         cols_used += cell_w
         c += 1
     if cols_used < width:

@@ -178,10 +178,14 @@ class MouseEvent:
         Zero-based terminal column.
     modifiers : KeyMod
         Active keyboard modifiers during the mouse event.
-    pixel_x : int
-        Horizontal pixel coordinate for ``?1016`` SGR-Pixel mode.
-    pixel_y : int
-        Vertical pixel coordinate for ``?1016`` SGR-Pixel mode.
+    pixel_x : int | None
+        Explicit horizontal pixel coordinate for ``?1016`` SGR-Pixel mode
+        (clamped to ``>= 0``); ``None`` derives cell-center pixels from
+        ``col`` and ``cell_width_px``.
+    pixel_y : int | None
+        Explicit vertical pixel coordinate for ``?1016`` SGR-Pixel mode
+        (clamped to ``>= 0``); ``None`` derives cell-center pixels from
+        ``row`` and ``cell_height_px``.
     """
 
     button: MouseButton
@@ -189,8 +193,8 @@ class MouseEvent:
     row: int
     col: int
     modifiers: KeyMod = KeyMod.NONE
-    pixel_x: int = 0
-    pixel_y: int = 0
+    pixel_x: int | None = None
+    pixel_y: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +231,8 @@ class PasteEvent:
     allow_unbracketed_newlines: bool = False
 
 
+#: Outbound input event union accepted by :func:`encode_input` and
+#: :meth:`~libvt.terminal.Terminal.encode`.
 type InputEvent = KeyEvent | MouseEvent | FocusEvent | PasteEvent
 
 _ARROW_CSI: dict[str, str] = {
@@ -330,11 +336,20 @@ def encode_paste(
     return payload
 
 
+def _is_ascii_alpha(k: str) -> bool:
+    return "a" <= k <= "z" or "A" <= k <= "Z"
+
+
+def _has_legacy_c0_mapping(k: str) -> bool:
+    return _is_ascii_alpha(k) or k in (" ", "@", "[", "\\", "]", "^", "_", "/")
+
+
 def _encode_key(
     event: KeyEvent,
     *,
     modes: ModeState,
     kitty_flags: KittyKeyboardFlags,
+    modify_other_keys: int = 0,
 ) -> bytes:
     report_events = bool(kitty_flags & KittyKeyboardFlags.REPORT_EVENT_TYPES)
     if event.action == KeyAction.RELEASE and not report_events:
@@ -378,6 +393,7 @@ def _encode_key(
         & (KittyKeyboardFlags.DISAMBIGUATE | KittyKeyboardFlags.REPORT_ALL_KEYS),
     )
     report_all = bool(kitty_flags & KittyKeyboardFlags.REPORT_ALL_KEYS)
+    use_xtmod = kitty_flags == KittyKeyboardFlags.NONE and modify_other_keys in (1, 2)
 
     # Named C0 keys (escape, enter, tab, backspace)
     if k_low in _KITTY_SPECIAL_CP:
@@ -393,6 +409,18 @@ def _encode_key(
             if mod_param == 1 and not ev_suffix:
                 return f"\x1b[{cp}u".encode("ascii")
             return f"\x1b[{cp};{mod_param}{ev_suffix}u".encode("ascii")
+        if (
+            use_xtmod
+            and event.modifiers != KeyMod.NONE
+            and (
+                modify_other_keys == 2
+                or not (
+                    (k_low == "tab" and event.modifiers == KeyMod.SHIFT)
+                    or event.modifiers == KeyMod.ALT
+                )
+            )
+        ):
+            return f"\x1b[27;{mod_param};{cp}~".encode("ascii")
         if k_low == "tab" and (event.modifiers & KeyMod.SHIFT):
             return b"\x1b[Z"
         raw = bytes([cp])
@@ -414,12 +442,33 @@ def _encode_key(
             return f"\x1b[{base_cp}u".encode("ascii")
         return f"\x1b[{base_cp};{mp}{ev_suffix}u".encode("ascii")
 
+    if use_xtmod and event.modifiers != KeyMod.NONE:
+        mods = event.modifiers | (KeyMod.SHIFT if "A" <= k <= "Z" else KeyMod.NONE)
+        cp_out = ord(k.upper()) if ("a" <= k <= "z" and (mods & KeyMod.SHIFT)) else cp
+        if mods == KeyMod.SHIFT:
+            if cp_out == 0x20:
+                return b"\x1b[27;2;32~"
+            if modify_other_keys == 2 and 0x40 <= cp_out <= 0x7F:
+                return f"\x1b[27;2;{cp_out}~".encode("ascii")
+        else:
+            if modify_other_keys == 2:
+                return f"\x1b[27;{int(mods) + 1};{cp_out}~".encode("ascii")
+            legacy_ctrl = mods in (KeyMod.CTRL, KeyMod.CTRL | KeyMod.ALT) and (
+                _has_legacy_c0_mapping(k)
+            )
+            legacy_alt = (mods & ~(KeyMod.ALT | KeyMod.SHIFT)) == KeyMod.NONE and bool(
+                mods & KeyMod.ALT
+            )
+            if not (legacy_ctrl or legacy_alt):
+                return f"\x1b[27;{int(mods) + 1};{cp_out}~".encode("ascii")
+
     # Legacy xterm key encoding
-    out_char = k
+    out_char = (
+        k.upper() if ("a" <= k <= "z" and (event.modifiers & KeyMod.SHIFT)) else k
+    )
     if event.modifiers & KeyMod.CTRL:
-        low_cp = ord(k.lower())
-        if 0x61 <= low_cp <= 0x7A:
-            raw = bytes([low_cp - 0x60])
+        if _is_ascii_alpha(k):
+            raw = bytes([(ord(k) | 0x20) - 0x60])
         elif k in (" ", "@"):
             raw = b"\x00"
         elif k == "[":
@@ -442,13 +491,38 @@ def _encode_key(
     return raw
 
 
-def _encode_mouse(event: MouseEvent, *, modes: ModeState) -> bytes:
+def _encode_mouse(
+    event: MouseEvent,
+    *,
+    modes: ModeState,
+    active_is_alt: bool | None = None,
+    cell_width_px: int = 8,
+    cell_height_px: int = 16,
+) -> bytes:
     any_event = modes.is_set(Mode.MOUSE_ANY_EVENT)
     btn_event = modes.is_set(Mode.MOUSE_BUTTON_EVENT)
     vt200 = modes.is_set(Mode.MOUSE_VT200)
     x10 = modes.is_set(Mode.MOUSE_X10)
 
     if not (any_event or btn_event or vt200 or x10):
+        eff_alt = (
+            bool(
+                modes.is_set(Mode.ALT_SCREEN)
+                or modes.is_set(Mode.ALT_SCREEN_1047)
+                or modes.is_set(Mode.ALT_SCREEN_47)
+            )
+            if active_is_alt is None
+            else active_is_alt
+        )
+        if (
+            eff_alt
+            and modes.is_set(Mode.ALTERNATE_SCROLL)
+            and event.action == MouseAction.PRESS
+        ):
+            if event.button == MouseButton.WHEEL_UP:
+                return b"\x1bOA" if modes.is_set(Mode.DECCKM) else b"\x1b[A"
+            if event.button == MouseButton.WHEEL_DOWN:
+                return b"\x1bOB" if modes.is_set(Mode.DECCKM) else b"\x1b[B"
         return b""
     if (
         event.action == MouseAction.MOVE
@@ -474,12 +548,30 @@ def _encode_mouse(event: MouseEvent, *, modes: ModeState) -> bytes:
         code |= 16
 
     if modes.is_set(Mode.MOUSE_SGR_PIXELS):
-        final = "m" if event.action == MouseAction.RELEASE else "M"
-        return f"\x1b[<{code};{event.pixel_x};{event.pixel_y}{final}".encode("ascii")
+        can_encode_px = (event.pixel_x is not None or cell_width_px > 0) and (
+            event.pixel_y is not None or cell_height_px > 0
+        )
+        if can_encode_px:
+            cw = max(0, cell_width_px)
+            ch = max(0, cell_height_px)
+            px = (
+                max(0, event.pixel_x)
+                if event.pixel_x is not None
+                else (max(0, event.col) * cw + cw // 2)
+            )
+            py = (
+                max(0, event.pixel_y)
+                if event.pixel_y is not None
+                else (max(0, event.row) * ch + ch // 2)
+            )
+            final = "m" if event.action == MouseAction.RELEASE else "M"
+            return f"\x1b[<{code};{px};{py}{final}".encode("ascii")
 
     if modes.is_set(Mode.MOUSE_SGR):
         final = "m" if event.action == MouseAction.RELEASE else "M"
-        return f"\x1b[<{code};{event.col + 1};{event.row + 1}{final}".encode("ascii")
+        cx_sgr = max(0, event.col) + 1
+        cy_sgr = max(0, event.row) + 1
+        return f"\x1b[<{code};{cx_sgr};{cy_sgr}{final}".encode("ascii")
 
     # Classic X10 / VT200 byte-encoded coordinates (clamped to 223).
     wire_btn = 3 if event.action == MouseAction.RELEASE else code
@@ -493,12 +585,58 @@ def encode_input(
     *,
     modes: ModeState,
     kitty_flags: KittyKeyboardFlags = KittyKeyboardFlags.NONE,
+    modify_other_keys: int = 0,
+    active_is_alt: bool | None = None,
+    cell_width_px: int = 8,
+    cell_height_px: int = 16,
 ) -> bytes:
-    """Encode *event* into outbound PTY bytes respecting active terminal *modes*."""
+    """Encode *event* into outbound PTY bytes respecting active terminal *modes*.
+
+    Parameters
+    ----------
+    event : InputEvent
+        Keyboard, mouse, focus, or paste event to encode.
+    modes : ModeState
+        Active ANSI and DEC private modes.
+    kitty_flags : KittyKeyboardFlags
+        Active Kitty ``CSI u`` progressive-enhancement flags; when non-zero,
+        takes precedence over *modify_other_keys*.
+    modify_other_keys : int
+        ``xterm`` ``XTMODKEYS`` ``modifyOtherKeys`` level (``0``, ``1``, or
+        ``2``).
+    active_is_alt : bool | None
+        Whether the alternate screen buffer is active for ``?1007``
+        (:attr:`~libvt.modes.Mode.ALTERNATE_SCROLL`). When ``None``, inferred
+        from ``?47`` / ``?1047`` / ``?1049`` in *modes*.
+    cell_width_px : int
+        Cell width in pixels used to derive default ``?1016`` horizontal pixel
+        coordinates (falls back to ``?1006`` / X10 when ``<= 0`` and
+        :attr:`MouseEvent.pixel_x` is ``None``).
+    cell_height_px : int
+        Cell height in pixels used to derive default ``?1016`` vertical pixel
+        coordinates (falls back to ``?1006`` / X10 when ``<= 0`` and
+        :attr:`MouseEvent.pixel_y` is ``None``).
+
+    Returns
+    -------
+    bytes
+        Encoded VT input sequence (``b""`` when suppressed by active modes).
+    """
     if isinstance(event, KeyEvent):
-        return _encode_key(event, modes=modes, kitty_flags=kitty_flags)
+        return _encode_key(
+            event,
+            modes=modes,
+            kitty_flags=kitty_flags,
+            modify_other_keys=modify_other_keys,
+        )
     if isinstance(event, MouseEvent):
-        return _encode_mouse(event, modes=modes)
+        return _encode_mouse(
+            event,
+            modes=modes,
+            active_is_alt=active_is_alt,
+            cell_width_px=cell_width_px,
+            cell_height_px=cell_height_px,
+        )
     if isinstance(event, FocusEvent):
         if not modes.is_set(Mode.FOCUS_EVENT):
             return b""

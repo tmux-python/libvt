@@ -24,8 +24,8 @@ Unicode 17 grapheme clustering.
 
 ## Single byte-stream entry point
 
-Instead of pairing a separate `ByteStream` with a `Screen` or
-`HistoryScreen`, feed `bytes`, `bytearray`, or `memoryview` directly to
+Instead of pairing a separate `pyte` stream with a screen object, feed
+`bytes`, `bytearray`, or {class}`memoryview` directly to
 {meth}`libvt.Terminal.feed` (or UTF-8 strings via
 {meth}`libvt.Terminal.feed_str`):
 

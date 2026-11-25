@@ -106,7 +106,12 @@ _OSC_NAMES: dict[int, str] = {
     52: "OSC 52 (clipboard)",
     66: "OSC 66 (text sizing)",
     99: "OSC 99 (kitty notification)",
+    104: "OSC 104 (reset palette)",
+    110: "OSC 110 (reset fg color)",
+    111: "OSC 111 (reset bg color)",
+    112: "OSC 112 (reset cursor color)",
     133: "OSC 133 (semantic prompt)",
+    777: "OSC 777 (notification)",
     3008: "OSC 3008 (context)",
     5522: "OSC 5522 (mime clipboard)",
     7501: "OSC 7501 (program status)",
@@ -114,8 +119,10 @@ _OSC_NAMES: dict[int, str] = {
 
 
 def _describe_mode(code: int, *, private: bool) -> str:
-    raw = (DEC_PRIVATE_MASK | code) if private else code
     prefix = "?" if private else ""
+    if not (0 <= code < DEC_PRIVATE_MASK):
+        return f"{prefix}{code}"
+    raw = (DEC_PRIVATE_MASK | code) if private else code
     try:
         name = Mode(raw).name
     except ValueError:

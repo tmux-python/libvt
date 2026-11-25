@@ -8,6 +8,7 @@ import collections
 import collections.abc
 import enum
 import html
+import itertools
 import os
 import re
 import types
@@ -23,8 +24,6 @@ from libvt._grid import (
     _CellExt,
     _FrozenHistory,
     _Row,
-    bump_row_gen,
-    current_row_gen,
     make_cell_ext,
     pack_pen_base,
     raw_width_bits,
@@ -84,10 +83,19 @@ from libvt.modes import (
     ALT_SCREEN_MODES,
     DEC_PRIVATE_MASK,
     TRANSIENT_SNAPSHOT_MODES,
+    DecrpmValue,
     Mode,
     ModeState,
 )
-from libvt.parser import CsiParams, Parser, ParserEncoding, ParserState, parse_sgr
+from libvt.parser import (
+    CsiParams,
+    Parser,
+    ParserEncoding,
+    ParserState,
+    _parse_ascii_int,
+    _parse_ascii_uint,
+    parse_sgr,
+)
 from libvt.screen import (
     Cell,
     Cursor,
@@ -161,15 +169,33 @@ _PRINT_ASCII_RE = re.compile(rb"[\x20-\x7e]+")
 _STR_BODY_UTF8_RE = re.compile(rb"[^\x07\x18\x1a\x1b\x7f]+")
 _STR_BODY_LATIN1_RE = re.compile(rb"[^\x07\x18\x1a\x1b\x7f\x80-\x9f]+")
 
-_NEXT_TERMINAL_ID: int = 0
+
+class _TerminalIdAllocator:
+    """Fork-safe lazy per-PID random nonce paired with monotonic counter."""
+
+    __slots__ = ("_counter", "_nonce", "_pid")
+
+    def __init__(self) -> None:
+        self._pid: int = -1
+        self._nonce: int = 0
+        self._counter = itertools.count(1).__next__
+
+    def alloc(self) -> int:
+        pid = os.getpid()
+        if pid != self._pid:
+            self._nonce = int.from_bytes(os.urandom(8), "big")
+            self._pid = pid
+        return (self._nonce << 32) | self._counter()
+
+
+_TERMINAL_IDS = _TerminalIdAllocator()
 
 
 def _alloc_terminal_id() -> int:
-    global _NEXT_TERMINAL_ID
-    _NEXT_TERMINAL_ID += 1
-    return _NEXT_TERMINAL_ID
+    return _TERMINAL_IDS.alloc()
 
 
+#: Buffer view selector for :meth:`Terminal.sync_token` and incremental deltas.
 type SyncView = t.Literal["working", "committed"]
 
 
@@ -184,45 +210,7 @@ class ResyncReason(enum.StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class SyncToken:
-    """Opaque monotonic watermark passed to :meth:`Terminal.changes_since`.
-
-    Attributes
-    ----------
-    terminal_id : int
-        Identity cookie of the originating :class:`Terminal`.
-    view : SyncView
-        Tracked view (``"committed"`` or ``"working"``).
-    epoch : int
-        Structural epoch incremented on ``resize()``, ``RIS``, and ``?1049``
-        alternate-screen transitions.
-    revision : int
-        Monotonic row-content mutation watermark.
-    scrolled_total : int
-        Cumulative primary-screen lines scrolled into history.
-    evicted_total : int
-        Cumulative primary-screen history lines evicted by ``maxlen``.
-    history_clear_at : int
-        ``scrolled_total`` value at the most recent ``ED 3`` history clear.
-    history_clear_seq : int
-        Monotonic counter of ``ED 3`` history clears.
-    cursor : Cursor
-        Cursor state at watermark capture.
-    modes : frozenset[Mode]
-        Enabled terminal modes at watermark capture.
-    title : str
-        Window title at watermark capture.
-    cwd : str
-        Working directory at watermark capture.
-    cwd_uri : str
-        Raw ``OSC 7`` / ``OSC 9;9`` working directory URI at watermark capture.
-    aux_revision : int
-        Monotonic counter of prompt-zone, program-status, and window-metadata
-        updates.
-    graphics_revision : int
-        Monotonic graphics placement revision on the active screen.
-    """
-
+class _SyncState:
     terminal_id: int
     view: SyncView
     epoch: int
@@ -238,6 +226,70 @@ class SyncToken:
     cwd_uri: str = ""
     aux_revision: int = 0
     graphics_revision: int = 0
+
+
+def _make_sync_token(state: _SyncState) -> SyncToken:
+    tok = object.__new__(SyncToken)
+    object.__setattr__(tok, "_state", state)
+    return tok
+
+
+class SyncToken:
+    """Opaque per-:class:`Terminal` watermark passed to :meth:`Terminal.changes_since`.
+
+    Compare tokens with ``==`` and store them in sets or dictionaries via
+    :func:`hash`; obtain instances from :meth:`Terminal.sync_token` or
+    :attr:`ScreenDelta.token`.
+    """
+
+    __slots__ = ("_state",)
+    _state: _SyncState
+
+    def __new__(cls, *args: object, **kwargs: object) -> t.NoReturn:
+        """Disallow direct construction; call :meth:`Terminal.sync_token`."""
+        msg = "SyncToken cannot be instantiated directly; call Terminal.sync_token()"
+        raise TypeError(msg)
+
+    def __setattr__(self, name: str, value: object) -> t.NoReturn:
+        """Disallow attribute mutation on immutable tokens."""
+        msg = f"cannot assign to attribute {name!r} on immutable SyncToken"
+        raise AttributeError(msg)
+
+    def __delattr__(self, name: str) -> t.NoReturn:
+        """Disallow attribute deletion on immutable tokens."""
+        msg = f"cannot delete attribute {name!r} on immutable SyncToken"
+        raise AttributeError(msg)
+
+    def __eq__(self, other: object) -> bool:
+        """Return ``True`` when *other* captures the identical watermark state."""
+        if self is other:
+            return True
+        if not isinstance(other, SyncToken):
+            return NotImplemented
+        return self._state == other._state
+
+    def __hash__(self) -> int:
+        """Return hash of the captured watermark state."""
+        return hash(self._state)
+
+    def __repr__(self) -> str:
+        """Return compact opaque representation."""
+        st = self._state
+        return f"SyncToken(view={st.view!r}, epoch={st.epoch}, revision={st.revision})"
+
+    def __copy__(self) -> SyncToken:
+        """Return ``self`` (immutable value)."""
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> SyncToken:
+        """Return ``self`` (immutable value)."""
+        return self
+
+    def __reduce__(
+        self,
+    ) -> tuple[collections.abc.Callable[[_SyncState], SyncToken], tuple[_SyncState]]:
+        """Serialize token state for :mod:`pickle`."""
+        return (_make_sync_token, (self._state,))
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +520,8 @@ class _SavedCursor:
         Saved ``G0``..``G3`` character-set designations.
     gl : int
         Saved active locking-shift slot index (``0..3``).
+    single_shift : int | None
+        Saved pending single-shift slot (``2`` for ``SS2``, ``3`` for ``SS3``).
     protected : bool
         Saved ``DECSCA`` character-protection pen attribute.
     """
@@ -479,11 +533,70 @@ class _SavedCursor:
     decom: bool = False
     g_sets: tuple[Charset, Charset, Charset, Charset] = ("B", "B", "B", "B")
     gl: int = 0
+    single_shift: int | None = None
     protected: bool = False
+
+
+def _make_snapshot(
+    *,
+    rows: tuple[_Row, ...],
+    history: _FrozenHistory | collections.abc.Sequence[FrozenRow] = (
+        _EMPTY_FROZEN_HISTORY
+    ),
+    cols: int,
+    cursor: Cursor,
+    title: str,
+    cwd: str,
+    cwd_uri: str = "",
+    modes: frozenset[Mode],
+    active_is_alt: bool,
+    prompt_zones: tuple[PromptZone, ...],
+    program_status: ProgramStatus | None,
+    program_statuses: collections.abc.Mapping[str, ProgramStatus],
+    generation: int,
+    images: collections.abc.Mapping[int, ImageMeta] | None = None,
+    placements: tuple[ImagePlacement, ...] = (),
+    scrolled_total: int | None = None,
+    evicted_total: int | None = None,
+) -> Snapshot:
+    snap = object.__new__(Snapshot)
+    object.__setattr__(snap, "_frozen", False)
+    snap._rows = rows
+    hist_obj = _FrozenHistory.from_sequence(history)
+    snap._history = hist_obj
+    snap._cols = cols
+    eff_scrolled = (
+        (0 if active_is_alt else len(hist_obj))
+        if scrolled_total is None
+        else scrolled_total
+    )
+    snap._scrolled_total = eff_scrolled
+    snap._evicted_total = (
+        (0 if active_is_alt else max(0, eff_scrolled - len(hist_obj)))
+        if evicted_total is None
+        else evicted_total
+    )
+    snap.cursor = cursor
+    snap.title = title
+    snap.cwd = cwd
+    snap.cwd_uri = cwd_uri
+    snap.modes = modes
+    snap.active_is_alt = active_is_alt
+    snap.prompt_zones = prompt_zones
+    snap.program_status = program_status
+    snap.program_statuses = types.MappingProxyType(dict(program_statuses))
+    snap.generation = generation
+    snap.images = types.MappingProxyType(dict(images) if images is not None else {})
+    snap.placements = placements
+    object.__setattr__(snap, "_frozen", True)
+    return snap
 
 
 class Snapshot:
     """Immutable point-in-time capture of terminal screen, history, and metadata.
+
+    Obtain instances via :meth:`Terminal.snapshot`, :attr:`Terminal.committed`,
+    or :meth:`Snapshot.from_tmux_capture`.
 
     Attributes
     ----------
@@ -535,62 +648,29 @@ class Snapshot:
         "title",
     )
 
-    def __init__(
-        self,
-        *,
-        rows: tuple[_Row, ...],
-        history: _FrozenHistory | collections.abc.Sequence[FrozenRow] = (
-            _EMPTY_FROZEN_HISTORY
-        ),
-        cols: int,
-        cursor: Cursor,
-        title: str,
-        cwd: str,
-        cwd_uri: str = "",
-        modes: frozenset[Mode],
-        active_is_alt: bool,
-        prompt_zones: tuple[PromptZone, ...],
-        program_status: ProgramStatus | None,
-        program_statuses: collections.abc.Mapping[str, ProgramStatus],
-        generation: int,
-        images: collections.abc.Mapping[int, ImageMeta] | None = None,
-        placements: tuple[ImagePlacement, ...] = (),
-        scrolled_total: int | None = None,
-        evicted_total: int | None = None,
-    ) -> None:
-        object.__setattr__(self, "_frozen", False)
-        self._rows = rows
-        hist_obj = _FrozenHistory.from_sequence(history)
-        self._history: _FrozenHistory = hist_obj
-        self._cols = cols
-        eff_scrolled = (
-            (0 if active_is_alt else len(hist_obj))
-            if scrolled_total is None
-            else scrolled_total
-        )
-        self._scrolled_total = eff_scrolled
-        self._evicted_total = (
-            (0 if active_is_alt else max(0, eff_scrolled - len(hist_obj)))
-            if evicted_total is None
-            else evicted_total
-        )
-        self.cursor = cursor
-        self.title = title
-        self.cwd = cwd
-        self.cwd_uri = cwd_uri
-        self.modes = modes
-        self.active_is_alt = active_is_alt
-        self.prompt_zones = prompt_zones
-        self.program_status = program_status
-        self.program_statuses: collections.abc.Mapping[str, ProgramStatus] = (
-            types.MappingProxyType(dict(program_statuses))
-        )
-        self.generation = generation
-        self.images: collections.abc.Mapping[int, ImageMeta] = types.MappingProxyType(
-            dict(images) if images is not None else {}
-        )
-        self.placements = placements
-        object.__setattr__(self, "_frozen", True)
+    _cols: int
+    _evicted_total: int
+    _frozen: bool
+    _history: _FrozenHistory
+    _rows: tuple[_Row, ...]
+    _scrolled_total: int
+    active_is_alt: bool
+    cursor: Cursor
+    cwd: str
+    cwd_uri: str
+    generation: int
+    images: collections.abc.Mapping[int, ImageMeta]
+    modes: frozenset[Mode]
+    placements: tuple[ImagePlacement, ...]
+    program_status: ProgramStatus | None
+    program_statuses: collections.abc.Mapping[str, ProgramStatus]
+    prompt_zones: tuple[PromptZone, ...]
+    title: str
+
+    def __new__(cls, *args: object, **kwargs: object) -> t.NoReturn:
+        """Disallow direct construction; call :meth:`Terminal.snapshot`."""
+        msg = "Snapshot cannot be instantiated directly; call Terminal.snapshot()"
+        raise TypeError(msg)
 
     def __setattr__(self, name: str, value: object) -> None:
         """Reject attribute mutation once snapshot initialization completes."""
@@ -609,14 +689,21 @@ class Snapshot:
         cols: int = 80,
         scrollback: int | None = None,
         flagged: bool = False,
+        trim_trailing: bool = False,
         joined_capture: CaptureInput | None = None,
         saved_primary_capture: CaptureInput | None = None,
         saved_primary_flagged: bool | None = None,
+        saved_primary_trim_trailing: bool | None = None,
+        saved_primary_joined_capture: CaptureInput | None = None,
+        post_metadata: TmuxPaneMetadata | str | None = None,
         profile: Profile = TMUX_PROFILE,
         policy: Policy = TMUX_CAPTURE_POLICY,
         limits: Limits = DEFAULT_LIMITS,
     ) -> Snapshot:
-        """Decode ``tmux capture-pane`` output directly into a :class:`Snapshot`."""
+        """Decode ``tmux capture-pane`` output directly into a :class:`Snapshot`.
+
+        See :func:`~libvt.tmux.decode_tmux_capture` for parameter semantics.
+        """
         from libvt.tmux import decode_tmux_capture
 
         return decode_tmux_capture(
@@ -626,9 +713,13 @@ class Snapshot:
             cols=cols,
             scrollback=scrollback,
             flagged=flagged,
+            trim_trailing=trim_trailing,
             joined_capture=joined_capture,
             saved_primary_capture=saved_primary_capture,
             saved_primary_flagged=saved_primary_flagged,
+            saved_primary_trim_trailing=saved_primary_trim_trailing,
+            saved_primary_joined_capture=saved_primary_joined_capture,
+            post_metadata=post_metadata,
             profile=profile,
             policy=policy,
             limits=limits,
@@ -709,7 +800,8 @@ class Snapshot:
             msg = f"abs_row {abs_row} was evicted (earliest retained is {first_abs})"
             raise IndexError(msg)
         if abs_row < self._scrolled_total:
-            return RowView(self._history.at(abs_row - first_abs))
+            fr = self._history.at(abs_row - first_abs)
+            return RowView(fr, range(max(self._cols, fr.used)))
         rel = abs_row - self._scrolled_total
         if rel < len(self._rows):
             return RowView(self._rows[rel])
@@ -719,7 +811,7 @@ class Snapshot:
     @property
     def history(self) -> collections.abc.Sequence[RowView]:
         """Return ``O(1)`` immutable :class:`RowView` sequence over scrollback rows."""
-        return _HistoryView(self._history)
+        return _HistoryView(self._history, cols=self._cols)
 
     @property
     def lines(self) -> tuple[str, ...]:
@@ -915,26 +1007,41 @@ class Formatter:
         export_modes = snapshot.modes - TRANSIENT_SNAPSHOT_MODES
         if not snapshot.active_is_alt:
             export_modes = export_modes - ALT_SCREEN_MODES
-        for mode in sorted(export_modes, key=int):
-            raw = int(mode)
-            if raw & DEC_PRIVATE_MASK:
-                code = raw & ~DEC_PRIVATE_MASK
-                if mode not in (
-                    Mode.DECAWM,
-                    Mode.DECTCEM,
-                    Mode.GRAPHEME_CLUSTERING,
-                ):
-                    out.append(f"\x1b[?{code}h")
-            else:
-                out.append(f"\x1b[{raw}h")
-        if Mode.DECTCEM not in export_modes:
-            out.append("\x1b[?25l")
+        else:
+            for alt_mode in sorted(export_modes & ALT_SCREEN_MODES, key=int):
+                code = int(alt_mode) & ~DEC_PRIVATE_MASK
+                out.append(f"\x1b[?{code}h")
+        if Mode.GRAPHEME_CLUSTERING not in export_modes:
+            out.append("\x1b[?2027l")
         cur_style = DEFAULT_STYLE
         cur_link: Hyperlink | None = None
+        cols = snapshot.cols
+        n_rows = len(snapshot._rows)
         for r_idx, row in enumerate(snapshot._rows):
+            eff_wrapped = row.wrapped and r_idx + 1 < n_rows
             if r_idx > 0:
-                out.append("\r\n" if not snapshot._rows[r_idx - 1].wrapped else "")
-            limit = row.used if row.wrapped else row.text_used
+                prev_wrapped = snapshot._rows[r_idx - 1].wrapped
+                if not prev_wrapped:
+                    out.append("\r\n")
+                elif not eff_wrapped and row.text_used == 0 and cols > 0:
+                    if cur_link is not None:
+                        out.append("\x1b]8;;\x1b\\")
+                        cur_link = None
+                    if cur_style != DEFAULT_STYLE:
+                        out.append("\x1b[0m")
+                        cur_style = DEFAULT_STYLE
+                    out.append(f" \x1b[{r_idx + 1};1H\x1b[K")
+            if eff_wrapped:
+                has_spacer_head = (
+                    cols > 0
+                    and raw_width_bits(row.attr_at(cols - 1))
+                    == int(WidthRole.SPACER_HEAD)
+                    and raw_width_bits(snapshot._rows[r_idx + 1].attr_at(0))
+                    == int(WidthRole.WIDE)
+                )
+                limit = max(0, cols - 1) if has_spacer_head else cols
+            else:
+                limit = min(cols, row.text_used)
             for c in range(limit):
                 word = row.attr_at(c)
                 rb = raw_width_bits(word)
@@ -953,11 +1060,11 @@ class Formatter:
                 if style != cur_style:
                     out.append(_style_to_sgr(style))
                     cur_style = style
-                out.append(row.chars[c])
-            if not row.wrapped and row.used > limit:
+                out.append(row.char_at(c))
+            if not eff_wrapped and row.used > limit:
                 cur_col_pos = limit
                 span_c = limit
-                row_used = min(snapshot.cols, row.used)
+                row_used = min(cols, row.used)
                 while span_c < row_used:
                     word = row.attr_at(span_c)
                     ext = row.ext_at(span_c)
@@ -987,7 +1094,7 @@ class Formatter:
                         if style != cur_style:
                             out.append(_style_to_sgr(style))
                             cur_style = style
-                        if end_c == snapshot.cols:
+                        if end_c == cols:
                             out.append("\x1b[K")
                         else:
                             out.append(f"\x1b[{end_c - span_c}X")
@@ -996,7 +1103,37 @@ class Formatter:
             out.append("\x1b]8;;\x1b\\")
         if cur_style != DEFAULT_STYLE:
             out.append("\x1b[0m")
-        out.append(f"\x1b[{snapshot.cursor.row + 1};{snapshot.cursor.col + 1}H")
+        for mode in sorted(export_modes - ALT_SCREEN_MODES, key=int):
+            raw = int(mode)
+            if raw & DEC_PRIVATE_MASK:
+                code = raw & ~DEC_PRIVATE_MASK
+                if mode not in (
+                    Mode.DECAWM,
+                    Mode.DECTCEM,
+                    Mode.ALTERNATE_SCROLL,
+                    Mode.GRAPHEME_CLUSTERING,
+                ):
+                    out.append(f"\x1b[?{code}h")
+            else:
+                out.append(f"\x1b[{raw}h")
+        if Mode.DECAWM not in export_modes:
+            out.append("\x1b[?7l")
+        if Mode.DECTCEM not in export_modes:
+            out.append("\x1b[?25l")
+        if Mode.ALTERNATE_SCROLL not in export_modes:
+            out.append("\x1b[?1007l")
+        cur = snapshot.cursor
+        if (cur.shape, cur.blinking) != (CursorShape.BLOCK, True):
+            decscusr_map: dict[tuple[CursorShape, bool], int] = {
+                (CursorShape.BLOCK, False): 2,
+                (CursorShape.UNDERLINE, True): 3,
+                (CursorShape.UNDERLINE, False): 4,
+                (CursorShape.BAR, True): 5,
+                (CursorShape.BAR, False): 6,
+            }
+            ps = decscusr_map.get((cur.shape, cur.blinking), 1)
+            out.append(f"\x1b[{ps} q")
+        out.append(f"\x1b[{cur.row + 1};{cur.col + 1}H")
         return "".join(out)
 
     def _render_html(self, snapshot: Snapshot) -> str:
@@ -1117,25 +1254,107 @@ class _TerminalSink:
         self._term._handle_window_rename(data)
 
 
+def _utf8_len(text: str) -> int:
+    return len(text) if text.isascii() else len(text.encode("utf-8", "surrogatepass"))
+
+
 def _event_byte_cost(event: Event) -> int:
     if isinstance(event, Passthrough):
         return 64 + len(event.data)
     if isinstance(event, SixelGraphic):
-        return 64 + len(event.data.payload)
+        return 64 + len(event.data.payload) + len(event.data.params) * 8
     if isinstance(event, KittyGraphic):
-        return 64 + len(event.command.payload)
+        ctrl_cost = sum(
+            32 + _utf8_len(k) + _utf8_len(v) for k, v in event.command.control.items()
+        )
+        return 64 + len(event.command.payload) + ctrl_cost
     if isinstance(event, ClipboardWrite):
-        return 64 + len(event.text)
-    return 64
+        return 64 + _utf8_len(event.selection) + _utf8_len(event.text)
+    if isinstance(event, TitleChanged):
+        return 64 + _utf8_len(event.title)
+    if isinstance(event, WindowRenamed):
+        return 64 + _utf8_len(event.name)
+    if isinstance(event, WorkingDirectoryChanged):
+        return 64 + _utf8_len(event.uri) + _utf8_len(event.path)
+    if isinstance(event, ProgramStatusChanged):
+        cost = 64 + _utf8_len(event.task_id)
+        st = event.status
+        if st is not None:
+            cost += 64 + _utf8_len(st.id)
+            if st.app is not None:
+                cost += _utf8_len(st.app)
+            if st.effective_app is not None:
+                cost += _utf8_len(st.effective_app)
+            if st.title is not None:
+                cost += _utf8_len(st.title)
+            if st.msg is not None:
+                cost += _utf8_len(st.msg)
+        return cost
+    if isinstance(event, UnhandledSequence):
+        return 64 + _utf8_len(event.kind) + _utf8_len(event.summary)
+    if isinstance(
+        event,
+        (
+            Bell,
+            PromptMark,
+            RenderHoldChanged,
+            ColorSchemeQueried,
+            InBandResize,
+            ScreenErased,
+        ),
+    ):
+        return 64
+    t.assert_never(event)
+
+
+def _parse_ascii_uint_bytes(raw: bytes, *, max_val: int) -> int | None:
+    if not raw:
+        return None
+    acc = 0
+    for b in raw:
+        if not (0x30 <= b <= 0x39):
+            return None
+        acc = acc * 10 + (b - 0x30)
+        if acc > max_val:
+            return None
+    return acc
+
+
+def _format_osc_rgb(rgb: tuple[int, int, int]) -> str:
+    r, g, b = rgb
+    return f"rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"
+
+
+def _parse_ascii_hex(raw: str) -> int | None:
+    if not raw:
+        return None
+    acc = 0
+    for ch in raw:
+        code = ord(ch)
+        if 0x30 <= code <= 0x39:
+            digit = code - 0x30
+        elif 0x41 <= code <= 0x46:
+            digit = code - 0x41 + 10
+        elif 0x61 <= code <= 0x66:
+            digit = code - 0x61 + 10
+        else:
+            return None
+        acc = (acc << 4) | digit
+    return acc
 
 
 def _parse_osc_rgb(spec: bytes) -> tuple[int, int, int] | None:
-    text = spec.decode("ascii", errors="ignore").strip()
+    try:
+        text = spec.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return None
     if text.startswith("#") and len(text) == 7:
-        try:
-            return (int(text[1:3], 16), int(text[3:5], 16), int(text[5:7], 16))
-        except ValueError:
+        r = _parse_ascii_hex(text[1:3])
+        g = _parse_ascii_hex(text[3:5])
+        b = _parse_ascii_hex(text[5:7])
+        if r is None or g is None or b is None:
             return None
+        return (r, g, b)
     if text.lower().startswith("rgb:"):
         parts = text[4:].split("/")
         if len(parts) != 3:
@@ -1144,9 +1363,8 @@ def _parse_osc_rgb(spec: bytes) -> tuple[int, int, int] | None:
         for comp in parts:
             if not (1 <= len(comp) <= 4):
                 return None
-            try:
-                raw = int(comp, 16)
-            except ValueError:
+            raw = _parse_ascii_hex(comp)
+            if raw is None:
                 return None
             scale = (1 << (4 * len(comp))) - 1
             vals.append((raw * 255) // scale)
@@ -1171,7 +1389,14 @@ _TERMINFO_CAPS: dict[str, str] = {
 
 
 class Terminal:
-    """Sans-I/O virtual terminal emulator over a streaming VT500 parser."""
+    """Sans-I/O virtual terminal emulator over a streaming VT500 parser.
+
+    Every method call and attribute read on a :class:`Terminal` instance
+    (including capturing state via :meth:`snapshot` or :attr:`committed`)
+    belongs to a single owning thread or ``asyncio`` event loop unless
+    externally synchronized. Returned :class:`Snapshot` values are immutable
+    and safe to pass across threads without locking.
+    """
 
     def __init__(
         self,
@@ -1200,6 +1425,19 @@ class Terminal:
         self._recorder = recorder
         self._events: collections.deque[Event] = collections.deque()
         self._event_bytes: int = 0
+        self._terminal_id: int = _alloc_terminal_id()
+        self._generation: int = 0
+        self._committed_generation: int = 0
+        self._epoch: int = 0
+        self._aux_revision: int = 0
+        self._sync_generation: int = 0
+        self._sync_hold_pending: bool = False
+        self._cached_snapshot: Snapshot | None = None
+        self._cached_row_gen: int = -1
+        self._held_snapshot: Snapshot | None = None
+        self._held_sync_token: SyncToken | None = None
+        self._step_event: StopOn = StopOn.NONE
+        self._passthrough_depth: int = 0
         self._screens = ScreenSet(
             rows=rows,
             cols=cols,
@@ -1209,10 +1447,15 @@ class Terminal:
             max_images=limits.max_images,
             max_placements=limits.max_placements,
             max_image_dimension=limits.max_image_dimension,
+            top_margin_scrolls_to_history=profile.top_margin_scrolls_to_history,
+            on_mutate=self._on_screen_mutate,
         )
-        self._modes = ModeState()
+        self._modes = ModeState(
+            on_mutate=self._before_mutate,
+            on_set_mode=self._intercept_mode_set,
+        )
         if newline_mode:
-            self._modes.set_mode(Mode.LNM, enabled=True)
+            self._modes._enabled.add(Mode.LNM)
         self._parser = Parser(
             encoding=encoding,
             tmux_window_rename=profile.tmux_window_rename,
@@ -1238,6 +1481,8 @@ class Terminal:
         self._single_shift: int | None = None
         self._saved_primary = _SavedCursor(g_sets=def_g)
         self._saved_alt = _SavedCursor(g_sets=def_g)
+        self._saved_decsc = _SavedCursor(g_sets=def_g)
+        self._has_alt_saved: bool = False
         self._last_printed: str = ""
         self._last_printed_pos: tuple[int, int] | None = None
         self._cluster_state: int = CLUSTER_NONE
@@ -1247,6 +1492,8 @@ class Terminal:
         self._window_name: str = ""
         self._fg_rgb: tuple[int, int, int] = profile.fg_rgb
         self._bg_rgb: tuple[int, int, int] = profile.bg_rgb
+        self._cursor_rgb: tuple[int, int, int] = profile.cursor_rgb
+        self._palette_overrides: dict[int, tuple[int, int, int]] = {}
         self._title_stack: list[str] = []
         self._cwd: str = ""
         self._cwd_uri: str = ""
@@ -1257,17 +1504,6 @@ class Terminal:
             max_records=limits.max_status_records,
         )
         self._replies = bytearray()
-        self._terminal_id: int = _alloc_terminal_id()
-        self._generation: int = 0
-        self._epoch: int = 0
-        self._aux_revision: int = 0
-        self._sync_generation: int = 0
-        self._sync_hold_pending: bool = False
-        self._cached_snapshot: Snapshot | None = None
-        self._held_snapshot: Snapshot | None = None
-        self._held_sync_token: SyncToken | None = None
-        self._step_event: StopOn = StopOn.NONE
-        self._passthrough_depth: int = 0
 
     @classmethod
     def from_size(
@@ -1299,14 +1535,21 @@ class Terminal:
         cols: int = 80,
         scrollback: int | None = None,
         flagged: bool = False,
+        trim_trailing: bool = False,
         joined_capture: CaptureInput | None = None,
         saved_primary_capture: CaptureInput | None = None,
         saved_primary_flagged: bool | None = None,
+        saved_primary_trim_trailing: bool | None = None,
+        saved_primary_joined_capture: CaptureInput | None = None,
+        post_metadata: TmuxPaneMetadata | str | None = None,
         profile: Profile = TMUX_PROFILE,
         policy: Policy = TMUX_CAPTURE_POLICY,
         limits: Limits = DEFAULT_LIMITS,
     ) -> Terminal:
-        """Reconstruct a live :class:`Terminal` from ``tmux capture-pane`` output."""
+        """Reconstruct a live :class:`Terminal` from ``tmux capture-pane`` output.
+
+        See :func:`~libvt.tmux.decode_tmux_capture` for parameter semantics.
+        """
         from libvt.tmux import decode_tmux_capture
 
         return decode_tmux_capture(
@@ -1316,9 +1559,13 @@ class Terminal:
             cols=cols,
             scrollback=scrollback,
             flagged=flagged,
+            trim_trailing=trim_trailing,
             joined_capture=joined_capture,
             saved_primary_capture=saved_primary_capture,
             saved_primary_flagged=saved_primary_flagged,
+            saved_primary_trim_trailing=saved_primary_trim_trailing,
+            saved_primary_joined_capture=saved_primary_joined_capture,
+            post_metadata=post_metadata,
             profile=profile,
             policy=policy,
             limits=limits,
@@ -1410,6 +1657,11 @@ class Terminal:
         return self._screens.active.keyboard_stack.flags
 
     @property
+    def modify_other_keys(self) -> int:
+        """Return active screen's ``XTMODKEYS`` ``modifyOtherKeys`` level."""
+        return self._screens.active.modify_other_keys
+
+    @property
     def synchronized(self) -> bool:
         """Return ``True`` while DEC mode ``?2026`` synchronized output is active."""
         return self._modes.is_set(Mode.SYNCHRONIZED_OUTPUT)
@@ -1418,6 +1670,11 @@ class Terminal:
     def sync_generation(self) -> int:
         """Return monotonic ``?2026`` synchronized-update batch counter."""
         return self._sync_generation
+
+    @property
+    def committed_generation(self) -> int:
+        """Return monotonic counter incremented whenever :attr:`committed` advances."""
+        return self._committed_generation
 
     @property
     def prompt_zones(self) -> tuple[PromptZone, ...]:
@@ -1482,7 +1739,7 @@ class Terminal:
         if exclude_modes:
             modes = modes - exclude_modes
         active_alt = self._screens.active_is_alt
-        return Snapshot(
+        return _make_snapshot(
             rows=tuple(r.clone() for r in scr._rows),
             history=self._screens.primary._history.freeze(),
             cols=scr.cols,
@@ -1514,22 +1771,24 @@ class Terminal:
         if exclude_modes:
             modes = modes - exclude_modes
         gfx_rev = scr._gfx.revision if scr._gfx is not None else 0
-        return SyncToken(
-            terminal_id=self._terminal_id,
-            view=view,
-            epoch=self._epoch,
-            revision=current_row_gen(),
-            scrolled_total=prim._scrolled_total,
-            evicted_total=prim._evicted_total,
-            history_clear_at=prim._history_clear_at,
-            history_clear_seq=prim._history_clear_seq,
-            cursor=scr.cursor,
-            modes=modes,
-            title=self._title,
-            cwd=self._cwd,
-            cwd_uri=self._cwd_uri,
-            aux_revision=self._aux_revision,
-            graphics_revision=gfx_rev,
+        return _make_sync_token(
+            _SyncState(
+                terminal_id=self._terminal_id,
+                view=view,
+                epoch=self._epoch,
+                revision=self._screens._row_gen,
+                scrolled_total=prim._scrolled_total,
+                evicted_total=prim._evicted_total,
+                history_clear_at=prim._history_clear_at,
+                history_clear_seq=prim._history_clear_seq,
+                cursor=scr.cursor,
+                modes=modes,
+                title=self._title,
+                cwd=self._cwd,
+                cwd_uri=self._cwd_uri,
+                aux_revision=self._aux_revision,
+                graphics_revision=gfx_rev,
+            )
         )
 
     def _ensure_sync_snapshot(self) -> None:
@@ -1608,12 +1867,17 @@ class Terminal:
 
         if token is None:
             return _full(ResyncReason.INITIAL)
-        if token.terminal_id != self._terminal_id or token.view != view:
+        if not isinstance(token, SyncToken):
+            msg = f"token must be SyncToken or None, got {type(token).__name__}"
+            raise TypeError(msg)
+        cur_st = cur_tok._state
+        tok_st = token._state
+        if tok_st.terminal_id != self._terminal_id or tok_st.view != view:
             return _full(ResyncReason.TERMINAL_MISMATCH)
-        if token.epoch != cur_tok.epoch:
+        if tok_st.epoch != cur_st.epoch:
             return _full(ResyncReason.EPOCH_CHANGED)
 
-        if token == cur_tok:
+        if tok_st == cur_st:
             return ScreenDelta(
                 token=cur_tok,
                 from_token=token,
@@ -1630,7 +1894,7 @@ class Terminal:
                 snapshot=cur_snap,
             )
 
-        hist_cleared = cur_tok.history_clear_seq != token.history_clear_seq
+        hist_cleared = cur_st.history_clear_seq != tok_st.history_clear_seq
         hist_len = len(cur_snap._history)
         zero_hist_cap = self._screens.primary._history.maxlen == 0 and hist_len == 0
         new_hist: collections.abc.Sequence[RowView]
@@ -1639,7 +1903,7 @@ class Terminal:
                 new_hist = ()
                 evicted_cnt = 0
             else:
-                post_clear = max(0, cur_tok.scrolled_total - cur_tok.history_clear_at)
+                post_clear = max(0, cur_st.scrolled_total - cur_st.history_clear_at)
                 if post_clear > hist_len:
                     return _full(ResyncReason.HISTORY_EVICTED)
                 new_hist = (
@@ -1647,7 +1911,7 @@ class Terminal:
                 )
                 evicted_cnt = 0
         else:
-            added = max(0, cur_tok.scrolled_total - token.scrolled_total)
+            added = max(0, cur_st.scrolled_total - tok_st.scrolled_total)
             if zero_hist_cap:
                 new_hist = ()
                 evicted_cnt = 0
@@ -1655,17 +1919,17 @@ class Terminal:
                 if added > hist_len:
                     return _full(ResyncReason.HISTORY_EVICTED)
                 new_hist = cur_snap.history[hist_len - added :] if added > 0 else ()
-                evicted_cnt = max(0, cur_tok.evicted_total - token.evicted_total)
+                evicted_cnt = max(0, cur_st.evicted_total - tok_st.evicted_total)
 
         v_scroll = (
             0
             if cur_snap.active_is_alt
-            else max(0, cur_tok.scrolled_total - token.scrolled_total)
+            else max(0, cur_st.scrolled_total - tok_st.scrolled_total)
         )
         dirty = tuple(
             idx
             for idx, r in enumerate(cur_snap._rows)
-            if r.content_gen > token.revision
+            if r.content_gen > tok_st.revision
         )
         return ScreenDelta(
             token=cur_tok,
@@ -1676,27 +1940,30 @@ class Terminal:
             new_history=new_hist,
             history_evicted=evicted_cnt,
             history_cleared=hist_cleared,
-            cursor_changed=cur_tok.cursor != token.cursor,
-            modes_changed=cur_tok.modes != token.modes,
+            cursor_changed=cur_st.cursor != tok_st.cursor,
+            modes_changed=cur_st.modes != tok_st.modes,
             metadata_changed=(
-                cur_tok.title != token.title
-                or cur_tok.cwd != token.cwd
-                or cur_tok.cwd_uri != token.cwd_uri
-                or cur_tok.aux_revision != token.aux_revision
+                cur_st.title != tok_st.title
+                or cur_st.cwd != tok_st.cwd
+                or cur_st.cwd_uri != tok_st.cwd_uri
+                or cur_st.aux_revision != tok_st.aux_revision
             ),
-            graphics_changed=cur_tok.graphics_revision != token.graphics_revision,
+            graphics_changed=cur_st.graphics_revision != tok_st.graphics_revision,
             snapshot=cur_snap,
         )
 
     def snapshot(self) -> Snapshot:
         """Capture an immutable :class:`Snapshot` of live terminal state."""
+        cur_row_gen = self._screens._row_gen
         if (
             self._cached_snapshot is not None
             and self._cached_snapshot.generation == self._generation
+            and self._cached_row_gen == cur_row_gen
         ):
             return self._cached_snapshot
         snap = self._build_snapshot()
         self._cached_snapshot = snap
+        self._cached_row_gen = cur_row_gen
         return snap
 
     @t.overload
@@ -1729,15 +1996,14 @@ class Terminal:
             max_ev = self._limits.max_events
             max_bytes = self._limits.max_event_bytes
             cost = _event_byte_cost(event)
-            if max_ev > 0 and max_bytes > 0:
+            if max_ev > 0 and max_bytes > 0 and cost <= max_bytes:
                 while self._events and (
                     len(self._events) >= max_ev or self._event_bytes + cost > max_bytes
                 ):
                     dropped = self._events.popleft()
                     self._event_bytes -= _event_byte_cost(dropped)
-                if cost <= max_bytes:
-                    self._events.append(event)
-                    self._event_bytes += cost
+                self._events.append(event)
+                self._event_bytes += cost
         if self._on_event is not None:
             self._on_event(event)
 
@@ -1749,7 +2015,7 @@ class Terminal:
             self._emit_event(UnhandledSequence(kind=kind, summary=summary))
 
     def drain_events(self) -> tuple[Event, ...]:
-        """Return and clear buffered :data:`~libvt.events.Event` records."""
+        """Return and clear buffered ``Event`` records from :mod:`libvt.events`."""
         if not self._events:
             return ()
         out = tuple(self._events)
@@ -1771,6 +2037,10 @@ class Terminal:
             event,
             modes=self._modes,
             kitty_flags=self.kitty_keyboard_flags,
+            modify_other_keys=self.modify_other_keys,
+            active_is_alt=self._screens.active_is_alt,
+            cell_width_px=self._profile.cell_width_px,
+            cell_height_px=self._profile.cell_height_px,
         )
 
     def expire_synchronized_output(
@@ -1786,12 +2056,13 @@ class Terminal:
             return False
         if sync_generation is not None and sync_generation != self._sync_generation:
             return False
-        self._modes.set_mode(Mode.SYNCHRONIZED_OUTPUT, enabled=False)
+        self._modes._enabled.discard(Mode.SYNCHRONIZED_OUTPUT)
         self._sync_hold_pending = False
         self._held_snapshot = None
         self._held_sync_token = None
         self._cached_snapshot = None
         self._generation += 1
+        self._committed_generation += 1
         self._emit_event(
             RenderHoldChanged(
                 active=False,
@@ -1833,10 +2104,9 @@ class Terminal:
         )
 
     def _bce_pair(self) -> tuple[int, _CellExt | None]:
-        if self._style.bg is None and self._hyperlink is None:
+        if self._style.bg is None:
             return 0, None
-        bce_style = Style(bg=self._style.bg)
-        return pack_pen_base(bce_style), make_cell_ext(bce_style, self._hyperlink)
+        return pack_pen_base(Style(bg=self._style.bg)), None
 
     def _notify_erase(self, rect: Rect, cause: EraseCause) -> None:
         if (
@@ -1860,10 +2130,46 @@ class Terminal:
         reflow: bool | None = None,
     ) -> None:
         """Resize terminal screens to ``(rows, cols)``."""
+        if isinstance(rows, bool) or isinstance(cols, bool) or rows < 1 or cols < 1:
+            msg = f"rows and cols must be >= 1, got ({rows!r}, {cols!r})"
+            raise ValueError(msg)
         eff_reflow = self._profile.reflow_on_resize if reflow is None else reflow
         self._before_mutate()
         self._clear_cluster_anchor()
-        self._screens.resize(rows=rows, cols=cols, reflow=eff_reflow)
+        old_zones = tuple(self._prompt_zones)
+        zone_pins = tuple((z.abs_row, z.col) for z in old_zones)
+        remapped_pins = self._screens._resize_with_pins(
+            rows=rows,
+            cols=cols,
+            reflow=eff_reflow,
+            primary_pins=zone_pins,
+        )
+        if old_zones and len(remapped_pins) == len(old_zones):
+            prim = self._screens.primary
+            min_z_abs = prim._evicted_total
+            max_z_abs = prim._scrolled_total + rows
+            changed_z = False
+            updated_z: list[PromptZone] = []
+            for z, (new_abs, new_col) in zip(old_zones, remapped_pins, strict=True):
+                if new_abs < min_z_abs or new_abs >= max_z_abs:
+                    changed_z = True
+                    continue
+                if new_abs != z.abs_row or new_col != z.col:
+                    updated_z.append(
+                        PromptZone(
+                            kind=z.kind,
+                            abs_row=new_abs,
+                            col=new_col,
+                            exit_code=z.exit_code,
+                        )
+                    )
+                    changed_z = True
+                else:
+                    updated_z.append(z)
+            if changed_z:
+                self._prompt_zones.clear()
+                self._prompt_zones.extend(updated_z)
+                self._aux_revision += 1
         if not self._modes.is_set(Mode.DECAWM):
             self._screens.primary._pending_wrap = False
             self._screens.alternate._pending_wrap = False
@@ -1877,12 +2183,15 @@ class Terminal:
                 decom=self._saved_primary.decom,
                 g_sets=self._saved_primary.g_sets,
                 gl=self._saved_primary.gl,
+                single_shift=self._saved_primary.single_shift,
                 protected=self._saved_primary.protected,
             )
         self._generation += 1
         self._epoch += 1
         if self._modes.is_set(Mode.IN_BAND_RESIZE):
-            self._emit_reply(f"\x1b[48;{rows};{cols};0;0t".encode("ascii"))
+            px_h = rows * max(0, self._profile.cell_height_px)
+            px_w = cols * max(0, self._profile.cell_width_px)
+            self._emit_reply(f"\x1b[48;{rows};{cols};{px_h};{px_w}t".encode("ascii"))
             self._emit_event(InBandResize(rows=rows, cols=cols))
 
     def reset(self, *, soft: bool = False) -> None:
@@ -1904,16 +2213,20 @@ class Terminal:
         self._gl = 0
         self._single_shift = None
         was_sync = self.synchronized
-        was_alt = self._screens.active_is_alt
-        self._modes = ModeState()
-        if self._newline_mode:
-            self._modes.set_mode(Mode.LNM, enabled=True)
-        self._sync_hold_pending = False
-        self._held_snapshot = None
-        self._held_sync_token = None
         if soft:
-            if was_alt:
-                self._modes.sync_alt_screen(active_is_alt=True)
+            for mode_off in (
+                Mode.IRM,
+                Mode.DECOM,
+                Mode.REVERSE_WRAP,
+                Mode.DECCKM,
+                Mode.DECLRMM,
+            ):
+                self._modes.set_mode(mode_off, enabled=False)
+            for mode_on in (
+                Mode.DECAWM,
+                Mode.DECTCEM,
+            ):
+                self._modes.set_mode(mode_on, enabled=True)
             scr = self._screens.active
             scr.scroll_region = ScrollRegion(
                 top=0,
@@ -1921,10 +2234,29 @@ class Terminal:
                 left=0,
                 right=scr.cols - 1,
             )
-            scr._cur_visible = True
+            self._screens.primary._cur_visible = True
+            self._screens.alternate._cur_visible = True
+            scr._cur_shape = CursorShape.BLOCK
+            scr._cur_blinking = True
             scr._pending_wrap = False
-            scr.keyboard_stack.reset()
+            scr._modify_other_keys = 0
+            self._palette_overrides.clear()
+            if self._profile.separate_alt_save_cursor:
+                self._saved_decsc = _SavedCursor(g_sets=def_g)
+            elif self._screens.active_is_alt:
+                self._saved_alt = _SavedCursor(g_sets=def_g)
+            else:
+                self._saved_primary = _SavedCursor(g_sets=def_g)
         else:
+            self._modes = ModeState(
+                on_mutate=self._before_mutate,
+                on_set_mode=self._intercept_mode_set,
+            )
+            if self._newline_mode:
+                self._modes._enabled.add(Mode.LNM)
+            self._sync_hold_pending = False
+            self._held_snapshot = None
+            self._held_sync_token = None
             self._epoch += 1
             self._parser.reset()
             self._passthrough_parser = None
@@ -1933,10 +2265,14 @@ class Terminal:
             self._screens.alternate.reset()
             self._saved_primary = _SavedCursor(g_sets=def_g)
             self._saved_alt = _SavedCursor(g_sets=def_g)
+            self._saved_decsc = _SavedCursor(g_sets=def_g)
+            self._has_alt_saved = False
             self._title = ""
             self._window_name = ""
             self._fg_rgb = self._profile.fg_rgb
             self._bg_rgb = self._profile.bg_rgb
+            self._cursor_rgb = self._profile.cursor_rgb
+            self._palette_overrides.clear()
             self._title_stack.clear()
             self._cwd = ""
             self._cwd_uri = ""
@@ -1949,7 +2285,9 @@ class Terminal:
             )
         self._cached_snapshot = None
         self._generation += 1
-        if was_sync:
+        if (not soft and was_sync) or not self.synchronized:
+            self._committed_generation += 1
+        if not soft and was_sync:
             self._emit_event(
                 RenderHoldChanged(
                     active=False,
@@ -1957,9 +2295,61 @@ class Terminal:
                 ),
             )
 
+    def _on_screen_mutate(self, structural: bool) -> None:
+        self._before_mutate()
+        if structural:
+            self._epoch += 1
+
+    def _set_synchronized_output(self, enabled: bool) -> None:
+        was_set = self._modes.is_set(Mode.SYNCHRONIZED_OUTPUT)
+        if enabled == was_set:
+            return
+        self._invalidate_cache()
+        if enabled:
+            self._modes._enabled.add(Mode.SYNCHRONIZED_OUTPUT)
+            self._sync_generation += 1
+            self._sync_hold_pending = True
+            self._held_snapshot = None
+            self._held_sync_token = None
+            self._step_event |= StopOn.SYNC_START
+        else:
+            self._modes._enabled.discard(Mode.SYNCHRONIZED_OUTPUT)
+            self._sync_hold_pending = False
+            self._held_snapshot = None
+            self._held_sync_token = None
+            self._committed_generation += 1
+            self._step_event |= StopOn.SYNC_END
+        self._emit_event(
+            RenderHoldChanged(
+                active=enabled,
+                sync_generation=self._sync_generation,
+            ),
+        )
+
+    def _intercept_mode_set(self, mode: Mode, enabled: bool) -> bool:
+        if mode == Mode.SYNCHRONIZED_OUTPUT:
+            self._set_synchronized_output(enabled)
+            return True
+        if mode == Mode.DECLRMM and not self._profile.declrmm_enabled and enabled:
+            return True
+        if mode == Mode.DECSC_1048 and self._profile.separate_alt_save_cursor:
+            return True
+        if (
+            mode == Mode.MOUSE_SGR_PIXELS
+            and enabled
+            and (self._profile.cell_width_px <= 0 or self._profile.cell_height_px <= 0)
+        ):
+            return True
+        if mode == Mode.DECTCEM:
+            self._screens.primary._cur_visible = enabled
+            self._screens.alternate._cur_visible = enabled
+        return False
+
     def _before_mutate(self) -> None:
         if self._sync_hold_pending:
             self._ensure_sync_snapshot()
+        elif not self.synchronized:
+            self._committed_generation += 1
         self._invalidate_cache()
 
     def feed_str(self, text: str, /) -> None:
@@ -2077,23 +2467,42 @@ class Terminal:
         if clear_cluster:
             self._clear_cluster_anchor()
 
-    def _shift_prompt_zones_below(
+    def _remap_prompt_zones_on_scroll(
         self,
         prev_scrolled: int,
+        *,
+        top: int,
         bottom: int,
-        count: int,
+        rows: int,
+        hist_delta: int,
     ) -> None:
-        if not self._prompt_zones or count <= 0:
+        if not self._prompt_zones or hist_delta <= 0:
             return
-        cutoff = prev_scrolled + bottom
+        if top == 0 and bottom >= rows - 1:
+            return
+        abs_top = prev_scrolled + top
+        abs_bot = prev_scrolled + bottom
         changed = False
         updated: list[PromptZone] = []
         for z in self._prompt_zones:
-            if z.abs_row > cutoff:
+            old_abs = z.abs_row
+            if top == 0:
+                new_abs = old_abs + hist_delta if old_abs > abs_bot else old_abs
+            elif old_abs < prev_scrolled:
+                new_abs = old_abs
+            elif old_abs < abs_top:
+                new_abs = old_abs + hist_delta
+            elif old_abs < abs_top + hist_delta:
+                new_abs = old_abs - top
+            elif old_abs <= abs_bot:
+                new_abs = old_abs
+            else:
+                new_abs = old_abs + hist_delta
+            if new_abs != old_abs:
                 updated.append(
                     PromptZone(
                         kind=z.kind,
-                        abs_row=z.abs_row + count,
+                        abs_row=new_abs,
                         col=z.col,
                         exit_code=z.exit_code,
                     ),
@@ -2117,7 +2526,7 @@ class Terminal:
         )
         if scr._cur_row == bottom and left <= scr._cur_col <= right:
             prev_scrolled = scr._scrolled_total
-            bce_word, bce_ext = self._bce_pair()
+            bce_word, _ = self._bce_pair()
             save_hist = not self._screens.active_is_alt
             scr.scroll_up(
                 1,
@@ -2127,17 +2536,16 @@ class Terminal:
                 right=right,
                 save_history=save_hist,
                 bce_word=bce_word,
-                bce_ext=bce_ext,
             )
             hist_delta = scr._scrolled_total - prev_scrolled
-            if (
-                hist_delta > 0
-                and top == 0
-                and bottom < scr.rows - 1
-                and left == 0
-                and right == scr.cols - 1
-            ):
-                self._shift_prompt_zones_below(prev_scrolled, bottom, hist_delta)
+            if hist_delta > 0 and left == 0 and right == scr.cols - 1:
+                self._remap_prompt_zones_on_scroll(
+                    prev_scrolled,
+                    top=top,
+                    bottom=bottom,
+                    rows=scr.rows,
+                    hist_delta=hist_delta,
+                )
             self._notify_erase(
                 Rect(bottom, left, 1, right - left + 1),
                 EraseCause.SCROLL,
@@ -2172,7 +2580,7 @@ class Terminal:
             self._set_cursor(scr, orig_row + to_bottom, final_col, pending_wrap=False)
             return orig_row
         prev_scrolled = scr._scrolled_total
-        bce_word, bce_ext = self._bce_pair()
+        bce_word, _ = self._bce_pair()
         save_hist = not self._screens.active_is_alt
         scr.scroll_up(
             scroll_cnt,
@@ -2182,17 +2590,16 @@ class Terminal:
             right=right,
             save_history=save_hist,
             bce_word=bce_word,
-            bce_ext=bce_ext,
         )
         hist_delta = scr._scrolled_total - prev_scrolled
-        if (
-            hist_delta > 0
-            and top == 0
-            and bottom < scr.rows - 1
-            and left == 0
-            and right == scr.cols - 1
-        ):
-            self._shift_prompt_zones_below(prev_scrolled, bottom, hist_delta)
+        if hist_delta > 0 and left == 0 and right == scr.cols - 1:
+            self._remap_prompt_zones_on_scroll(
+                prev_scrolled,
+                top=top,
+                bottom=bottom,
+                rows=scr.rows,
+                hist_delta=hist_delta,
+            )
         erase_h = min(scroll_cnt, bottom - top + 1)
         self._notify_erase(
             Rect(bottom - erase_h + 1, left, erase_h, right - left + 1),
@@ -2254,13 +2661,11 @@ class Terminal:
                 set_wrap = can_advance and min_col == 0 and c_col == scr.cols - 1
                 if set_wrap and prev_row == 0 and bottom == 0:
                     scr._rows[0].wrapped = True
-                    bump_row_gen(scr._rows[0])
                 self._linefeed(scr)
                 if set_wrap and not (prev_row == 0 and bottom == 0):
                     wrap_idx = prev_row - 1 if prev_row == bottom else prev_row
                     if 0 <= wrap_idx < scr.rows:
                         scr._rows[wrap_idx].wrapped = True
-                        bump_row_gen(scr._rows[wrap_idx])
                 self._set_cursor(scr, scr._cur_row, min_col, pending_wrap=False)
                 c_col = scr._cur_col
             avail = max_col - c_col + 1
@@ -2437,7 +2842,7 @@ class Terminal:
                             and eff_right - eff_left >= 1
                         ):
                             prev_cluster_len = self._cluster_len
-                            combined = row_obj.chars[pc] + ch
+                            combined = row_obj.char_at(pc) + ch
                             base_pen = row_obj.attr_at(pc) & _PEN_BASE_MASK
                             base_ext = row_obj.ext_at(pc)
                             bce_w, bce_e = self._bce_pair()
@@ -2552,7 +2957,7 @@ class Terminal:
                         if pc == 0 and w_override == 1:
                             scr.heal_wrapped_spacer_head(pr)
                         self._cluster_len += 1
-                        self._last_printed = row_obj.chars[pc]
+                        self._last_printed = row_obj.char_at(pc)
                         if (
                             w_override == 2
                             and cur_role == int(WidthRole.NARROW)
@@ -2620,13 +3025,11 @@ class Terminal:
                 set_wrap = can_advance and min_col == 0 and c_col == scr.cols - 1
                 if set_wrap and c_row == 0 and bottom == 0:
                     scr._rows[0].wrapped = True
-                    bump_row_gen(scr._rows[0])
                 self._linefeed(scr)
                 if set_wrap and not (c_row == 0 and bottom == 0):
                     wrap_idx = c_row - 1 if c_row == bottom else c_row
                     if 0 <= wrap_idx < scr.rows:
                         scr._rows[wrap_idx].wrapped = True
-                        bump_row_gen(scr._rows[wrap_idx])
                 self._set_cursor(scr, scr._cur_row, min_col, pending_wrap=False)
                 c_row = scr._cur_row
                 c_col = scr._cur_col
@@ -2805,9 +3208,9 @@ class Terminal:
         elif byte == 0x0F:  # SI -> G0
             self._gl = 0
 
-    def _save_cursor(self) -> None:
+    def _capture_saved_cursor(self) -> _SavedCursor:
         scr = self._screens.active
-        saved = _SavedCursor(
+        return _SavedCursor(
             row=scr._cur_row,
             col=scr._cur_col,
             pending_wrap=scr._pending_wrap,
@@ -2820,24 +3223,26 @@ class Terminal:
                 self._g_sets[3],
             ),
             gl=self._gl,
+            single_shift=self._single_shift,
             protected=self._protected,
         )
-        if self._screens.active_is_alt:
-            self._saved_alt = saved
-        else:
-            self._saved_primary = saved
 
-    def _restore_cursor(self) -> None:
+    def _apply_saved_cursor(
+        self,
+        saved: _SavedCursor,
+        *,
+        restore_decom: bool = True,
+    ) -> None:
         self._before_mutate()
         scr = self._screens.active
-        saved = self._saved_alt if self._screens.active_is_alt else self._saved_primary
         self._style = saved.style
         self._protected = saved.protected
         self._sync_pen_cache()
         self._g_sets = list(saved.g_sets)
         self._gl = saved.gl
-        self._single_shift = None
-        self._modes.set_mode(Mode.DECOM, enabled=saved.decom)
+        self._single_shift = saved.single_shift
+        if restore_decom:
+            self._modes.set_mode(Mode.DECOM, enabled=saved.decom)
         restored_wrap = (
             False if self._profile.pending_wrap_phantom_col else saved.pending_wrap
         )
@@ -2847,6 +3252,24 @@ class Terminal:
             saved.col,
             pending_wrap=restored_wrap,
         )
+
+    def _save_cursor(self) -> None:
+        saved = self._capture_saved_cursor()
+        if self._profile.separate_alt_save_cursor:
+            self._saved_decsc = saved
+        elif self._screens.active_is_alt:
+            self._saved_alt = saved
+        else:
+            self._saved_primary = saved
+
+    def _restore_cursor(self) -> None:
+        if self._profile.separate_alt_save_cursor:
+            saved = self._saved_decsc
+        else:
+            saved = (
+                self._saved_alt if self._screens.active_is_alt else self._saved_primary
+            )
+        self._apply_saved_cursor(saved)
 
     def _handle_esc(self, intermediates: bytes, final: int) -> None:
         self._last_printed = ""
@@ -2867,7 +3290,7 @@ class Terminal:
                 top, bottom, left, right = self._effective_margins(scr)
                 keep_wrap = self._profile.pending_wrap_phantom_col and scr._pending_wrap
                 if scr._cur_row == top and left <= scr._cur_col <= right:
-                    bce_w, bce_e = self._bce_pair()
+                    bce_w, _ = self._bce_pair()
                     scr.scroll_down(
                         1,
                         top=top,
@@ -2875,7 +3298,6 @@ class Terminal:
                         left=left,
                         right=right,
                         bce_word=bce_w,
-                        bce_ext=bce_e,
                     )
                     self._notify_erase(
                         Rect(top, left, 1, right - left + 1),
@@ -2926,57 +3348,82 @@ class Terminal:
             self._unhandled("esc", f"ESC {inter_s}{chr(final)}")
 
     def _apply_mode(self, code: int, *, private: bool, enabled: bool) -> None:
+        if not (0 <= code < DEC_PRIVATE_MASK):
+            return
         raw = (DEC_PRIVATE_MASK | code) if private else code
         try:
             mode = Mode(raw)
         except ValueError:
             return
-        was_set = self._modes.is_set(mode)
 
         if mode == Mode.SYNCHRONIZED_OUTPUT:
-            if enabled == was_set:
-                return
-            self._invalidate_cache()
-            self._modes.set_mode(mode, enabled=enabled)
-            if enabled:
-                self._sync_generation += 1
-                self._sync_hold_pending = True
-                self._held_snapshot = None
-                self._held_sync_token = None
-                self._step_event |= StopOn.SYNC_START
-            else:
-                self._sync_hold_pending = False
-                self._held_snapshot = None
-                self._held_sync_token = None
-                self._step_event |= StopOn.SYNC_END
-            self._emit_event(
-                RenderHoldChanged(
-                    active=enabled,
-                    sync_generation=self._sync_generation,
-                ),
-            )
+            self._set_synchronized_output(enabled)
+            return
+
+        if mode == Mode.DECLRMM and not self._profile.declrmm_enabled:
+            return
+
+        if mode == Mode.DECSC_1048 and self._profile.separate_alt_save_cursor:
+            return
+
+        if mode == Mode.MOUSE_SGR_PIXELS and (
+            self._profile.cell_width_px <= 0 or self._profile.cell_height_px <= 0
+        ):
             return
 
         if mode in ALT_SCREEN_MODES:
             self._before_mutate()
             self._clear_cluster_anchor()
+            def_g: tuple[Charset, Charset, Charset, Charset] = (
+                "B",
+                self._profile.default_g1_charset,
+                "B",
+                "B",
+            )
+            cur_vis = self._modes.is_set(Mode.DECTCEM)
             if enabled and not self._screens.active_is_alt:
                 if mode == Mode.ALT_SCREEN:
-                    self._save_cursor()
+                    self._saved_primary = self._capture_saved_cursor()
+                    self._has_alt_saved = True
+                self._single_shift = None
                 self._screens.alternate.reset()
+                self._screens.alternate._cur_visible = cur_vis
+                self._saved_alt = _SavedCursor(g_sets=def_g)
                 self._screens.active_is_alt = True
                 self._epoch += 1
                 self._modes.sync_alt_screen(active_is_alt=True, entered_via=mode)
+            elif enabled and self._screens.active_is_alt:
+                if (
+                    mode == Mode.ALT_SCREEN
+                    and not self._profile.separate_alt_save_cursor
+                ):
+                    self._saved_alt = self._capture_saved_cursor()
             elif not enabled and self._screens.active_is_alt:
                 if mode in (Mode.ALT_SCREEN_1047, Mode.ALT_SCREEN):
                     self._screens.alternate.reset()
+                    self._screens.alternate._cur_visible = cur_vis
+                    self._saved_alt = _SavedCursor(g_sets=def_g)
+                self._single_shift = None
+                self._screens.primary._cur_visible = cur_vis
                 self._screens.active_is_alt = False
                 self._epoch += 1
                 self._modes.sync_alt_screen(active_is_alt=False)
-                if mode == Mode.ALT_SCREEN:
-                    self._restore_cursor()
+                if mode == Mode.ALT_SCREEN and (
+                    not self._profile.separate_alt_save_cursor or self._has_alt_saved
+                ):
+                    self._apply_saved_cursor(
+                        self._saved_primary,
+                        restore_decom=not self._profile.separate_alt_save_cursor,
+                    )
             elif not enabled:
                 self._modes.sync_alt_screen(active_is_alt=False)
+                if mode == Mode.ALT_SCREEN and (
+                    not self._profile.separate_alt_save_cursor or self._has_alt_saved
+                ):
+                    self._apply_saved_cursor(
+                        self._saved_primary,
+                        restore_decom=not self._profile.separate_alt_save_cursor,
+                    )
             return
 
         self._before_mutate()
@@ -2984,7 +3431,8 @@ class Terminal:
         scr = self._screens.active
 
         if mode == Mode.DECTCEM:
-            scr._cur_visible = enabled
+            self._screens.primary._cur_visible = enabled
+            self._screens.alternate._cur_visible = enabled
         elif mode == Mode.DECOM:
             top, _, left, _ = self._effective_margins(scr)
             self._set_cursor(
@@ -3044,7 +3492,6 @@ class Terminal:
         if scroll_clear:
             scr.push_scrollback_and_clear(
                 bce_w,
-                bce_e,
                 include_cursor_row=False,
             )
             self._notify_erase(Rect(0, 0, scr.rows, scr.cols), cause)
@@ -3129,7 +3576,7 @@ class Terminal:
             self._notify_erase(Rect(0, 0, scr.rows, scr.cols), cause)
         elif mode == 22 and not selective:
             if not self._screens.active_is_alt:
-                scr.push_scrollback_and_clear(bce_w, bce_e)
+                scr.push_scrollback_and_clear(bce_w)
             else:
                 for r in range(scr.rows):
                     scr._rows[r].clear_range(0, scr.cols, bce_w, bce_e)
@@ -3228,6 +3675,10 @@ class Terminal:
     ) -> None:
         prev_printed = self._last_printed
         self._last_printed = ""
+        if params.colon_mask != 0 and not (
+            prefix == 0 and not intermediates and final == ord("m")
+        ):
+            return
         scr = self._screens.active
         top, bottom, left, right = self._effective_margins(scr)
 
@@ -3266,15 +3717,30 @@ class Terminal:
 
         # DECRQM: CSI ? Ps $ p or CSI Ps $ p
         if intermediates == b"$" and final == ord("p"):
+            if prefix not in (0, ord("?")) or len(params.values) > 1:
+                return
             private = prefix == ord("?")
             code = params.raw_or_default(0, 0)
-            pm = int(
-                self._modes.decrpm(
-                    code,
-                    private=private,
-                    active_is_alt=self._screens.active_is_alt,
-                ),
-            )
+            if private and (
+                (code == 69 and not self._profile.declrmm_enabled)
+                or (code == 1048 and self._profile.separate_alt_save_cursor)
+                or (
+                    code == 1016
+                    and (
+                        self._profile.cell_width_px <= 0
+                        or self._profile.cell_height_px <= 0
+                    )
+                )
+            ):
+                pm = int(DecrpmValue.NOT_RECOGNIZED)
+            else:
+                pm = int(
+                    self._modes.decrpm(
+                        code,
+                        private=private,
+                        active_is_alt=self._screens.active_is_alt,
+                    ),
+                )
             q = "?" if private else ""
             self._emit_reply(f"\x1b[{q}{code};{pm}$y".encode("ascii"))
             return
@@ -3352,11 +3818,48 @@ class Terminal:
                     scheme = self._profile.color_scheme
                     self._emit_reply(f"\x1b[?997;{int(scheme)}n".encode("ascii"))
                     self._emit_event(ColorSchemeQueried(scheme=scheme))
+            elif final == ord("m"):  # XTQMODKEYS: CSI ? Pp m
+                if len(params.values) == 1 and params.raw_or_default(0, -1) == 4:
+                    self._emit_reply(
+                        f"\x1b[>4;{scr._modify_other_keys}m".encode("ascii"),
+                    )
+            elif final == ord("S") and 1 <= len(params.values) <= 4:  # XTSMGRAPHICS
+                pi = params.raw_or_default(0, 0)
+                self._emit_reply(f"\x1b[?{pi};3S".encode("ascii"))
             return
 
         if prefix != 0:
-            if prefix == ord(">") and final in (ord("m"), ord("n")):
-                # XTMODKEYS: accept quietly
+            if prefix == ord(">") and final == ord("m"):
+                if not params.values:
+                    if scr._modify_other_keys != 0:
+                        self._before_mutate()
+                        scr._modify_other_keys = 0
+                elif len(params.values) <= 2:
+                    pp = params.raw_or_default(0, 0)
+                    if pp == 0 and len(params.values) == 1:
+                        if scr._modify_other_keys != 0:
+                            self._before_mutate()
+                            scr._modify_other_keys = 0
+                    elif pp == 4:
+                        pv = (
+                            params.raw_or_default(1, 0)
+                            if len(params.values) == 2
+                            else 0
+                        )
+                        if pv in (0, 1, 2) and scr._modify_other_keys != pv:
+                            self._before_mutate()
+                            scr._modify_other_keys = pv
+                return
+            if prefix == ord(">") and final == ord("n"):
+                if (
+                    not params.values
+                    or (
+                        len(params.values) == 1
+                        and params.raw_or_default(0, -1) in (0, 4)
+                    )
+                ) and scr._modify_other_keys != 0:
+                    self._before_mutate()
+                    scr._modify_other_keys = 0
                 return
             self._unhandled("csi", f"CSI {chr(prefix)}{chr(final)}")
             return
@@ -3484,62 +3987,68 @@ class Terminal:
             if self._profile.pending_wrap_phantom_col and scr._pending_wrap:
                 return
             self._before_mutate()
-            n = params.get(0, 1)
-            bce_w, bce_e = self._bce_pair()
-            scr.heal_before_edit(c_row, c_col, right + 1)
-            scr._rows[c_row].insert_blanks(
-                c_col,
-                n,
-                left=left,
-                right=right,
-                bce_word=bce_w,
-                bce_ext=bce_e,
-            )
-            if scr._gfx is not None and scr._gfx.has_sixels and left <= c_col <= right:
-                scr._gfx.erase_sixel_rect(
-                    row=c_row,
-                    col=c_col,
-                    rows=1,
-                    cols=right - c_col + 1,
-                    scrolled_total=scr._scrolled_total,
-                    policy=self._profile.sixel_erase_policy,
+            if left <= c_col <= right:
+                n = params.get(0, 1)
+                bce_w, bce_e = self._bce_pair()
+                scr.heal_before_edit(c_row, c_col, right + 1)
+                scr._rows[c_row].insert_blanks(
+                    c_col,
+                    n,
+                    left=left,
+                    right=right,
+                    bce_word=bce_w,
+                    bce_ext=bce_e,
                 )
+                if scr._gfx is not None and scr._gfx.has_sixels:
+                    scr._gfx.erase_sixel_rect(
+                        row=c_row,
+                        col=c_col,
+                        rows=1,
+                        cols=right - c_col + 1,
+                        scrolled_total=scr._scrolled_total,
+                        policy=self._profile.sixel_erase_policy,
+                    )
             self._set_cursor(scr, c_row, c_col, pending_wrap=False)
         elif ch_final == "P":  # DCH
             if self._profile.pending_wrap_phantom_col and scr._pending_wrap:
                 return
             self._before_mutate()
-            n = params.get(0, 1)
-            bce_w, bce_e = self._bce_pair()
-            scr.heal_before_edit(c_row, c_col, right + 1)
-            if c_col == 0 and left == 0 and c_row > 0 and scr._rows[c_row - 1].wrapped:
-                scr._rows[c_row - 1].wrapped = False
-                bump_row_gen(scr._rows[c_row - 1])
-            scr._rows[c_row].delete_cells(
-                c_col,
-                n,
-                left=left,
-                right=right,
-                bce_word=bce_w,
-                bce_ext=bce_e,
-            )
-            if right == scr.cols - 1:
-                scr._rows[c_row].wrapped = False
-            if scr._gfx is not None and scr._gfx.has_sixels and left <= c_col <= right:
-                scr._gfx.erase_sixel_rect(
-                    row=c_row,
-                    col=c_col,
-                    rows=1,
-                    cols=right - c_col + 1,
-                    scrolled_total=scr._scrolled_total,
-                    policy=self._profile.sixel_erase_policy,
+            if left <= c_col <= right:
+                n = params.get(0, 1)
+                bce_w, bce_e = self._bce_pair()
+                scr.heal_before_edit(c_row, c_col, right + 1)
+                if (
+                    c_col == 0
+                    and left == 0
+                    and c_row > 0
+                    and scr._rows[c_row - 1].wrapped
+                ):
+                    scr._rows[c_row - 1].wrapped = False
+                scr._rows[c_row].delete_cells(
+                    c_col,
+                    n,
+                    left=left,
+                    right=right,
+                    bce_word=bce_w,
+                    bce_ext=bce_e,
                 )
+                if right == scr.cols - 1:
+                    scr._rows[c_row].wrapped = False
+                if scr._gfx is not None and scr._gfx.has_sixels:
+                    scr._gfx.erase_sixel_rect(
+                        row=c_row,
+                        col=c_col,
+                        rows=1,
+                        cols=right - c_col + 1,
+                        scrolled_total=scr._scrolled_total,
+                        policy=self._profile.sixel_erase_policy,
+                    )
             self._set_cursor(scr, c_row, c_col, pending_wrap=False)
         elif ch_final == "L":  # IL
             if top <= c_row <= bottom and left <= c_col <= right:
                 self._before_mutate()
                 n = params.get(0, 1)
-                bce_w, bce_e = self._bce_pair()
+                bce_w, _ = self._bce_pair()
                 keep_wrap = (
                     not self._profile.il_dl_resets_col
                     and self._profile.pending_wrap_phantom_col
@@ -3552,7 +4061,6 @@ class Terminal:
                     left=left,
                     right=right,
                     bce_word=bce_w,
-                    bce_ext=bce_e,
                     is_line_op=True,
                 )
                 self._notify_erase(
@@ -3565,7 +4073,7 @@ class Terminal:
             if top <= c_row <= bottom and left <= c_col <= right:
                 self._before_mutate()
                 n = params.get(0, 1)
-                bce_w, bce_e = self._bce_pair()
+                bce_w, _ = self._bce_pair()
                 keep_wrap = (
                     not self._profile.il_dl_resets_col
                     and self._profile.pending_wrap_phantom_col
@@ -3579,7 +4087,6 @@ class Terminal:
                     right=right,
                     save_history=False,
                     bce_word=bce_w,
-                    bce_ext=bce_e,
                     is_line_op=True,
                 )
                 self._notify_erase(
@@ -3595,23 +4102,33 @@ class Terminal:
                 self._set_cursor(scr, c_row, target_col, pending_wrap=keep_wrap)
         elif ch_final == "S":  # SU
             self._before_mutate()
-            n = params.get(0, 1)
-            bce_w, bce_e = self._bce_pair()
+            region_h = bottom - top + 1
+            n = min(params.get(0, 1), region_h)
+            prev_scrolled = scr._scrolled_total
+            bce_w, _ = self._bce_pair()
             scr.scroll_up(
                 n,
                 top=top,
                 bottom=bottom,
                 left=left,
                 right=right,
-                save_history=False,
+                save_history=not self._screens.active_is_alt,
                 bce_word=bce_w,
-                bce_ext=bce_e,
             )
+            hist_delta = scr._scrolled_total - prev_scrolled
+            if hist_delta > 0 and left == 0 and right == scr.cols - 1:
+                self._remap_prompt_zones_on_scroll(
+                    prev_scrolled,
+                    top=top,
+                    bottom=bottom,
+                    rows=scr.rows,
+                    hist_delta=hist_delta,
+                )
             self._notify_erase(
                 Rect(
                     max(top, bottom - n + 1),
                     left,
-                    min(n, bottom - top + 1),
+                    min(n, region_h),
                     right - left + 1,
                 ),
                 EraseCause.SCROLL,
@@ -3620,7 +4137,7 @@ class Terminal:
         elif ch_final == "T":  # SD
             self._before_mutate()
             n = params.get(0, 1)
-            bce_w, bce_e = self._bce_pair()
+            bce_w, _ = self._bce_pair()
             scr.scroll_down(
                 n,
                 top=top,
@@ -3628,7 +4145,6 @@ class Terminal:
                 left=left,
                 right=right,
                 bce_word=bce_w,
-                bce_ext=bce_e,
             )
             self._notify_erase(
                 Rect(top, left, min(n, bottom - top + 1), right - left + 1),
@@ -3673,25 +4189,26 @@ class Terminal:
                 )
         elif ch_final == "s":  # DECSLRM (when ?69 set) or SCOSC
             if self._modes.is_set(Mode.DECLRMM):
-                l_arg = params.get(0, 1) - 1
-                r_arg = params.get(1, scr.cols) - 1
-                l_clamped = max(0, min(scr.cols - 1, l_arg))
-                r_clamped = max(0, min(scr.cols - 1, r_arg))
-                if l_clamped < r_clamped:
-                    sr = scr.scroll_region
-                    scr.scroll_region = ScrollRegion(
-                        top=sr.top,
-                        bottom=sr.bottom,
-                        left=l_clamped,
-                        right=r_clamped,
-                    )
-                    decom = self._modes.is_set(Mode.DECOM)
-                    self._set_cursor(
-                        scr,
-                        sr.top if decom else 0,
-                        l_clamped if decom else 0,
-                    )
-            else:
+                if len(params.values) <= 2:
+                    l_arg = params.get(0, 1) - 1
+                    r_arg = params.get(1, scr.cols) - 1
+                    l_clamped = max(0, min(scr.cols - 1, l_arg))
+                    r_clamped = max(0, min(scr.cols - 1, r_arg))
+                    if l_clamped < r_clamped:
+                        sr = scr.scroll_region
+                        scr.scroll_region = ScrollRegion(
+                            top=sr.top,
+                            bottom=sr.bottom,
+                            left=l_clamped,
+                            right=r_clamped,
+                        )
+                        decom = self._modes.is_set(Mode.DECOM)
+                        self._set_cursor(
+                            scr,
+                            sr.top if decom else 0,
+                            l_clamped if decom else 0,
+                        )
+            elif not self._profile.declrmm_enabled or not params.values:
                 self._save_cursor()
         elif ch_final == "u":  # SCORC
             self._restore_cursor()
@@ -3728,15 +4245,13 @@ class Terminal:
             if op == 18:  # report text area size in chars
                 self._emit_reply(f"\x1b[8;{scr.rows};{scr.cols}t".encode("ascii"))
             elif op == 14:  # report text area size in pixels
-                px_h = scr.rows * self._profile.cell_height_px
-                px_w = scr.cols * self._profile.cell_width_px
+                px_h = scr.rows * max(0, self._profile.cell_height_px)
+                px_w = scr.cols * max(0, self._profile.cell_width_px)
                 self._emit_reply(f"\x1b[4;{px_h};{px_w}t".encode("ascii"))
             elif op == 16:  # report cell size in pixels
-                self._emit_reply(
-                    f"\x1b[6;{self._profile.cell_height_px};{self._profile.cell_width_px}t".encode(
-                        "ascii"
-                    ),
-                )
+                ch_px = max(0, self._profile.cell_height_px)
+                cw_px = max(0, self._profile.cell_width_px)
+                self._emit_reply(f"\x1b[6;{ch_px};{cw_px}t".encode("ascii"))
             elif op == 21 and self._policy.allow_title_report:
                 safe_title = "".join(
                     ch for ch in self._title if " " <= ch <= "~" and ch != "\\"
@@ -3778,12 +4293,17 @@ class Terminal:
             self._cwd = safe_uri
             self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=safe_uri))
             return
-        parsed = urllib.parse.urlsplit(cleaned)
+        try:
+            parsed = urllib.parse.urlsplit(cleaned)
+            raw_host = urllib.parse.unquote(parsed.hostname or "").lower()
+        except ValueError:
+            self._cwd = ""
+            self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=""))
+            return
         if parsed.scheme.lower() != "file" or not parsed.path.startswith("/"):
             self._cwd = ""
             self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=""))
             return
-        raw_host = urllib.parse.unquote(parsed.hostname or "").lower()
         allowed_hosts = (
             self._policy.osc7_hosts
             if self._policy.osc7_hosts is not None
@@ -3794,7 +4314,10 @@ class Terminal:
             self._cwd = ""
             self._emit_event(WorkingDirectoryChanged(uri=safe_uri, path=""))
             return
-        decoded_path = os.fsdecode(raw_path)
+        try:
+            decoded_path = os.fsdecode(raw_path)
+        except UnicodeDecodeError:
+            decoded_path = raw_path.decode("utf-8", errors="surrogateescape")
         if raw_host in allowed_hosts:
             self._cwd = decoded_path
         else:
@@ -3818,6 +4341,45 @@ class Terminal:
             self._emit_event(TitleChanged(title=text))
         elif code == 1:
             return
+        elif code == 4:
+            if not data:
+                return
+            pos = 0
+            n_data = len(data)
+            while pos <= n_data:
+                semi1 = data.find(b";", pos)
+                if semi1 == -1:
+                    break
+                pal_idx = _parse_ascii_uint_bytes(data[pos:semi1], max_val=255)
+                if pal_idx is None:
+                    break
+                semi2 = data.find(b";", semi1 + 1)
+                if semi2 == -1:
+                    spec_b = data[semi1 + 1 :]
+                    pos = n_data + 1
+                else:
+                    spec_b = data[semi1 + 1 : semi2]
+                    pos = semi2 + 1
+                if spec_b == b"?":
+                    if self._policy.allow_color_queries and (
+                        self._on_pty_write is not None
+                        or len(self._replies) + 24 <= self._limits.max_reply_bytes
+                    ):
+                        rgb_val = self._palette_overrides.get(pal_idx)
+                        if rgb_val is None:
+                            rgb_val = _resolve_color_rgb(
+                                IndexedColor(pal_idx),
+                                (0, 0, 0),
+                            )
+                        reply = (f"\x1b]4;{pal_idx};{_format_osc_rgb(rgb_val)}").encode(
+                            "ascii"
+                        )
+                        self._emit_reply(reply + out_term)
+                    continue
+                parsed_pal = _parse_osc_rgb(spec_b)
+                if parsed_pal is None:
+                    break
+                self._palette_overrides[pal_idx] = parsed_pal
         elif code == 7:
             self._update_cwd(data.decode("utf-8", errors="replace"), from_osc7=True)
         elif code == 8:
@@ -3840,39 +4402,98 @@ class Terminal:
         elif code == 9:
             text = data.decode("utf-8", errors="replace")
             parts = text.split(";")
-            if len(parts) >= 2 and parts[0] == "4" and parts[1].isdigit():
-                self._before_mutate()
-                sub = int(parts[1])
-                prog = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None
-                changed, status = self._status_store.apply_osc_9_4(sub, prog)
-                if changed:
-                    self._aux_revision += 1
-                    self._emit_event(ProgramStatusChanged(status=status, task_id=""))
+            if len(parts) >= 2 and parts[0] == "4":
+                sub = _parse_ascii_uint(parts[1], max_val=255)
+                if sub is not None:
+                    self._before_mutate()
+                    prog = (
+                        _parse_ascii_uint(parts[2], max_val=1_000)
+                        if len(parts) >= 3
+                        else None
+                    )
+                    changed, status = self._status_store.apply_osc_9_4(sub, prog)
+                    if changed:
+                        self._aux_revision += 1
+                        self._emit_event(
+                            ProgramStatusChanged(status=status, task_id="")
+                        )
             elif len(parts) >= 2 and parts[0] == "9":
                 self._update_cwd(";".join(parts[1:]), from_osc7=False)
-        elif code in (10, 11):
-            if data == b"?":
-                if self._policy.allow_color_queries:
-                    r, g, b = self._fg_rgb if code == 10 else self._bg_rgb
-                    reply = (
-                        f"\x1b]{code};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"
-                    ).encode("ascii")
-                    self._emit_reply(reply + out_term)
+        elif code in (10, 11, 12):
+            if not data:
                 return
-            parsed_rgb = _parse_osc_rgb(data)
-            if parsed_rgb is not None:
-                if code == 10:
-                    self._fg_rgb = parsed_rgb
+            cur_code = code
+            pos = 0
+            n_data = len(data)
+            while cur_code <= 12 and pos <= n_data:
+                semi = data.find(b";", pos)
+                if semi == -1:
+                    spec_b = data[pos:]
+                    pos = n_data + 1
                 else:
-                    self._bg_rgb = parsed_rgb
-        elif code == 12:
+                    spec_b = data[pos:semi]
+                    pos = semi + 1
+                if spec_b == b"?":
+                    if self._policy.allow_color_queries and (
+                        self._on_pty_write is not None
+                        or len(self._replies) + 23 <= self._limits.max_reply_bytes
+                    ):
+                        cur_rgb = (
+                            self._fg_rgb
+                            if cur_code == 10
+                            else (self._bg_rgb if cur_code == 11 else self._cursor_rgb)
+                        )
+                        reply = (f"\x1b]{cur_code};{_format_osc_rgb(cur_rgb)}").encode(
+                            "ascii"
+                        )
+                        self._emit_reply(reply + out_term)
+                else:
+                    parsed_rgb = _parse_osc_rgb(spec_b)
+                    if parsed_rgb is None:
+                        break
+                    if cur_code == 10:
+                        self._fg_rgb = parsed_rgb
+                    elif cur_code == 11:
+                        self._bg_rgb = parsed_rgb
+                    else:
+                        self._cursor_rgb = parsed_rgb
+                cur_code += 1
+        elif code in (99, 777):
             return
+        elif code == 104:
+            if not self._palette_overrides:
+                return
+            if not data:
+                self._palette_overrides.clear()
+                return
+            saw_nonempty = False
+            pos = 0
+            n_data = len(data)
+            while pos <= n_data:
+                semi = data.find(b";", pos)
+                if semi == -1:
+                    tok = data[pos:]
+                    pos = n_data + 1
+                else:
+                    tok = data[pos:semi]
+                    pos = semi + 1
+                if not tok:
+                    continue
+                saw_nonempty = True
+                pal_idx = _parse_ascii_uint_bytes(tok, max_val=255)
+                if pal_idx is not None:
+                    self._palette_overrides.pop(pal_idx, None)
+            if not saw_nonempty:
+                self._palette_overrides.clear()
         elif code == 110:
-            self._fg_rgb = self._profile.fg_rgb
+            if not data:
+                self._fg_rgb = self._profile.fg_rgb
         elif code == 111:
-            self._bg_rgb = self._profile.bg_rgb
+            if not data:
+                self._bg_rgb = self._profile.bg_rgb
         elif code == 112:
-            return
+            if not data:
+                self._cursor_rgb = self._profile.cursor_rgb
         elif code == 52:
             semi = data.find(b";")
             if semi == -1:
@@ -3899,12 +4520,12 @@ class Terminal:
                 kind = PromptKind(raw_kind)
                 exit_code: int | None = None
                 is_continuation = any(p.strip() == "k=s" for p in parts[1:])
-                if (
-                    kind == PromptKind.COMMAND_FINISHED
-                    and len(parts) >= 2
-                    and parts[1].lstrip("-").isdigit()
-                ):
-                    exit_code = int(parts[1])
+                if kind == PromptKind.COMMAND_FINISHED and len(parts) >= 2:
+                    exit_code = _parse_ascii_int(
+                        parts[1],
+                        min_val=-2_147_483_648,
+                        max_val=2_147_483_647,
+                    )
                 if not self._screens.active_is_alt:
                     abs_r = self._screens.primary.scrolled_total + scr._cur_row
                     zone = PromptZone(
@@ -4076,11 +4697,14 @@ class Terminal:
                     else:
                         post_r = self._advance_rows(scr, s_rows, final_col=0)
                         eff_rows = min(s_rows, max(1, scr.rows - post_r))
-                        min_sixel_abs = (
-                            scr._scrolled_total + (top if in_margins else 0)
-                            if scr._scrolled_total == pre_scrolled
-                            else scr._scrolled_total - len(scr._history)
-                        )
+                        if in_margins and top > 0:
+                            min_sixel_abs = scr._scrolled_total + top
+                        elif scr._scrolled_total == pre_scrolled:
+                            min_sixel_abs = scr._scrolled_total + (
+                                top if in_margins else 0
+                            )
+                        else:
+                            min_sixel_abs = scr._scrolled_total - len(scr._history)
                     gfx.commit_sixel(
                         payload_len=len(data),
                         width_px=w_px,

@@ -47,6 +47,7 @@ conf = merge_sphinx_config(
         ),
     },
     html_favicon="_static/img/libvt.svg",
+    html_css_files=["css/libvt.css"],
     sphinx_font_preload=[
         *DEFAULT_SPHINX_FONT_PRELOAD,
         ("IBM Plex Mono", 600, "normal"),
@@ -60,4 +61,5 @@ conf = merge_sphinx_config(
         "project/adr/_template.md",
     ],
 )
+conf.setdefault("autodoc_default_options", {})["private-members"] = False
 globals().update(conf)
