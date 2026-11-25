@@ -30,8 +30,8 @@ breaking API changes; pin `libvt>=0.0.1a0,<0.1` while the package is pre-1.0.
 
 ## Quickstart
 
-Each call to `feed()` updates the terminal's screen. Read the resulting text,
-cells, and cursor position:
+Each call to [`feed()`][feed] updates the terminal's screen. Read the resulting
+text, cells, and cursor position:
 
 ```python
 >>> import libvt
@@ -44,8 +44,8 @@ cells, and cursor position:
 (0, 11)
 ```
 
-`assert_screen_box()` checks screen contents, wide-character column alignment,
-and cursor coordinates in tests:
+[`assert_screen_box()`][assert_screen_box] checks screen contents,
+wide-character column alignment, and cursor coordinates in tests:
 
 ```python
 >>> from libvt.testing import assert_screen_box
@@ -63,9 +63,9 @@ and cursor coordinates in tests:
 ... )
 ```
 
-`render()` returns screen text after processing terminal output. `strip()`
-removes control sequences without applying cursor movements. `explain()`
-identifies the sequences in a byte stream:
+[`render()`][render] returns screen text after processing terminal output.
+[`strip()`][strip] removes control sequences without applying cursor movements.
+[`explain()`][explain] identifies the sequences in a byte stream:
 
 ```python
 >>> libvt.render(b"\x1b[1;32mready\x1b[0m\r\nitem 1", rows=4, cols=20)
@@ -96,3 +96,9 @@ reference are at [libvt.git-pull.com](https://libvt.git-pull.com/).
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+[feed]: https://libvt.git-pull.com/api/terminal/#libvt.terminal.Terminal.feed
+[assert_screen_box]: https://libvt.git-pull.com/api/testing/#libvt.testing.assert_screen_box
+[render]: https://libvt.git-pull.com/api/terminal/#libvt.terminal.render
+[strip]: https://libvt.git-pull.com/api/terminal/#libvt.terminal.strip
+[explain]: https://libvt.git-pull.com/api/codec/#libvt.codec.explain
