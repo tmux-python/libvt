@@ -2,8 +2,9 @@
 
 ## Version Policy
 
-`libvt` is pre-1.0. Minor version bumps may include breaking API
-changes. Downstream users should pin to `>=0.x,<0.y`.
+`libvt` is pre-1.0 (currently in `0.0.x` pre-alpha). Pre-`0.1` updates and
+`0.x` minor version bumps may include breaking API changes; downstream users
+should pin `libvt>=0.0.1a0,<0.1` (and `>=0.x,<0.y` once `0.1.0` ships).
 
 ## Release Process
 
@@ -15,7 +16,7 @@ trusted publishing.
 3. Commit:
 
    ```console
-   $ git commit -m "libvt <version>"
+   $ git commit -m "Tag v<version>"
    ```
 
 4. Tag:

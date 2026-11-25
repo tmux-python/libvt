@@ -2,32 +2,29 @@
 
 # Architecture & Grid Storage
 
-`libvt` separates terminal emulation into four acyclic layers so callers
-import only the machinery they need:
+{class}`~libvt.parser.Parser` ({mod}`libvt.parser`) recognizes text and control
+sequences. {class}`~libvt.screen.Screen` ({mod}`libvt.screen`) stores cells,
+cursor position, and scrollback. {class}`~libvt.terminal.Terminal`
+({mod}`libvt.terminal`) applies sequences across primary and alternate screens
+and prepares replies and events. The adapters in {mod}`libvt.aio` connect
+`Terminal` to `asyncio` streams and POSIX child processes.
 
-1. **Streaming parser** ({mod}`libvt.parser`): VT500 byte state machine
-   with colon-subparameter `CSI` bitmasks, incremental UTF-8 decoding,
-   `STRING_ESC` 7-bit string termination, optional Latin-1 8-bit `C1`
-   wire parsing, and `DCS tmux;` `ESC ESC` collapsing.
-2. **Grid and screen model** ({mod}`libvt.screen`): Zero-based
-   `(row, col)` viewport with lazy 64-bit `array('Q')` attribute words,
-   wide-spacer boundary healing, run-length-encoded scrollback rows, and
-   primary-screen soft-wrap resize reflow.
-3. **Sans-I/O terminal facade** ({mod}`libvt.terminal`,
-   {mod}`libvt.status`, {mod}`libvt.input`, {mod}`libvt.codec`):
-   Coordinates dual primary/alternate screens,
-   {class}`~libvt.config.Profile` / {class}`~libvt.config.Policy` /
-   {class}`~libvt.config.Limits`, `OSC 7501` status records, outbound
-   replies, and input encoding with zero system calls.
-4. **Transport and test edges** ({mod}`libvt.aio`,
-   {mod}`libvt.testing`, {mod}`libvt.pytest_plugin`): Optional
-   {mod}`asyncio` stream/PTY runners and pytest diagnostics.
+{meth}`Terminal.feed() <libvt.terminal.Terminal.feed>` processes supplied
+bytes. The caller provides incoming data, retrieves queued replies with
+{meth}`~libvt.terminal.Terminal.drain_replies`, and decides when to read or
+write the transport (a sans-I/O boundary).
 
-## Configuration split
+Importing `libvt` loads the emulation, input, formatting, and `tmux` modules.
+{mod}`libvt.aio`, {mod}`libvt.testing`, and {mod}`libvt.pytest_plugin` are
+imported separately when used, and POSIX `pty` / `termios` modules are loaded
+inside {func}`~libvt.aio.open_pty`.
 
-{class}`~libvt.config.Profile`, {class}`~libvt.config.Policy`, and
-{class}`~libvt.config.Limits` separate compatibility identity from
-security gates and resource caps:
+## Configuration
+
+{class}`~libvt.config.Profile` selects terminal behavior and reported
+capabilities. {class}`~libvt.config.Policy` controls which operations are
+allowed. {class}`~libvt.config.Limits` sets bounds on buffers and other stored
+data:
 
 ```python
 >>> import libvt
@@ -43,12 +40,14 @@ security gates and resource caps:
 '1234X'
 ```
 
-## Two-tier viewport and RLE scrollback
+## Viewport and scrollback storage
 
-Active viewport rows keep plain ASCII lines at a single uniform 64-bit
-word and promote to `array('Q')` only when styled or wide cells appear.
-Evicted scrollback lines freeze into immutable run-length-encoded rows
-exposed through {attr}`~libvt.terminal.Terminal.history`:
+Active viewport rows store a single uniform 64-bit attribute word while a line
+contains plain default-styled text, allocating a per-column `array('Q')`
+attribute array only when styled or wide cells are written. Lines scrolled off
+the top of the primary screen freeze into immutable run-length-encoded rows on
+{attr}`~libvt.terminal.Terminal.history`, and resizing the primary screen
+reflows soft-wrapped lines across history and the viewport:
 
 ```python
 >>> term = libvt.Terminal(rows=2, cols=12, scrollback=10)
@@ -59,4 +58,22 @@ exposed through {attr}`~libvt.terminal.Terminal.history`:
 <AnsiColor.GREEN: 2>
 ```
 
-For rationale and memory measurements, see {doc}`../project/adr/index`.
+## Unicode 17 width and grapheme clustering
+
+`libvt` bundles two-stage lookup tables generated from Unicode 17.0.0 data
+(`EastAsianWidth`, UAX #29 `GraphemeBreakProperty`, `emoji-data`, and
+`DerivedCoreProperties` `InCB`). {func}`~libvt.display_width` computes column
+widths, and enabling DEC mode `?2027`
+({attr}`~libvt.modes.Mode.GRAPHEME_CLUSTERING`) groups ZWJ emoji, Regional
+Indicator flag pairs, Indic conjuncts, and `VS15` / `VS16` variation sequences
+into display cells:
+
+```python
+>>> term = libvt.Terminal(rows=2, cols=10)
+>>> term.feed(b"\x1b[?2027h")
+>>> term.feed_str("🧑\u200d🌾ok")
+>>> term[0, 0].width, term.cursor.col
+(2, 4)
+```
+
+For design rationale and memory measurements, see {doc}`../project/adr/index`.

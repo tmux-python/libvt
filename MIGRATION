@@ -3,8 +3,8 @@
 Migration and deprecation notes for `libvt` are recorded here; see
 {ref}`changelog` as well.
 
-`libvt` is pre-1.0. Pin a minor version range in downstream projects
-(`libvt>=0.1,<0.2`).
+`libvt` is in pre-alpha (`0.0.1a0`) and pre-1.0; pin `libvt>=0.0.1a0,<0.1` in
+downstream projects (and `>=0.x,<0.y` once `0.1.0` is released).
 
 ---
 

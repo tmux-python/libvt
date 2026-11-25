@@ -12,7 +12,7 @@ Public modules and types shipped by `libvt`.
 :::{grid-item-card} `libvt`
 :link: libvt
 :link-type: doc
-Top-level re-exports, progressive-disclosure helpers, and package metadata.
+`Terminal` and helpers for rendering, stripping, and explaining terminal output.
 :::
 
 :::{grid-item-card} `libvt.terminal`
@@ -60,7 +60,7 @@ Mode-aware `KeyEvent`, `MouseEvent`, `PasteEvent`, and VT sequence `explain`.
 :::{grid-item-card} `libvt.graphics`
 :link: graphics
 :link-type: doc
-Zero-dependency `SIXEL` and Kitty `APC G` `ImageMeta` and `ImagePlacement`.
+`SIXEL` and Kitty `APC G` `ImageMeta` and `ImagePlacement`.
 :::
 
 :::{grid-item-card} `libvt.tmux`
